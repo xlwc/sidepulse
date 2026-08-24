@@ -283,11 +283,13 @@ class AgentMonitorTests(unittest.TestCase):
             )
 
     def test_reading_a_rotated_log_stops_once_the_line_budget_is_met(self) -> None:
-        """The backup top-up must cost a busy install nothing.
+        """The top-up stops as soon as the line budget is met.
 
-        A live log already holding the whole line window is the common case, so
-        the reader has to satisfy the budget from it alone and never open a
-        backup -- this runs on every AgentMonitor snapshot.
+        A live log that already holds max_lines lines must not open a backup.
+        This runs on every AgentMonitor snapshot. Note that the defaults do not
+        put a real install in that case: the budget counts lines and the rotation
+        cap counts bytes, so 5000 lines fit under 5 MiB only at about 1 KiB per
+        record, and a provider log recording tool inputs runs several times that.
         """
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"

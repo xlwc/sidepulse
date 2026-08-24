@@ -1449,9 +1449,17 @@ def read_recent_lines_across_rotations(
 
     ``rotate_log`` moves records out of the live log into ``.1``-``.N`` while
     still retaining them, so reading the live path alone loses a session whose
-    latest event sits in a backup. This tops up from the backups only when the
-    live log is shorter than ``max_lines``, so a busy install opens exactly one
-    file and pays what it paid before.
+    latest event sits in a backup. This tops up from the backups until it holds
+    ``max_lines``.
+
+    That budget is a line count and the rotation cap is a byte count, so the
+    live log ends the loop only when its records are small enough for
+    ``max_lines`` of them to fit under the cap. At the defaults -- 5 MiB and
+    5000 lines -- that means about 1 KiB per record, and a provider log that
+    records tool inputs runs several times that. Expect every retained
+    generation to be opened and parsed on a real install, and note that
+    ``AgentMonitor._cached_log_records`` keys its cache on the live file's mtime
+    and size, so each hook event invalidates it.
     """
     if max_lines <= 0:
         return []

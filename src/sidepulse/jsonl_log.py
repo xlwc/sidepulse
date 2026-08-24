@@ -129,15 +129,20 @@ def append_jsonl_line(
     payload = (
         json.dumps(record, separators=(",", ":"), ensure_ascii=False, default=str) + "\n"
     )
-    # O_APPEND puts each record at EOF, so concurrent hook processes from
-    # parallel agent sessions cannot interleave a line. The mode argument applies
-    # only when this call creates the file, hence the chmod.
+    # O_APPEND puts the file offset at EOF for each write(2), so two appenders
+    # never overwrite each other. It does not make a record atomic: the loop
+    # below can take several write(2) calls, and another process can append
+    # between two of them. The mode argument applies only when this call creates
+    # the file, hence the chmod.
     data = payload.encode("utf-8")
     handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, FILE_MODE)
     try:
-        # os.write is one write(2) and may return short. Dropping the remainder
-        # would lose the trailing newline and make the next append share this
-        # physical line, so two records would be unparseable instead of zero.
+        # os.write is one write(2) and may return short, so keep writing until
+        # the payload is out. This covers a short write followed by a successful
+        # one. It does not cover a write that fails part-way through -- ENOSPC,
+        # EDQUOT, EIO, or a return of 0 -- which leaves a partial record with no
+        # trailing newline, so the next append shares that physical line and both
+        # records become unparseable.
         written = 0
         while written < len(data):
             count = os.write(handle, data[written:])

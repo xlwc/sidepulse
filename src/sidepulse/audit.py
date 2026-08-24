@@ -27,9 +27,15 @@ LOG_BACKUP_COUNT = DEFAULT_BACKUP_COUNT
 STATUS_AUDIT_MAX_BYTES = DEFAULT_MAX_BYTES
 # The settings chart reads up to 48h of history and the status bar appends a
 # record every refresh, so a rollover clips the graph -- read_status_history_records
-# opens the live file only, which no cap can prevent. The cap is loose enough
-# that the clip is rare, and the history log keeps no backups because a backup
-# would be retained bytes the chart cannot reach.
+# opens the live file only, which no cap can prevent. The history log keeps no
+# backups because a backup would be retained bytes the chart cannot reach.
+#
+# This cap does not cover the widest chart window. A record measures about 1 KiB,
+# so 16 MiB holds roughly 16,800 of them. The 15s refresh timer alone writes
+# 11,520 records in 48h, and StatusBarController.refresh_ also runs once per
+# inbound hook event, so an active machine reaches the cap well inside the 48h
+# the chart offers. Raising the cap or teaching the chart to read a backup is
+# what would close that; until then the 48h window empties at each rollover.
 STATUS_HISTORY_MAX_BYTES = 16 * 1024 * 1024
 STATUS_HISTORY_BACKUP_COUNT = 0
 AUDIT_COLUMNS = (
