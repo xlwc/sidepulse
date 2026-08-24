@@ -27,10 +27,12 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from sidepulse import audit as audit_module
 from sidepulse import hook as hook_module
 from sidepulse.cli import build_parser, build_sidepulse_parser, cmd_hook_log
 from sidepulse.hook import format_hook_payload, hook_log_main, routed_hook_payload
 from sidepulse.install import fail_open_command, hook_command
+from sidepulse.providers import parse_log_line
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
@@ -128,6 +130,7 @@ class FailOpenTests(HookIsolationMixin, unittest.TestCase):
             "write_hook_line",
             "write_hook_status_audit",
             "hook_event_socket_disabled",
+            "append_jsonl_line",
         ]
         for name in collaborators:
             with self.subTest(raises=name):
@@ -238,6 +241,114 @@ class HappyPathTests(HookIsolationMixin, unittest.TestCase):
                 self.assertTrue(provider)
                 self.assertIsInstance(path, Path)
                 self.assertIsInstance(line, dict)
+
+
+class LogHygieneTests(HookIsolationMixin, unittest.TestCase):
+    """The hook log holds tool inputs, so it must stay private and bounded.
+
+    ``tool_input`` carries whole file contents and shell commands, so this log
+    accumulates a verbatim copy of everything the agents do. Two properties
+    keep that from becoming a liability: nobody but the owner can read it, and
+    it cannot grow without limit.
+    """
+
+    def write_records(self, count: int, *, filler: int = 0) -> None:
+        for index in range(count):
+            payload = json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": f"s{index}",
+                    "message": "x" * filler,
+                }
+            )
+            run_hook("claude", self.log_path, payload)
+
+    def mode_of(self, path: Path) -> int:
+        return path.stat().st_mode & 0o777
+
+    def test_new_log_is_owner_only(self):
+        self.write_records(1)
+        self.assertEqual(0o600, self.mode_of(self.log_path))
+
+    def test_existing_world_readable_log_is_tightened(self):
+        """Installs that already wrote a 0644 log must be repaired in place."""
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_path.write_text('{"hook_event_name": "Stop"}\n', encoding="utf-8")
+        self.log_path.chmod(0o644)
+        self.write_records(1)
+        self.assertEqual(0o600, self.mode_of(self.log_path))
+
+    def test_log_directory_is_owner_only(self):
+        """The directory guard also covers the audit log and latest.json."""
+        self.write_records(1)
+        self.assertEqual(0o700, self.mode_of(self.log_path.parent))
+
+    def test_log_rotates_at_the_size_cap(self):
+        with patch.object(hook_module, "MAX_LOG_BYTES", 2048):
+            self.write_records(40, filler=200)
+        rotated = self.log_path.with_suffix(self.log_path.suffix + ".1")
+        self.assertTrue(rotated.exists(), "log never rotated past the cap")
+        self.assertLessEqual(self.log_path.stat().st_size, 2048 + 512)
+
+    def test_rotation_keeps_a_bounded_number_of_backups(self):
+        with patch.object(hook_module, "MAX_LOG_BYTES", 1024):
+            with patch.object(hook_module, "LOG_BACKUP_COUNT", 2):
+                self.write_records(120, filler=200)
+        backups = sorted(p.name for p in self.log_path.parent.glob("hook.jsonl.*"))
+        self.assertEqual(["hook.jsonl.1", "hook.jsonl.2"], backups)
+
+    def test_rotated_backups_stay_owner_only(self):
+        with patch.object(hook_module, "MAX_LOG_BYTES", 1024):
+            self.write_records(40, filler=200)
+        for backup in self.log_path.parent.glob("hook.jsonl.*"):
+            self.assertEqual(0o600, self.mode_of(backup), f"{backup.name} is readable")
+
+    def test_rotation_preserves_whole_records(self):
+        """Rotation must split between lines, never mid-record."""
+        with patch.object(hook_module, "MAX_LOG_BYTES", 1024):
+            self.write_records(40, filler=200)
+        for path in [self.log_path, *self.log_path.parent.glob("hook.jsonl.*")]:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                json.loads(line)  # a truncated record would raise here
+
+    def test_rotation_failure_still_exits_zero(self):
+        """Log hygiene is best-effort; it must never break an agent turn."""
+        with patch.object(
+            hook_module, "append_jsonl_line", side_effect=OSError("rotation broke")
+        ):
+            code, out = run_hook("claude", self.log_path, '{"hook_event_name": "Stop"}')
+        self.assertEqual(0, code)
+        self.assertEqual("", out)
+
+    def test_sibling_audit_log_is_also_private_and_bounded(self):
+        """event-status.jsonl holds up to 2000 chars of raw payload per record.
+
+        It is written by a different module than the provider log, so it needs
+        its own guard rather than inheriting one.
+        """
+        audit_path = self.home / "audit.jsonl"
+        event = parse_log_line("claude", json.dumps({"hook_event_name": "Stop"}))
+        with patch.object(audit_module, "STATUS_AUDIT_MAX_BYTES", 1024):
+            for _ in range(200):
+                audit_module.append_status_audit_record(event, None, path=audit_path)
+        self.assertEqual(0o600, self.mode_of(audit_path))
+        self.assertTrue(
+            list(self.home.glob("audit.jsonl.*")), "audit log never rotated"
+        )
+
+    def test_status_history_log_is_also_private_and_bounded(self):
+        """The status bar appends one of these per refresh, idle or not."""
+        history_path = self.home / "history.jsonl"
+        with patch.object(audit_module, "STATUS_HISTORY_MAX_BYTES", 1024):
+            for index in range(200):
+                audit_module.append_status_history_record(
+                    {"recorded_at": f"t{index}", "status": "idle", "pad": "x" * 100},
+                    path=history_path,
+                )
+        self.assertEqual(0o600, self.mode_of(history_path))
+        self.assertTrue(
+            list(self.home.glob("history.jsonl.*")), "history log never rotated"
+        )
 
 
 class EntryPointSubprocessTests(unittest.TestCase):

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .battery import BatterySnapshot
+from .jsonl_log import append_jsonl_line
 from .lid_sleep import MacSleepSnapshot
 from .models import AgentStatus, HookEvent
 from .providers import default_state_dir
@@ -17,6 +18,12 @@ STATUS_AUDIT_LOG_NAME = "event-status.jsonl"
 STATUS_HISTORY_LOG_NAME = "status-history.jsonl"
 RAW_PREVIEW_LIMIT = 2000
 MESSAGE_PREVIEW_LIMIT = 240
+LOG_BACKUP_COUNT = 3
+STATUS_AUDIT_MAX_BYTES = 5 * 1024 * 1024
+# The settings chart reads up to 48h of history, and the status bar appends a
+# record every refresh, so this cap is deliberately looser than the others:
+# rotating inside the widest chart window would truncate the graph.
+STATUS_HISTORY_MAX_BYTES = 16 * 1024 * 1024
 AUDIT_COLUMNS = (
     "audited_at",
     "logged_at",
@@ -51,16 +58,12 @@ def append_status_audit_record(
 ) -> None:
     target = path or default_status_audit_log_path()
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("a", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    status_audit_record(event, status),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                + "\n"
-            )
+        append_jsonl_line(
+            target,
+            status_audit_record(event, status),
+            max_bytes=STATUS_AUDIT_MAX_BYTES,
+            backup_count=LOG_BACKUP_COUNT,
+        )
     except OSError:
         pass
 
@@ -71,17 +74,12 @@ def append_status_history_record(
     path: Path | None = None,
 ) -> None:
     target = path or default_status_history_log_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                record,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                default=str,
-            )
-            + "\n"
-        )
+    append_jsonl_line(
+        target,
+        record,
+        max_bytes=STATUS_HISTORY_MAX_BYTES,
+        backup_count=LOG_BACKUP_COUNT,
+    )
 
 
 def status_history_record(
