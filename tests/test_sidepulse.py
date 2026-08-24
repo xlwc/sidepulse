@@ -213,6 +213,111 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(snapshot.aggregate.mode, AgentMode.WAITING_FOR_INPUT)
             self.assertEqual(len(snapshot.statuses), 2)
 
+    def test_rotated_provider_log_still_reports_its_sessions(self) -> None:
+        """A rollover must not drop a session the device is still showing.
+
+        AgentMonitor rebuilds every status from the log on each snapshot and
+        keeps nothing in memory, so a session whose latest event moved into the
+        .1 backup would otherwise vanish and drive the LEDs back from Ask to
+        Working.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            codex = Path(tmp) / "codex.jsonl"
+            now = datetime.now(timezone.utc).isoformat()
+
+            codex.with_name(codex.name + ".1").write_text(
+                json.dumps(
+                    {
+                        "logged_at": now,
+                        "event": {
+                            "hook_event_name": "Notification",
+                            "session_id": "waiting-session",
+                            "notification_type": "idle_prompt",
+                            "message": "Codex is waiting for your input",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            codex.write_text(
+                json.dumps(
+                    {
+                        "logged_at": now,
+                        "event": {
+                            "hook_event_name": "PreToolUse",
+                            "session_id": "busy-session",
+                            "tool_name": "Bash",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("codex", codex),),
+                stale_after_seconds=999999999,
+            )
+            snapshot = monitor.snapshot()
+
+            self.assertEqual(
+                {status.agent_id for status in snapshot.statuses},
+                {"codex:session:waiting-session", "codex:session:busy-session"},
+            )
+            self.assertEqual(snapshot.aggregate.mode, AgentMode.WAITING_FOR_INPUT)
+
+    def test_reading_a_rotated_log_survives_a_missing_live_file(self) -> None:
+        """Rotation renames the live file before the next append recreates it.
+
+        In that window the backups still hold the whole window, so the reader
+        must not fail just because the live path is gone.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "codex.jsonl"
+            log.with_name(log.name + ".1").write_text("old-0\n", encoding="utf-8")
+
+            self.assertEqual(
+                ["old-0"],
+                collector_module.read_recent_lines_across_rotations(log, 5),
+            )
+
+    def test_reading_a_rotated_log_stops_once_the_line_budget_is_met(self) -> None:
+        """The backup top-up must cost a busy install nothing.
+
+        A live log already holding the whole line window is the common case, so
+        the reader has to satisfy the budget from it alone and never open a
+        backup -- this runs on every AgentMonitor snapshot.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "codex.jsonl"
+            log.write_text("".join(f"live-{i}\n" for i in range(5)), encoding="utf-8")
+            backup = log.with_name(log.name + ".1")
+            backup.write_text("".join(f"old-{i}\n" for i in range(5)), encoding="utf-8")
+
+            opened: list[Path] = []
+            original = collector_module.read_recent_lines
+
+            def tracking_read(read_path: Path, max_lines: int) -> list[str]:
+                opened.append(read_path)
+                return original(read_path, max_lines)
+
+            with patch.object(
+                collector_module, "read_recent_lines", side_effect=tracking_read
+            ):
+                full = collector_module.read_recent_lines_across_rotations(log, 3)
+                self.assertEqual(opened, [log])
+
+                opened.clear()
+                topped_up = collector_module.read_recent_lines_across_rotations(log, 8)
+                self.assertEqual(opened, [log, backup])
+
+        self.assertEqual(full, ["live-2", "live-3", "live-4"])
+        self.assertEqual(
+            topped_up,
+            ["old-2", "old-3", "old-4", "live-0", "live-1", "live-2", "live-3", "live-4"],
+        )
+
     def test_hook_log_writes_provider_formats(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -443,6 +548,51 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(export_status_audit_html(html_path, source=log), 1)
             self.assertIn("hook_event,status", csv_path.read_text())
             self.assertIn("SidePulse Agent Debug Log", html_path.read_text())
+
+    def test_status_audit_export_includes_rotated_generations(self) -> None:
+        """The export is the diagnostics path, so it must reach the whole window.
+
+        rotate_log keeps event-status.jsonl.1-.3 under the retention policy. An
+        export that reads the live file only ends at the last rollover and omits
+        the incident the user opened it to find.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            log = base / "event-status.jsonl"
+
+            def audit_line(session: str) -> str:
+                record = parse_log_line(
+                    "grok",
+                    json.dumps(
+                        {
+                            "hookEventName": "notification",
+                            "sessionId": session,
+                            "workspaceRoot": "/tmp/project",
+                            "notificationType": "idle_prompt",
+                            "message": "Turn complete",
+                            "timestamp": "2026-07-18T21:55:14Z",
+                        }
+                    ),
+                )
+                status = collector_module.status_from_event(record)
+                append_status_audit_record(record, status, path=log)
+                text = log.read_text(encoding="utf-8")
+                log.unlink()
+                return text
+
+            # Oldest generation is the highest index, as rotate_log names them.
+            log.with_name(log.name + ".2").write_text(audit_line("s-oldest"))
+            log.with_name(log.name + ".1").write_text(audit_line("s-middle"))
+            log.write_text(audit_line("s-live"))
+
+            records = read_status_audit_records(log)
+
+            self.assertEqual(
+                [record["session_id"] for record in records],
+                ["s-oldest", "s-middle", "s-live"],
+            )
+            csv_path = base / "debug.csv"
+            self.assertEqual(export_status_audit_csv(csv_path, source=log), 3)
 
     def test_status_history_record_includes_charger_power_and_sleep_state(self) -> None:
         record = status_history_record(

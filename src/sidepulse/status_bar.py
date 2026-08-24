@@ -76,7 +76,11 @@ from .audit import (
     read_status_history_records,
     status_history_record,
 )
-from .collector import LiveAgentMonitor, SourceSpec, read_recent_lines
+from .collector import (
+    LiveAgentMonitor,
+    SourceSpec,
+    read_recent_lines_across_rotations,
+)
 from .device_writer import (
     DEFAULT_FILE_NAME,
     MOUNT_ROOT,
@@ -348,7 +352,11 @@ def replay_recent_debug_logs(
     for provider in providers:
         try:
             path = detect_log_path(provider)
-            lines = read_recent_lines(path, max_lines) if path.exists() else []
+            lines = (
+                read_recent_lines_across_rotations(path, max_lines)
+                if path.exists()
+                else []
+            )
         except Exception as exc:
             log_status_bar(f"startup_replay {provider} error: {exc}")
             continue

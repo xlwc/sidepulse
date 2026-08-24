@@ -75,7 +75,7 @@ modules; `battery.py`, `lid_sleep.py`, `keep_awake.py` shell out to
 
 **LEDS.LED is the device contract.** The DSL is specified in `LEDS_FORMAT.md`;
 the controller's 512-byte / 20-line limits are enforced in
-`device_writer.validate_led_text`. `resources/sdled.wasm` is the same parser the
+`device_writer.validate_led_text`. `src/sidepulse/resources/sdled.wasm` is the same parser the
 firmware and web simulator use — `led_wasm.py` runs it through JavaScriptCore so
 the Screen Bar virtual device animates identical programs instead of
 reimplementing the DSL.
@@ -83,7 +83,7 @@ reimplementing the DSL.
 **macOS system integration.** `status_bar_launch.py` writes the
 `io.sidepulse.agentstatus` LaunchAgent (and cleans up the older
 `com.pixiepulse.*` label). `sd_eject_guard_launch.py` compiles
-`resources/sd_eject_guard.c` on demand and installs it as a per-user
+`src/sidepulse/resources/sd_eject_guard.c` on demand and installs it as a per-user
 LaunchAgent or a system LaunchDaemon (`--sd-eject-guard-scope`) to keep the SD
 reader attached after sleep. `lid_sleep.py` installs
 a narrow sudoers rule for exactly `/usr/bin/pmset -a disablesleep 0|1` so the

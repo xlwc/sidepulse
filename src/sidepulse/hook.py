@@ -10,15 +10,16 @@ from typing import Any
 from .audit import append_status_audit_record
 from .collector import StatusMetadata, status_from_event, title_from_event
 from .ipc import send_hook_event
-from .jsonl_log import append_jsonl_line
+from .jsonl_log import DEFAULT_BACKUP_COUNT, DEFAULT_MAX_BYTES, append_jsonl_line
 from .origin import annotate_payload_with_origin
 from .providers import detect_log_path, infer_provider_from_payload, parse_log_line
 
 
 # The hook log records whole payloads, including tool inputs, so it is kept
-# owner-only and rolled over at a fixed size. See jsonl_log.
-MAX_LOG_BYTES = 5 * 1024 * 1024
-LOG_BACKUP_COUNT = 3
+# owner-only and rolled over at a fixed size. See jsonl_log, which owns the
+# values -- restating the numbers here is how three copies of the cap drift apart.
+MAX_LOG_BYTES = DEFAULT_MAX_BYTES
+LOG_BACKUP_COUNT = DEFAULT_BACKUP_COUNT
 
 
 def format_hook_payload(
@@ -55,6 +56,10 @@ def write_hook_line(log_path: Path, line: dict[str, Any]) -> None:
         line,
         max_bytes=MAX_LOG_BYTES,
         backup_count=LOG_BACKUP_COUNT,
+        # This path comes from --claude-log/--codex-log/--grok-log or --log-dir, so
+        # the parent may be a directory the user owns the policy for, such as $HOME.
+        # The audit write in hook_log_main keeps the state dir itself tightened.
+        secure_parent=False,
     )
 
 

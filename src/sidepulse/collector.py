@@ -19,6 +19,7 @@ from .models import (
     provider_label,
 )
 from .origin import origin_label_from_payload
+from .jsonl_log import DEFAULT_BACKUP_COUNT, backup_path
 from .providers import detect_log_path, parse_log_line
 from .settings import AgentMonitorSettings, load_settings
 
@@ -288,7 +289,9 @@ class AgentMonitor:
             return cached.records
 
         records: list[HookEvent] = []
-        for line in read_recent_lines(source.path, self.max_lines_per_source):
+        for line in read_recent_lines_across_rotations(
+            source.path, self.max_lines_per_source
+        ):
             record = parse_log_line(source.provider, line)
             if record is not None:
                 records.append(record)
@@ -1434,6 +1437,42 @@ def read_recent_lines(path: Path, max_lines: int) -> list[str]:
     data = b"".join(reversed(chunks))
     lines = data.decode("utf-8", errors="replace").splitlines()
     return lines[-max_lines:]
+
+
+def read_recent_lines_across_rotations(
+    path: Path,
+    max_lines: int,
+    *,
+    backup_count: int = DEFAULT_BACKUP_COUNT,
+) -> list[str]:
+    """Read the last ``max_lines`` lines of a rotated log, oldest first.
+
+    ``rotate_log`` moves records out of the live log into ``.1``-``.N`` while
+    still retaining them, so reading the live path alone loses a session whose
+    latest event sits in a backup. This tops up from the backups only when the
+    live log is shorter than ``max_lines``, so a busy install opens exactly one
+    file and pays what it paid before.
+    """
+    if max_lines <= 0:
+        return []
+
+    try:
+        lines = read_recent_lines(path, max_lines)
+    except OSError:
+        # Rotation renames the live file before the next append recreates it, so
+        # it can be absent for a moment while the backups still hold the window.
+        lines = []
+    for index in range(1, backup_count + 1):
+        if len(lines) >= max_lines:
+            break
+        try:
+            older = read_recent_lines(backup_path(path, index), max_lines - len(lines))
+        except OSError:
+            break
+        if not older:
+            continue
+        lines = older + lines
+    return lines
 
 
 def _replace_stale(status: AgentStatus, stale: bool) -> AgentStatus:

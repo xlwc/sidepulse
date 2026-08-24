@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .battery import BatterySnapshot
-from .jsonl_log import append_jsonl_line
+from .jsonl_log import (
+    DEFAULT_BACKUP_COUNT,
+    DEFAULT_MAX_BYTES,
+    append_jsonl_line,
+    backup_path,
+)
 from .lid_sleep import MacSleepSnapshot
 from .models import AgentStatus, HookEvent
 from .providers import default_state_dir
@@ -18,12 +23,15 @@ STATUS_AUDIT_LOG_NAME = "event-status.jsonl"
 STATUS_HISTORY_LOG_NAME = "status-history.jsonl"
 RAW_PREVIEW_LIMIT = 2000
 MESSAGE_PREVIEW_LIMIT = 240
-LOG_BACKUP_COUNT = 3
-STATUS_AUDIT_MAX_BYTES = 5 * 1024 * 1024
-# The settings chart reads up to 48h of history, and the status bar appends a
-# record every refresh, so this cap is deliberately looser than the others:
-# rotating inside the widest chart window would truncate the graph.
+LOG_BACKUP_COUNT = DEFAULT_BACKUP_COUNT
+STATUS_AUDIT_MAX_BYTES = DEFAULT_MAX_BYTES
+# The settings chart reads up to 48h of history and the status bar appends a
+# record every refresh, so a rollover clips the graph -- read_status_history_records
+# opens the live file only, which no cap can prevent. The cap is loose enough
+# that the clip is rare, and the history log keeps no backups because a backup
+# would be retained bytes the chart cannot reach.
 STATUS_HISTORY_MAX_BYTES = 16 * 1024 * 1024
+STATUS_HISTORY_BACKUP_COUNT = 0
 AUDIT_COLUMNS = (
     "audited_at",
     "logged_at",
@@ -78,7 +86,7 @@ def append_status_history_record(
         target,
         record,
         max_bytes=STATUS_HISTORY_MAX_BYTES,
-        backup_count=LOG_BACKUP_COUNT,
+        backup_count=STATUS_HISTORY_BACKUP_COUNT,
     )
 
 
@@ -212,10 +220,22 @@ def truncate_preview(text: str, limit: int) -> str:
 
 def read_status_audit_records(path: Path | None = None) -> list[dict[str, str]]:
     source = path or default_status_audit_log_path()
+
+    # Oldest first: rotation moves the live file to .1 and shifts .1 to .2, so a
+    # higher index is older. The export is the diagnostics path, so it reads the
+    # whole retention window rather than stopping at the last rollover.
+    lines: list[str] = []
+    for index in range(LOG_BACKUP_COUNT, 0, -1):
+        try:
+            text = backup_path(source, index).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        lines.extend(text.splitlines())
     try:
-        lines = source.read_text(encoding="utf-8").splitlines()
+        lines.extend(source.read_text(encoding="utf-8").splitlines())
     except OSError:
-        return []
+        if not lines:
+            return []
 
     records: list[dict[str, str]] = []
     for line in lines:

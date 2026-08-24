@@ -36,6 +36,16 @@ def secure_path_mode(path: Path, mode: int) -> None:
         pass
 
 
+def backup_path(path: Path, index: int) -> Path:
+    """Name the ``index``-th rotated generation of ``path``.
+
+    Readers need this too: a record that rotation moved out of the live log is
+    still retained, so a reader that wants the whole retention window has to
+    know where rotation put it.
+    """
+    return path.with_name(f"{path.name}.{index}")
+
+
 def rotate_log(
     path: Path,
     *,
@@ -46,8 +56,20 @@ def rotate_log(
 
     Rotation runs before the append rather than after, so a record is never
     split across two files; the live log may exceed the cap by one record.
+
+    ``backup_count=0`` rotates by discarding: the live log is removed and the
+    next append starts an empty one. Use it for a log whose reader only ever
+    opens the live file, so that the bytes kept on disk are the bytes the
+    feature can actually show. ``max_bytes=0`` disables rotation entirely.
+
+    Rotation is not atomic against itself. Two hook processes from parallel
+    agent sessions can both see the log oversized and interleave the shuffle
+    below, which strands a just-written record in a backup and can drop a
+    generation earlier than ``backup_count`` says. A lock here would have to
+    hold in a process that must exit 0 whatever happens, so the trade is
+    deliberate: readers that care about the whole window read the backups too.
     """
-    if max_bytes <= 0 or backup_count <= 0:
+    if max_bytes <= 0 or backup_count < 0:
         return
 
     try:
@@ -56,8 +78,15 @@ def rotate_log(
     except OSError:
         return
 
+    if backup_count == 0:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+
     def backup(index: int) -> Path:
-        return path.with_name(f"{path.name}.{index}")
+        return backup_path(path, index)
 
     try:
         backup(backup_count).unlink()
@@ -81,22 +110,40 @@ def append_jsonl_line(
     *,
     max_bytes: int = DEFAULT_MAX_BYTES,
     backup_count: int = DEFAULT_BACKUP_COUNT,
+    secure_parent: bool = True,
 ) -> None:
-    """Append one JSON record as a single physical line, privately and bounded."""
+    """Append one JSON record as a single physical line, privately and bounded.
+
+    ``secure_parent`` tightens the containing directory to 0700 as well, and
+    repairs it in place for installs from older versions. Pass ``False`` when the
+    caller does not own the directory: the provider log path is user-configurable
+    (``--claude-log``, ``--log-dir``), so its parent may be $HOME, and re-permissioning
+    a directory the user chose is not this function's business.
+    """
     path = path.expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    secure_path_mode(path.parent, DIR_MODE)
+    if secure_parent:
+        secure_path_mode(path.parent, DIR_MODE)
     rotate_log(path, max_bytes=max_bytes, backup_count=backup_count)
 
     payload = (
         json.dumps(record, separators=(",", ":"), ensure_ascii=False, default=str) + "\n"
     )
-    # O_APPEND puts each record at EOF in one write, so concurrent hook
-    # processes from parallel agent sessions cannot interleave a line. The mode
-    # argument applies only when this call creates the file, hence the chmod.
+    # O_APPEND puts each record at EOF, so concurrent hook processes from
+    # parallel agent sessions cannot interleave a line. The mode argument applies
+    # only when this call creates the file, hence the chmod.
+    data = payload.encode("utf-8")
     handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, FILE_MODE)
     try:
-        os.write(handle, payload.encode("utf-8"))
+        # os.write is one write(2) and may return short. Dropping the remainder
+        # would lose the trailing newline and make the next append share this
+        # physical line, so two records would be unparseable instead of zero.
+        written = 0
+        while written < len(data):
+            count = os.write(handle, data[written:])
+            if count <= 0:
+                break
+            written += count
     finally:
         os.close(handle)
     secure_path_mode(path, FILE_MODE)

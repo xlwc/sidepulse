@@ -29,6 +29,7 @@ from unittest.mock import patch
 
 from sidepulse import audit as audit_module
 from sidepulse import hook as hook_module
+from sidepulse import jsonl_log
 from sidepulse.cli import build_parser, build_sidepulse_parser, cmd_hook_log
 from sidepulse.hook import format_hook_payload, hook_log_main, routed_hook_payload
 from sidepulse.install import fail_open_command, hook_command
@@ -270,6 +271,100 @@ class LogHygieneTests(HookIsolationMixin, unittest.TestCase):
         self.write_records(1)
         self.assertEqual(0o600, self.mode_of(self.log_path))
 
+    def test_a_user_chosen_log_directory_keeps_its_own_permissions(self):
+        """The log path is user-configurable, so its parent is not ours to set.
+
+        `--claude-log ~/hook.jsonl` makes $HOME the parent. Tightening it to 0700
+        is an unrequested change to a directory the user owns the policy for, and
+        the hook does it on every agent event.
+        """
+        chosen = self.home / "user-chosen"
+        chosen.mkdir(parents=True, exist_ok=True)
+        chosen.chmod(0o755)
+
+        run_hook("claude", chosen / "hook.jsonl", '{"hook_event_name": "Stop"}')
+
+        self.assertEqual(0o755, self.mode_of(chosen))
+        self.assertEqual(0o600, self.mode_of(chosen / "hook.jsonl"))
+
+    def test_the_state_dir_is_still_tightened_in_place(self):
+        """The directory sidepulse creates is ours, including on upgrades.
+
+        Installs from older versions left it 0755, so the repair has to keep
+        working for the default path even though a chosen path is left alone.
+        """
+        state_dir = self.home / ".local" / "state" / "sidepulse" / "agent-monitor"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_dir.chmod(0o755)
+
+        audit_module.append_status_history_record(
+            {"recorded_at": "t0", "status": "idle"},
+            path=state_dir / "status-history.jsonl",
+        )
+
+        self.assertEqual(0o700, self.mode_of(state_dir))
+
+    def test_a_short_write_still_lands_a_whole_record(self):
+        """os.write is one write(2) and may return short.
+
+        A dropped trailing newline makes the next append share a physical line,
+        so two records become unparseable instead of zero. The write has to loop
+        until the payload is out.
+        """
+        path = self.home / "short.jsonl"
+        real_write = os.write
+        chunks: list[int] = []
+
+        def one_byte_at_a_time(fd: int, data: bytes) -> int:
+            written = real_write(fd, data[:1])
+            chunks.append(written)
+            return written
+
+        with patch.object(jsonl_log.os, "write", side_effect=one_byte_at_a_time):
+            jsonl_log.append_jsonl_line(path, {"index": 0})
+            jsonl_log.append_jsonl_line(path, {"index": 1})
+
+        self.assertGreater(len(chunks), 2, "os.write was not exercised short")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual([{"index": 0}, {"index": 1}], [json.loads(x) for x in lines])
+
+    def test_zero_backups_discards_instead_of_growing_unbounded(self):
+        """A log whose reader ignores backups asks for no backups.
+
+        Retaining a generation no reader opens costs disk and buys nothing, so
+        ``backup_count=0`` has to mean "rotate and discard". It must not mean
+        "never rotate", which would let the log grow without limit.
+        """
+        path = self.home / "discard.jsonl"
+        for index in range(200):
+            jsonl_log.append_jsonl_line(
+                path,
+                {"index": index, "pad": "x" * 100},
+                max_bytes=1024,
+                backup_count=0,
+            )
+
+        self.assertEqual([], list(self.home.glob("discard.jsonl.*")))
+        self.assertLess(path.stat().st_size, 1024 + 200)
+        self.assertEqual(
+            199,
+            json.loads(path.read_text(encoding="utf-8").splitlines()[-1])["index"],
+        )
+
+    def test_zero_max_bytes_still_disables_rotation(self):
+        """Passing no cap must keep the old unbounded behaviour available."""
+        path = self.home / "uncapped.jsonl"
+        for index in range(50):
+            jsonl_log.append_jsonl_line(
+                path,
+                {"index": index, "pad": "x" * 100},
+                max_bytes=0,
+                backup_count=0,
+            )
+
+        self.assertEqual([], list(self.home.glob("uncapped.jsonl.*")))
+        self.assertEqual(50, len(path.read_text(encoding="utf-8").splitlines()))
+
     def test_existing_world_readable_log_is_tightened(self):
         """Installs that already wrote a 0644 log must be repaired in place."""
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -279,9 +374,15 @@ class LogHygieneTests(HookIsolationMixin, unittest.TestCase):
         self.assertEqual(0o600, self.mode_of(self.log_path))
 
     def test_log_directory_is_owner_only(self):
-        """The directory guard also covers the audit log and latest.json."""
+        """The directory guard also covers the audit log and latest.json.
+
+        Those live in the state dir, which sidepulse creates and owns. The
+        provider log's own parent is deliberately not covered: that path is
+        user-configurable, so its permissions are the user's to set.
+        """
         self.write_records(1)
-        self.assertEqual(0o700, self.mode_of(self.log_path.parent))
+        state_dir = self.home / ".local" / "state" / "sidepulse" / "agent-monitor"
+        self.assertEqual(0o700, self.mode_of(state_dir))
 
     def test_log_rotates_at_the_size_cap(self):
         with patch.object(hook_module, "MAX_LOG_BYTES", 2048):
@@ -312,13 +413,34 @@ class LogHygieneTests(HookIsolationMixin, unittest.TestCase):
                 json.loads(line)  # a truncated record would raise here
 
     def test_rotation_failure_still_exits_zero(self):
-        """Log hygiene is best-effort; it must never break an agent turn."""
-        with patch.object(
-            hook_module, "append_jsonl_line", side_effect=OSError("rotation broke")
-        ):
+        """Log hygiene is best-effort; it must never break an agent turn.
+
+        Every step of rotate_log swallows OSError, so a log that cannot be
+        renamed has to leave the hook exiting 0 and still recording. A read-only
+        directory reaches that path for real; patching the writer to raise only
+        reaches hook_log_main's blanket except, which another test covers.
+        """
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_path.write_text("x" * 4096 + "\n", encoding="utf-8")
+        self.log_path.chmod(0o600)
+        self.log_path.parent.chmod(0o500)
+        self.addCleanup(self.log_path.parent.chmod, 0o700)
+
+        with patch.object(hook_module, "MAX_LOG_BYTES", 1024):
             code, out = run_hook("claude", self.log_path, '{"hook_event_name": "Stop"}')
+
         self.assertEqual(0, code)
         self.assertEqual("", out)
+        self.assertEqual(
+            [],
+            list(self.log_path.parent.glob("hook.jsonl.*")),
+            "rotation cannot rename inside a read-only directory",
+        )
+        self.assertIn(
+            "Stop",
+            self.log_path.read_text(encoding="utf-8"),
+            "the record must still be appended when rotation fails",
+        )
 
     def test_sibling_audit_log_is_also_private_and_bounded(self):
         """event-status.jsonl holds up to 2000 chars of raw payload per record.
@@ -337,7 +459,12 @@ class LogHygieneTests(HookIsolationMixin, unittest.TestCase):
         )
 
     def test_status_history_log_is_also_private_and_bounded(self):
-        """The status bar appends one of these per refresh, idle or not."""
+        """The status bar appends one of these per refresh, idle or not.
+
+        The chart reads the live file only, so this log keeps no backups: the
+        bytes on disk are the bytes the chart can show. Boundedness is therefore
+        a size assertion, not the presence of a rotated generation.
+        """
         history_path = self.home / "history.jsonl"
         with patch.object(audit_module, "STATUS_HISTORY_MAX_BYTES", 1024):
             for index in range(200):
@@ -346,8 +473,11 @@ class LogHygieneTests(HookIsolationMixin, unittest.TestCase):
                     path=history_path,
                 )
         self.assertEqual(0o600, self.mode_of(history_path))
-        self.assertTrue(
-            list(self.home.glob("history.jsonl.*")), "history log never rotated"
+        self.assertEqual(
+            [], list(self.home.glob("history.jsonl.*")), "history log kept a backup"
+        )
+        self.assertLess(
+            history_path.stat().st_size, 1024 + 200, "history log grew past the cap"
         )
 
 
