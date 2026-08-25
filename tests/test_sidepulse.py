@@ -1657,7 +1657,41 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIn("Agent Status", titles)
 
     def test_status_bar_multiagent_controller_takes_the_device_brightness(self) -> None:
-        """A slider drag has to reach the strip, not just the menu."""
+        """A slider drag has to reach the strip, not just the menu.
+
+        One call only, so there is no aliasing to reason about: the factory hands
+        back a cached object, and the "moved afterwards" half of that lives in the
+        next test rather than sharing a controller with this assertion.
+        """
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        device = status_bar.StatusBarDevice(
+            device_id="/Volumes/SidePulsePro",
+            name="SidePulse Pro",
+            root=Path("/Volumes/SidePulsePro"),
+            target=Path("/Volumes/SidePulsePro/LEDS.LED"),
+            connected=True,
+            display=LED_DISPLAY_MULTIAGENT,
+            brightness=96,
+        )
+        fake = SimpleNamespace(multiagent_led_controllers_by_device={})
+
+        controller = status_bar.StatusBarController.multiagent_controller_for_device(
+            fake, device
+        )
+
+        self.assertEqual(controller.brightness, 96)
+
+    def test_status_bar_multiagent_controller_follows_a_later_brightness(self) -> None:
+        """The second call re-points a cached controller; it must move it too.
+
+        Nothing rebuilds the controller when the slider moves, so a factory that
+        only set brightness on construction would strand it at whatever the device
+        happened to be on first sight.
+        """
         try:
             from sidepulse import status_bar
         except SystemExit as exc:
@@ -1677,15 +1711,11 @@ class AgentMonitorTests(unittest.TestCase):
         first = status_bar.StatusBarController.multiagent_controller_for_device(
             fake, device
         )
-        # Read before the second call: it hands back this same object, so asking
-        # afterwards would only ever see the second brightness.
-        self.assertEqual(first.brightness, 96)
-
         dimmed = status_bar.StatusBarController.multiagent_controller_for_device(
             fake, replace(device, brightness=32)
         )
 
-        # Same cached controller, moved by the second call.
+        # Cached, not rebuilt -- which is exactly why the move has to be assigned.
         self.assertIs(dimmed, first)
         self.assertEqual(dimmed.brightness, 32)
 
@@ -1812,6 +1842,59 @@ class AgentMonitorTests(unittest.TestCase):
         ]
 
         self.assertIn("Add Screen Bar", titles)
+
+    def test_status_bar_virtual_multiagent_program_carries_the_brightness(self) -> None:
+        """The Screen Bar's multiagent branch passes brightness like its neighbours.
+
+        Its two siblings in `sync_virtual_status_device` -- battery above, aggregate
+        below -- both pass `device.brightness`, and this branch was the one omitting
+        it. No slider builds for the virtual device today, so the value only ever
+        arrives from a hand-edited settings file; that makes this the sole thing
+        stopping a future refactor from dropping the argument unnoticed.
+        """
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        device = status_bar.StatusBarDevice(
+            device_id=status_bar.VIRTUAL_DEVICE_ID,
+            name="Screen Bar",
+            root=Path(status_bar.VIRTUAL_DEVICE_ID),
+            target=Path(status_bar.VIRTUAL_DEVICE_ID),
+            connected=True,
+            display=LED_DISPLAY_MULTIAGENT,
+            brightness=64,
+        )
+        programs: list[str] = []
+        target = SimpleNamespace(
+            settings=SimpleNamespace(virtual_status_device_enabled=True),
+            virtual_status_device=SimpleNamespace(
+                set_program=programs.append,
+                hide=lambda: programs.append("<hidden>"),
+            ),
+            status_bar_devices=lambda remember=True: [device],
+            active_led_display_kind_for_device=lambda _d, _s: LED_DISPLAY_MULTIAGENT,
+            virtual_slot_allocator=SlotAllocator(slot_count=8, rng=random.Random(1234)),
+        )
+        statuses = (
+            AgentStatus(
+                provider="claude",
+                agent_id="claude:session:a",
+                display_name="a",
+                mode=AgentMode.WAITING_FOR_INPUT,
+                updated_at=datetime.now(timezone.utc),
+                event_name="Stop",
+            ),
+        )
+
+        status_bar.StatusBarController.sync_virtual_status_device(
+            target, AgentMode.IDLE_READY, None, slot_statuses=statuses
+        )
+
+        self.assertEqual(len(programs), 1)
+        self.assertEqual(programs[0].splitlines()[0], "brightness 64")
+        self.assertIn(BAND_ALERT.steady, programs[0])
 
     def test_status_bar_observe_connected_device_resets_on_new_mount(self) -> None:
         try:
@@ -4820,6 +4903,51 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertFalse(second.changed)
             self.assertFalse(third.changed)
             self.assertIn(f"7:{BAND_ALERT.steady}", (device / "LEDS.LED").read_text())
+
+    def test_multiagent_controller_writes_once_when_the_brightness_moves(self) -> None:
+        """A slider move reaches the written program, and costs exactly one write.
+
+        This closes the chain the menu starts: the factory sets
+        `controller.brightness`, and it has to come out in the device file. The slot
+        vector is identical across all three syncs, so the dedupe key is the only
+        thing that can carry the move -- if `slot_render_key` ever stopped
+        including brightness, the slider would go quietly inert and every other
+        test in this file would still pass.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "SidePulsePro"
+            device.mkdir()
+            controller = MultiAgentLedController(
+                device_path=device, rng=random.Random(1234)
+            )
+            base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+            statuses = (
+                AgentStatus(
+                    provider="claude",
+                    agent_id="claude:session:a",
+                    display_name="a",
+                    mode=AgentMode.WAITING_FOR_INPUT,
+                    updated_at=base,
+                    event_name="Stop",
+                ),
+            )
+
+            first = controller.sync_statuses(statuses, now=base)
+            controller.brightness = 32
+            dimmed = controller.sync_statuses(statuses, now=base)
+            again = controller.sync_statuses(statuses, now=base)
+
+            self.assertTrue(first.changed)
+            # Full gain omits the directive entirely; a dimmed one must state it.
+            self.assertNotIn("brightness", first.program)
+            self.assertTrue(dimmed.changed)
+            self.assertEqual(dimmed.program.splitlines()[0], "brightness 32")
+            self.assertIn("brightness 32", (device / "LEDS.LED").read_text())
+            # A master gain over the bands, not a replacement for them: the band
+            # colours are the same hexes at either setting.
+            self.assertIn(f"7:{BAND_ALERT.steady}", dimmed.program)
+            # And the move settles -- one write, not a write per tick.
+            self.assertFalse(again.changed)
 
     def test_multiagent_controller_writes_once_when_a_slot_settles(self) -> None:
         """Ticking the window down is not a write; crossing five minutes is one, once.
