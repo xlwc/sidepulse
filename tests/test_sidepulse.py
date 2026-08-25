@@ -1593,6 +1593,25 @@ class AgentMonitorTests(unittest.TestCase):
 
         self.assertEqual(by_title["Manual"].state(), 1)
 
+    def test_status_bar_device_display_label_names_every_choice(self) -> None:
+        """The label is what the confirmation message says after you pick a mode.
+
+        A display kind missing here reads as "Agent Status", which is the wrong
+        mode rather than a missing string.
+        """
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        labels = {
+            display: status_bar.device_display_label(display)
+            for display in LED_DISPLAY_CHOICES
+        }
+
+        self.assertEqual(labels[LED_DISPLAY_MULTIAGENT], "One LED Per Agent")
+        self.assertEqual(len(set(labels.values())), len(LED_DISPLAY_CHOICES))
+
     def test_status_bar_device_menu_offers_the_multiagent_choice(self) -> None:
         try:
             from sidepulse import status_bar

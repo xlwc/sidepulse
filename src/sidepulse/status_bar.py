@@ -3942,6 +3942,8 @@ def device_display_label(display: str) -> str:
         return "Battery Level"
     if display == LED_DISPLAY_CUSTOM:
         return "Manual"
+    if display == LED_DISPLAY_MULTIAGENT:
+        return "One LED Per Agent"
     return "Agent Status"
 
 
