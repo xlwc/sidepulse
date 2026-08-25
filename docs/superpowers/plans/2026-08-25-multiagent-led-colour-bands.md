@@ -37,14 +37,14 @@ SIDEPULSE_SKIP_CLEAN_INSTALL=1 .venv/bin/python -m pytest tests -q
 |---|---|---|
 | `src/sidepulse/led_slots.py` | band table, slot allocation, flash clock | `SlotBand` + three band constants replace `SLOT_AMBER`/`SLOT_CYAN`/`SLOT_GREEN`; `MODE_SLOT_BAND`/`slot_band()` replace `MODE_SLOT_COLOR`/`slot_color()`; `FLASHING_RANKS` deleted; `Slot` gains keyword-only `flash_color` with `.flashing` derived; `_Occupant.color` → `_Occupant.band` |
 | `src/sidepulse/led_status.py` | LEDS.LED program text, write dedupe, controllers | flash-line target → `slot.flash_color`; `SLOT_BRIGHTNESS` 128 → 255; `slot_render_key` carries the colour pair |
-| `src/sidepulse/status_bar.py` | menu-bar app, per-device controllers | assign `controller.brightness`; un-hide the brightness readout and slider in multiagent mode |
+| `src/sidepulse/status_bar.py` | menu-bar app, per-device controllers | assign `controller.brightness`; pass `brightness=` to the Screen Bar's `program_for_slots`; un-hide the brightness readout and slider in multiagent mode |
 | `src/sidepulse/cli.py` | `agent-monitor leds` | **no change** — its `SLOT_EMPTY` comparison and `.flashing` count both still hold |
 | `tests/test_led_slots.py` | allocator and flash-clock unit tests | band assertions; working-never-flashes and idle-does-flash invert |
-| `tests/test_sidepulse.py` | renderer, controller, submenu tests | `Slot(...)` call sites, expected program text, brightness tests invert, submenu test inverts |
-| `docs/usage.md` | operational guide | colour table, brightness gotcha, "amber" reference, sample program |
+| `tests/test_sidepulse.py` | renderer, controller, submenu tests | `Slot(...)` call sites, expected program text, brightness tests invert, submenu test inverts, settle test edited in place |
+| `docs/usage.md` | operational guide | colour table, brightness gotcha, "amber" reference, Screen Bar promise, rationale link, sample program |
 | `docs/superpowers/specs/2026-08-24-multiagent-led-slots-design.md` | prior design | superseded-by pointer at the top |
 
-`virtual_device.py` needs no change: it renders the Screen Bar by running program text through `led_wasm`, so it picks up the new bands for free.
+`virtual_device.py` needs no change: it renders the Screen Bar by running program text through `led_wasm`, so it picks up the new bands for free. The call site in `status_bar.py` that *builds* that text does need one — see Task 3 Step 4.
 
 ---
 
@@ -184,9 +184,9 @@ These are mechanical substitutions of the old constants, which no longer exist:
 - `SLOT_CYAN` → `BAND_WORKING.steady`
 - `SLOT_GREEN` → `BAND_DONE.steady`
 
-Affected lines: 98, 99, 112, 122, 145, 153, 180, 196, 254, 265, 302, 313, 331, 390-391, 431. `SLOT_EMPTY` is unchanged everywhere it appears.
+The lines that need it are **98, 112, 145, 180, 196, 331, 391, 431** — every colour reference outside the two classes replaced wholesale by Steps 1 and 3. Do not go hunting further: lines 99, 122, 153 and 313 reference only `SLOT_EMPTY`, which is unchanged, and line 390 has no colour reference at all (391 does).
 
-Two of those need more than a substitution, because `[SLOT_AMBER] * 8` style lists now read oddly against a band:
+Two of them need more than a substitution, because a band name does not fit on the original line:
 
 ```python
 # line 196, inside test_a_less_important_newcomer_gets_no_slot
@@ -197,6 +197,9 @@ Two of those need more than a substitution, because `[SLOT_AMBER] * 8` style lis
             sorted(slot.color for slot in slots),
             sorted([BAND_ALERT.steady, BAND_WORKING.steady]),
         )
+
+# line 391, inside test_a_completed_session_renders_green_beside_a_working_one
+            sorted([BAND_WORKING.steady, BAND_DONE.steady]),
 ```
 
 - [ ] **Step 3: Rewrite `FlashClockTests` in `tests/test_led_slots.py`**
@@ -241,6 +244,25 @@ class FlashClockTests(unittest.TestCase):
         self.assertEqual(slots[7].color, BAND_ALERT.steady)
         self.assertTrue(slots[7].flashing)
         self.assertAlmostEqual(slots[7].remaining_flash_seconds, FLASH_SECONDS - 60)
+
+    def test_the_working_bands_clock_survives_working_to_tool_running(self) -> None:
+        """The same guarantee for the one pair where Slot cannot show it.
+
+        BAND_WORKING has no flash_peak, so a working slot renders
+        remaining_flash_seconds = 0.0 at any age and the clock behind it is
+        invisible from outside. Reading the occupant directly is the only way to
+        check that WORKING -> TOOL_RUNNING does not restart it. Private, and worth
+        it: the alternative is an asserted invariant nobody verifies.
+        """
+        allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
+        allocator.update((status("a", AgentMode.WORKING),), BASE)
+        entered_at = allocator._slots[7].entered_at
+
+        later = BASE + timedelta(seconds=60)
+        allocator.update((status("a", AgentMode.TOOL_RUNNING, updated_at=later),), later)
+
+        self.assertEqual(allocator._slots[7].entered_at, entered_at)
+        self.assertEqual(allocator._slots[7].band, BAND_WORKING)
 
     def test_the_flash_clock_resets_when_the_band_changes(self) -> None:
         allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
@@ -545,7 +567,7 @@ from "has been like this a while".
 .venv/bin/python -m pytest tests/test_led_slots.py -q
 ```
 
-Expected: PASS, 34 tests. `tests/test_sidepulse.py` is still red at import — Step 9 fixes that.
+Expected: PASS, 36 tests — 32 today, plus two in `SlotRankTests` and two in `FlashClockTests`. `tests/test_sidepulse.py` is still red at import — Step 9 fixes that.
 
 - [ ] **Step 9: Rewrite the renderer tests in `tests/test_sidepulse.py`**
 
@@ -734,11 +756,11 @@ Slot 2 asks for a full flash window and still does not appear on line 2, because
         self.assertNotEqual(slot_render_key(early, 128), slot_render_key(early, 255))
 ```
 
-Add one controller-level test for the boundary, next to the other `MultiAgentLedController` tests. The renderer test above proves the program shape; this proves the write budget:
+**Replace — do not add — the controller settle test at lines 4705-4741.** `test_multiagent_controller_writes_once_when_a_slot_settles` already exists. Defining the name a second time would make Python keep only the later one and drop the original with no error and no warning, losing its `after` phase — the assertion that proves the settle writes *once* rather than on every refresh afterwards. Keep all four phases and add the baseline check:
 
 ```python
     def test_multiagent_controller_writes_once_when_a_slot_settles(self) -> None:
-        """Ticking the flash window down is not a write; crossing five minutes is one.
+        """Ticking the window down is not a write; crossing five minutes is one, once.
 
         And the write it does emit restates the baseline unchanged -- the device is
         already holding the settled appearance by then, because `repeat` expired
@@ -750,7 +772,7 @@ Add one controller-level test for the boundary, next to the other `MultiAgentLed
             controller = MultiAgentLedController(
                 device_path=device, rng=random.Random(1234)
             )
-            base = datetime(2026, 8, 25, 12, 0, 0, tzinfo=timezone.utc)
+            base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
             statuses = (
                 AgentStatus(
                     provider="claude",
@@ -758,29 +780,39 @@ Add one controller-level test for the boundary, next to the other `MultiAgentLed
                     display_name="a",
                     mode=AgentMode.WAITING_FOR_INPUT,
                     updated_at=base,
-                    event_name="Notification",
+                    event_name="Stop",
                 ),
             )
 
             flashing = controller.sync_statuses(statuses, now=base)
-            midway = controller.sync_statuses(
-                statuses, now=base + timedelta(seconds=FLASH_SECONDS / 2)
+            still_flashing = controller.sync_statuses(
+                statuses, now=base + timedelta(seconds=FLASH_SECONDS - 15)
             )
-            settled = controller.sync_statuses(
+            settling = controller.sync_statuses(
                 statuses, now=base + timedelta(seconds=FLASH_SECONDS + 1)
+            )
+            after = controller.sync_statuses(
+                statuses, now=base + timedelta(seconds=FLASH_SECONDS + 16)
             )
 
             self.assertTrue(flashing.changed)
-            self.assertFalse(midway.changed)
-            self.assertTrue(settled.changed)
+            self.assertIn("900ms pulse", flashing.program)
+            self.assertFalse(still_flashing.changed)
+            self.assertTrue(settling.changed)
+            self.assertNotIn("pulse", settling.program)
+            self.assertNotIn("repeat", settling.program)
+            self.assertFalse(after.changed)
 
-            # Default brightness is 255, so no directive: baseline, flash, repeat.
+            # New: the settle write restates line 1 verbatim. Default brightness is
+            # 255 now, so there is no directive -- baseline, flash, repeat.
             self.assertEqual(len(flashing.program.splitlines()), 3)
-            self.assertEqual(len(settled.program.splitlines()), 1)
+            self.assertEqual(len(settling.program.splitlines()), 1)
             self.assertEqual(
-                flashing.program.splitlines()[0], settled.program.splitlines()[0]
+                flashing.program.splitlines()[0], settling.program.splitlines()[0]
             )
 ```
+
+**Delete `test_multiagent_program_uses_full_brightness_without_a_directive` (lines 4441-4446).** It passes `brightness=255` explicitly so it would still pass, but it is superseded in intent by `test_multiagent_program_defaults_to_full_brightness` above, which checks the same thing through the new default instead of around it. Do not leave it stranded between rewritten neighbours.
 
 Then the firmware-engine test. Replace its `vectors` list and add the pulse-up assertions Task 1 measured by hand:
 
@@ -979,13 +1011,16 @@ SLOT_BRIGHTNESS moves 128 -> 255. With intensity in the colours, leaving it at
 `multiagent_controller_for_device` refuses `device.brightness` on the grounds that eight LEDs at 255 glare. That reason is gone: the bands are already dim where dimness was wanted, so the directive is free to carry the slider.
 
 **Files:**
-- Modify: `src/sidepulse/status_bar.py:1769-1781`
-- Modify: `src/sidepulse/status_bar.py:2499-2510`
-- Test: `tests/test_sidepulse.py:1616-1671`
+- Modify: `src/sidepulse/status_bar.py:1776-1780`
+- Modify: `src/sidepulse/status_bar.py:1970`
+- Modify: `src/sidepulse/status_bar.py:2500-2506`
+- Test: `tests/test_sidepulse.py:1616-1657`
 
 - [ ] **Step 1: Write the failing tests**
 
-Replace `test_status_bar_multiagent_submenu_omits_the_inert_brightness_controls` (lines 1616-1671) with two tests. The first mirrors the assertions in `test_status_bar_aggregate_submenu_keeps_the_brightness_controls` immediately below it:
+Replace `test_status_bar_multiagent_submenu_omits_the_inert_brightness_controls`, which spans **lines 1616-1657**. Do not overshoot: line 1659 begins `test_status_bar_aggregate_submenu_keeps_the_brightness_controls`, and clipping its head both raises `SyntaxError` and destroys the very test the first replacement below mirrors.
+
+Replace it with two tests. The first mirrors the assertions in the aggregate test immediately below it:
 
 ```python
     def test_status_bar_multiagent_submenu_keeps_the_brightness_controls(self) -> None:
@@ -1079,7 +1114,7 @@ Expected: `test_status_bar_multiagent_submenu_keeps_the_brightness_controls` fai
 
 - [ ] **Step 3: Assign the brightness in `status_bar.py`**
 
-Replace the comment and add the assignment (lines 1777-1781):
+Replace the comment at lines 1777-1779 and the `return` at 1780, so the tail of `multiagent_controller_for_device` reads:
 
 ```python
         controller.device_path = device.target
@@ -1087,11 +1122,25 @@ Replace the comment and add the assignment (lines 1777-1781):
         return controller
 ```
 
-This now matches `agent_controller_for_device` and `battery_controller_for_device` exactly, which is the point — there is no longer anything special about this one.
+This now matches `agent_controller_for_device` (`:1750-1758`) and `battery_controller_for_device` (`:1760-1767`) exactly, which is the point — there is no longer anything special about this one.
 
-- [ ] **Step 4: Un-hide the submenu controls**
+- [ ] **Step 4: Give the Screen Bar the same brightness**
 
-Replace the comment and guard (lines 2499-2510):
+`sync_virtual_status_device` renders the multiagent Screen Bar with a bare call, while the battery branch above it (`:1963`) and the aggregate branch below it (`:1976`) both pass `brightness=device.brightness`. Left alone, `SLOT_BRIGHTNESS` 128 → 255 doubles the Screen Bar's output, and after Step 3 the physical strip would follow the slider while the Screen Bar never does.
+
+Replace line 1970:
+
+```python
+            self.virtual_status_device.set_program(
+                program_for_slots(slots, brightness=device.brightness)
+            )
+```
+
+`device` here is the `VIRTUAL_DEVICE_ID` entry, and `brightness_for_device` defaults it to 255, so this changes nothing at default settings. It stops the two displays from diverging permanently at every other setting, which is what `docs/usage.md` promises when it says only positions and counts are unguaranteed.
+
+- [ ] **Step 5: Un-hide the submenu controls**
+
+Replace the comment at lines 2500-2503 and the guard at 2504-2506:
 
 ```python
     if device.device_id != VIRTUAL_DEVICE_ID:
@@ -1108,7 +1157,7 @@ grep -c LED_DISPLAY_MULTIAGENT src/sidepulse/status_bar.py
 
 Expected: several hits (the mode picker and `active_led_display_kind_for_device` both use it), so the import stays.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 6: Run the tests to verify they pass**
 
 ```sh
 SIDEPULSE_REQUIRE_UI_TESTS=1 .venv/bin/python -m pytest tests/test_sidepulse.py -q -k "multiagent or brightness"
@@ -1116,7 +1165,7 @@ SIDEPULSE_REQUIRE_UI_TESTS=1 .venv/bin/python -m pytest tests/test_sidepulse.py 
 
 Expected: PASS. `SIDEPULSE_REQUIRE_UI_TESTS=1` makes an AppKit-less environment fail loudly instead of skipping the tests that matter here.
 
-- [ ] **Step 6: Run the full suite**
+- [ ] **Step 7: Run the full suite**
 
 ```sh
 SIDEPULSE_SKIP_CLEAN_INSTALL=1 .venv/bin/python -m pytest tests -q
@@ -1124,7 +1173,7 @@ SIDEPULSE_SKIP_CLEAN_INSTALL=1 .venv/bin/python -m pytest tests -q
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/sidepulse/status_bar.py tests/test_sidepulse.py
@@ -1134,6 +1183,13 @@ multiagent_controller_for_device refused device.brightness because the strip
 hardcoded 128, on the grounds that eight LEDs at 255 glare. The bands are dim
 where dimness was wanted now, so the directive is free to be the master gain the
 slider always looked like -- final output is hue x band tier x slider.
+
+The Screen Bar branch of sync_virtual_status_device was omitting brightness
+entirely while the battery and aggregate branches either side of it passed it.
+That was survivable when the strip ignored the setting too; with the strip now
+following the slider it would have made the two displays diverge at every setting
+below full, which is more than the 'positions and counts differ' that usage.md
+warns about. It passes device.brightness like its neighbours.
 
 The submenu items come back with it. Hiding them was the honest choice while the
 setting was ignored; showing a readout the strip agrees with is better."
@@ -1221,19 +1277,23 @@ Replace lines 251-270 (from the `A live strip with four sessions` paragraph thro
 
 ~~~markdown
 A live strip with four sessions — three waiting on input, one working, all four
-changed within the last five minutes:
+changed within the last five minutes. At default brightness there is no
+`brightness` directive at all; the intensity you see is the bands':
 
 ```text
-brightness 128
 0:#3D0000 1:#000000 2:#000000 3:#002A80 4:#3D0000 5:#000000 6:#000000 7:#3D0000
 0:#FF0000 900ms pulse; 4:#FF0000 900ms pulse; 7:#FF0000 900ms pulse
 repeat 328
 ```
 
-Line 2 is every slot's settled colour. Line 3 pulses only the recently-changed
+Line 1 is every slot's settled colour. Line 2 pulses only the recently-changed
 slots up to their band's peak and back; `pulse` returns to the line's start
 colour, so each cycle is a blink up from the baseline and unmentioned LEDs hold
-rock steady. Slot 3 is working and so never appears on line 3 at all.
+rock steady. Slot 3 is working and so never appears on line 2 at all, however
+recently it changed.
+
+Turn the slider down and a `brightness N` line appears above line 1, scaling all
+three bands together.
 
 `repeat` is `ceil(longest_remaining_flash / 917ms)` — 917 ms being the measured
 blink cycle for a `900ms pulse`, not a value derived from the pulse duration. It
@@ -1241,14 +1301,41 @@ counts down as the flash window closes, which is why the write-dedupe key
 excludes it; keying on the program text would rewrite `LEDS.LED` every 15 s
 forever.
 
-Because the count is finite *and* line 2 is the baseline, a dead app leaves a
+Because the count is finite *and* line 1 is the baseline, a dead app leaves a
 device holding the settled appearance — not one blinking indefinitely, and not
 one frozen on the bright pre-settle colour either. The five-minute write is
 therefore visually a no-op: by the time the host notices the boundary the device
-already looks right, and the write only removes a slot from line 3.
+already looks right, and the write only removes line 2.
 ~~~
 
-- [ ] **Step 5: Point the old design doc at the new one**
+- [ ] **Step 5: Amend the Screen Bar promise**
+
+Task 3 Step 4 made the Screen Bar follow `device.brightness` like the other display kinds, so the section at lines 168-179 needs its opening clause widened from colours to brightness. Replace lines 168-172 — everything from the heading down to and including "but nothing else is guaranteed:" — with:
+
+```markdown
+### The Screen Bar can disagree with the physical strip
+
+`sync_virtual_status_device` renders from the mode rather than reusing the
+strip's program, so it has its own allocator, seeded independently. Colours and
+brightness agree — both call `program_for_slots` with their device's brightness —
+but nothing else is guaranteed:
+```
+
+Leave the two bullets below it ("Positions differ", "Counts can differ") alone; both are still true.
+
+- [ ] **Step 6: Repoint the rationale link**
+
+Line 8 sends readers to the 2026-08-24 design doc, whose colour and brightness sections are now superseded. Replace lines 7-8:
+
+```markdown
+Design rationale lives in
+[`2026-08-24-multiagent-led-slots-design.md`](superpowers/specs/2026-08-24-multiagent-led-slots-design.md)
+for slot allocation, eviction and the status feed, and in
+[`2026-08-25-multiagent-led-colour-bands-design.md`](superpowers/specs/2026-08-25-multiagent-led-colour-bands-design.md)
+for the colour bands, the flash shape and brightness.
+```
+
+- [ ] **Step 7: Point the old design doc at the new one**
 
 Add this immediately after the `Status:` line at the top of
 `docs/superpowers/specs/2026-08-24-multiagent-led-slots-design.md`:
@@ -1263,7 +1350,7 @@ Add this immediately after the `Status:` line at the top of
 > the status feed, sleep behaviour, the write budget — still holds.
 ```
 
-- [ ] **Step 6: Check every hex in the docs matches the code**
+- [ ] **Step 8: Check every hex in the docs matches the code**
 
 ```sh
 grep -o '#[0-9A-Fa-f]\{6\}' docs/usage.md | sort -u
@@ -1272,7 +1359,7 @@ grep -o '#[0-9A-Fa-f]\{6\}' src/sidepulse/led_slots.py | sort -u
 
 Expected: both print exactly `#002A80`, `#003D18`, `#008033`, `#000000`, `#3D0000`, `#FF0000`. No `#FF3A00`, `#00E5FF`, or `#00FF66` may survive in `docs/usage.md`.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add docs/usage.md docs/superpowers/specs/2026-08-24-multiagent-led-slots-design.md
