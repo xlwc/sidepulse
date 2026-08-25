@@ -1774,9 +1774,7 @@ class StatusBarController(NSObject):
             controller = MultiAgentLedController(device_path=device.target)
             self.multiagent_led_controllers_by_device[device.device_id] = controller
         controller.device_path = device.target
-        # Deliberately not device.brightness: slots render at SLOT_BRIGHTNESS so
-        # eight lit LEDs are readable rather than glaring. Per-device brightness
-        # in multiagent mode is not wired up yet.
+        controller.brightness = device.brightness
         return controller
 
     def status_bar_devices(self, *, remember: bool = True) -> list[StatusBarDevice]:
@@ -1967,7 +1965,9 @@ class StatusBarController(NSObject):
             slots = self.virtual_slot_allocator.update(
                 slot_statuses, datetime.now(timezone.utc)
             )
-            self.virtual_status_device.set_program(program_for_slots(slots))
+            self.virtual_status_device.set_program(
+                program_for_slots(slots, brightness=device.brightness)
+            )
         else:
             self.virtual_status_device.set_program(
                 program_for_display_state(
@@ -2497,14 +2497,7 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
     custom.setState_(1 if device.display == LED_DISPLAY_CUSTOM else 0)
     submenu.addItem_(custom)
 
-    # Multiagent renders every slot at SLOT_BRIGHTNESS and never reads
-    # device.brightness (see multiagent_controller_for_device), so a readout here
-    # would report a number the strip does not use and the slider would do
-    # nothing. Omit both until the setting is wired through.
-    if (
-        device.device_id != VIRTUAL_DEVICE_ID
-        and device.display != LED_DISPLAY_MULTIAGENT
-    ):
+    if device.device_id != VIRTUAL_DEVICE_ID:
         submenu.addItem_(NSMenuItem.separatorItem())
         submenu.addItem_(disabled_menu_item(f"Brightness {brightness_percent(device.brightness)}%"))
         submenu.addItem_(build_brightness_slider_item(device, target))

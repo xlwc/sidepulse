@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1613,14 +1614,13 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(labels[LED_DISPLAY_MULTIAGENT], "One LED Per Agent")
         self.assertEqual(len(set(labels.values())), len(LED_DISPLAY_CHOICES))
 
-    def test_status_bar_multiagent_submenu_omits_the_inert_brightness_controls(
-        self,
-    ) -> None:
-        """Multiagent renders at a fixed SLOT_BRIGHTNESS and never reads the setting.
+    def test_status_bar_multiagent_submenu_keeps_the_brightness_controls(self) -> None:
+        """The slider is live in this mode now that intensity is in the colours.
 
-        Showing the readout anyway made the submenu claim "Brightness 100%" while
-        the strip wrote `brightness 128`, and dragging the slider changed nothing
-        on the device. Until the setting is wired through, the honest UI is no UI.
+        It used to be hidden because the strip hardcoded brightness 128 and
+        ignored the setting, so the readout would have claimed a number the device
+        did not use. The bands carry intensity themselves, so the directive is
+        free to be the master gain the slider always looked like.
         """
         try:
             from sidepulse import status_bar
@@ -1650,11 +1650,44 @@ class AgentMonitorTests(unittest.TestCase):
             if submenu.itemAtIndex_(index).view() is not None
         )
 
-        self.assertNotIn("Brightness 100%", titles)
-        self.assertEqual(slider_count, 0)
+        self.assertIn("Brightness 100%", titles)
+        self.assertEqual(slider_count, 1)
         # The mode picker itself must survive, or there is no way back out.
         self.assertIn("One LED Per Agent", titles)
         self.assertIn("Agent Status", titles)
+
+    def test_status_bar_multiagent_controller_takes_the_device_brightness(self) -> None:
+        """A slider drag has to reach the strip, not just the menu."""
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        device = status_bar.StatusBarDevice(
+            device_id="/Volumes/SidePulsePro",
+            name="SidePulse Pro",
+            root=Path("/Volumes/SidePulsePro"),
+            target=Path("/Volumes/SidePulsePro/LEDS.LED"),
+            connected=True,
+            display=LED_DISPLAY_MULTIAGENT,
+            brightness=96,
+        )
+        fake = SimpleNamespace(multiagent_led_controllers_by_device={})
+
+        first = status_bar.StatusBarController.multiagent_controller_for_device(
+            fake, device
+        )
+        # Read before the second call: it hands back this same object, so asking
+        # afterwards would only ever see the second brightness.
+        self.assertEqual(first.brightness, 96)
+
+        dimmed = status_bar.StatusBarController.multiagent_controller_for_device(
+            fake, replace(device, brightness=32)
+        )
+
+        # Same cached controller, moved by the second call.
+        self.assertIs(dimmed, first)
+        self.assertEqual(dimmed.brightness, 32)
 
     def test_status_bar_aggregate_submenu_keeps_the_brightness_controls(self) -> None:
         try:
