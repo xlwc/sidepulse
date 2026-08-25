@@ -428,5 +428,58 @@ class PackageDataTests(unittest.TestCase):
                     )
 
 
+HEX_LITERAL = re.compile(r"#[0-9A-Fa-f]{6}")
+
+LED_SLOTS = SRC_ROOT / "sidepulse/led_slots.py"
+USAGE_DOC = REPO_ROOT / "docs/usage.md"
+
+
+class DocumentedColourTests(unittest.TestCase):
+    """The multiagent band colours are restated in prose and must not drift.
+
+    The band hexes in ``led_slots.py`` are provisional: they encode intensity as
+    well as hue, so they are expected to be retuned against real hardware. A
+    retune that misses the code is caught loudly by the three exact-program-text
+    tests in ``tests/test_sidepulse.py``. A retune that misses ``docs/usage.md``
+    is caught by nothing -- it ships a colour table telling users that a state
+    they are looking at is a colour the strip no longer emits. This test is that
+    nothing.
+
+    Set equality, not order or count: the doc legitimately repeats a hex across
+    its table and its worked example, and says nothing about how many times each
+    appears.
+    """
+
+    def test_usage_doc_hexes_match_led_slots(self):
+        if not USAGE_DOC.exists():
+            self.skipTest(
+                f"{USAGE_DOC} is absent; docs/ ships in the repo, not the wheel"
+            )
+        documented = set(HEX_LITERAL.findall(USAGE_DOC.read_text(encoding="utf-8")))
+        implemented = set(HEX_LITERAL.findall(LED_SLOTS.read_text(encoding="utf-8")))
+
+        stale = sorted(documented - implemented)
+        undocumented = sorted(implemented - documented)
+        problems = []
+        if stale:
+            problems.append(
+                "docs/usage.md names colours led_slots.py does not emit: "
+                + ", ".join(stale)
+            )
+        if undocumented:
+            problems.append(
+                "led_slots.py emits colours docs/usage.md never names: "
+                + ", ".join(undocumented)
+            )
+        self.assertEqual(
+            [],
+            problems,
+            "; ".join(problems)
+            + " -- a band retune has to move the colour table, the worked "
+            "example and the two effective-intensity figures in docs/usage.md "
+            "as well as the table in led_slots.py",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

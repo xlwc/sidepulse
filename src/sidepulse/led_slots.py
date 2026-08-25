@@ -66,8 +66,11 @@ class SlotBand:
 #
 # Provisional. Numeric intensity is not perceived intensity -- one tier fraction
 # does not read as one tier across red, blue and green -- so expect to retune all
-# five against real hardware. Nothing outside this table needs to change when you
-# do.
+# five against real hardware. No code outside this table needs to change when you
+# do, but the three exact-program-text tests in tests/test_sidepulse.py and the
+# colour table, worked example and two effective-intensity figures in
+# docs/usage.md all restate these values. The tests fail loudly; the doc is
+# guarded by the hex-parity test in tests/test_packaging.py.
 BAND_ALERT = SlotBand(steady="#3D0000", flash_peak="#FF0000")  # low 24% / high 100%
 BAND_WORKING = SlotBand(steady="#002A80", flash_peak=None)  # medium 50%
 BAND_DONE = SlotBand(steady="#003D18", flash_peak="#008033")  # low 24% / medium 50%

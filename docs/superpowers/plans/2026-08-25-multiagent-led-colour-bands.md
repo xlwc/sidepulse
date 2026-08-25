@@ -1383,7 +1383,7 @@ would lose more than it saves."
 The suite proves the program text. It cannot prove that red reads as urgent and blue as calm at these numeric values — that is what this task is for, and it is the reason the hexes are called provisional.
 
 **Files:**
-- No files change unless the colours read badly, in which case only the five constants in `src/sidepulse/led_slots.py` move.
+- No files change unless the colours read badly. If they do, the five constants in `src/sidepulse/led_slots.py` move — and with them the three exact-program-text tests and the five `docs/usage.md` spots listed in Step 4.
 
 - [ ] **Step 1: Print the program without touching the device**
 
@@ -1391,7 +1391,7 @@ The suite proves the program text. It cannot prove that red reads as urgent and 
 .venv/bin/python -m sidepulse agent-monitor leds --once --dry-run --display multiagent
 ```
 
-Expected: a program whose baseline line uses only the six hexes from Task 4 Step 6, and no `brightness` line at all — the CLI relies on the controller default, which is now 255.
+Expected: a program whose baseline line uses only the six hexes from Task 4 Step 8, and no `brightness` line at all — the CLI relies on the controller default, which is now 255.
 
 - [ ] **Step 2: Drive a real strip, if one is mounted**
 
@@ -1418,9 +1418,27 @@ Expected: the readout and slider are present in multiagent mode, and dragging vi
 
 - [ ] **Step 4: Retune only if needed, then commit**
 
-If the bands read badly — most likely blue looking far weaker than red, or the settled colours being too faint to see — change only `BAND_ALERT`, `BAND_WORKING`, and `BAND_DONE` in `src/sidepulse/led_slots.py`, then update the hexes in `docs/usage.md` and the two exact-program-text tests in `tests/test_sidepulse.py`.
+If the bands read badly — most likely blue looking far weaker than red, or the settled colours being too faint to see — change only `BAND_ALERT`, `BAND_WORKING`, and `BAND_DONE` in `src/sidepulse/led_slots.py`. Then follow the restatements, because a retune is not a one-file edit.
 
-`test_every_flashing_band_peaks_brighter_than_it_settles` guards the one invariant tuning must not break. Re-run the suite before committing:
+**Three** exact-program-text tests in `tests/test_sidepulse.py` assert band hexes and will fail until updated:
+
+- `test_multiagent_program_renders_a_baseline_and_a_flash_line`
+- `test_multiagent_program_omits_the_flash_line_when_nothing_is_recent`
+- `test_multiagent_program_renders_a_two_led_strip`
+
+There is also a cosmetic `#3D0000` in a fake `MultiAgentLedWrite` program in the status-bar sync test; it asserts nothing about colour, so it is optional.
+
+**Five** spots in `docs/usage.md`, in the order they appear:
+
+1. The band table in "What you see" — `steady` and `flash_peak` for all three bands.
+2. The sample `text` program under "Checking what it is doing" — baseline and flash lines.
+3. The urgency-axis sentence, if a peak or the working value moves relative to the others ("red peaks at full and green at half, and after five minutes both settle *below* a working slot's steady mid-intensity").
+4. **"at 25%, `#3D0000` is an effective red of about 15/255"** in the brightness gotcha.
+5. **"an effective red of 61/255 where the old flat amber ran at 128"** in the same section.
+
+Spots 4 and 5 are the dangerous ones: they are arithmetic derived from `BAND_ALERT.steady`, they read as prose rather than as a colour reference, and no test recomputes them. Recompute both by hand — 61 is `0x3D`, and 15 is `61 × 64 ÷ 255` for a 25% slider.
+
+`test_every_flashing_band_peaks_brighter_than_it_settles` guards the one invariant tuning must not break, and `test_usage_doc_hexes_match_led_slots` in `tests/test_packaging.py` catches spots 1 and 2 being missed — it compares the hex *sets* in the two files, so it cannot see a wrong number in spots 3-5. Re-run the suite before committing:
 
 ```sh
 SIDEPULSE_SKIP_CLEAN_INSTALL=1 .venv/bin/python -m pytest tests -q

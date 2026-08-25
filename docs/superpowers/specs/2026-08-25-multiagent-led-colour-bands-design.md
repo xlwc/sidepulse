@@ -92,7 +92,11 @@ static line. Working is the boring state and should look boring.
 Numeric intensity is not perceived intensity. On RGB LEDs a pure blue at half
 scale reads very differently from a red at half scale, so one shared tier
 fraction will not look like one tier. All five constants live in a single table
-precisely so that tuning them requires touching nothing else.
+precisely so that no *code* outside it has to change when they are tuned. Three
+exact-program-text tests in `tests/test_sidepulse.py` and the colour table,
+worked example and two effective-intensity figures in `docs/usage.md` do restate
+the values, so a retune is a table edit plus those; the tests fail loudly and the
+doc is guarded by a hex-parity test.
 
 One known edge: the low tier combined with a low slider setting can quantize to
 invisible — at slider 25% `#3D0000` becomes an effective red of roughly 15/255.

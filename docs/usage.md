@@ -46,9 +46,10 @@ slider on top, as a master gain over all three bands.
 
 The hex values are provisional. Numeric intensity is not perceived intensity, and
 one tier fraction does not read as one tier across red, blue and green — expect
-them to be retuned against hardware. They are all in the `BAND_ALERT` /
-`BAND_WORKING` / `BAND_DONE` table in `led_slots.py`, so tuning them touches
-nothing else.
+them to be retuned against hardware. The code has them in one place, the
+`BAND_ALERT` / `BAND_WORKING` / `BAND_DONE` table in `led_slots.py`; this file
+restates them in the table above, in the worked example further down and in two
+effective-intensity figures, so a retune moves those too.
 
 ## Turning it on
 
