@@ -2,9 +2,10 @@
 
 One LED is one top-level agent session. A session takes a slot when it becomes
 displayable, keeps it while it stays displayable, and gives it up when it drops
-out of the set it was fed. Colour says what the session needs; a slot flashes
-for the first five minutes after it enters a colour, so "changed recently" reads
-differently from "has been like this a while".
+out of the set it was fed. A colour band says what the session needs; bands that
+carry a flash peak blink for the first five minutes after a session enters them
+and then settle to their steady colour, so "changed recently" reads differently
+from "has been like this a while".
 
 "Top-level" is enforced upstream, in ``collector.multiagent_statuses``, not
 here: this module keys on ``AgentStatus.agent_id``, and a Task-tool sub-agent
@@ -19,16 +20,13 @@ PyObjC absent.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Iterable
 
 from .models import AgentMode, AgentStatus
 
 
-SLOT_AMBER = "#FF3A00"
-SLOT_CYAN = "#00E5FF"
-SLOT_GREEN = "#00FF66"
 SLOT_EMPTY = "#000000"
 
 # Five minutes is the prompt cache TTL. Flashing therefore means the cache
@@ -38,8 +36,46 @@ SLOT_EMPTY = "#000000"
 # flash was signalling is no longer true.
 FLASH_SECONDS = 5 * 60.0
 
+
+@dataclass(frozen=True)
+class SlotBand:
+    """What a slot looks like settled, and what it flashes up to.
+
+    ``flash_peak`` is None for a band that never flashes, which is what replaced
+    the old rank-based ``FLASHING_RANKS`` set: whether a slot blinks was always a
+    property of its colour, not of its eviction priority, and the working band
+    having no peak makes that load-bearing.
+    """
+
+    steady: str
+    flash_peak: str | None
+
+    def slot(self, remaining_flash_seconds: float = 0.0) -> "Slot":
+        """Render this band with ``remaining`` seconds of flash window left."""
+        flashing = self.flash_peak is not None and remaining_flash_seconds > 0.0
+        return Slot(
+            color=self.steady,
+            flash_color=self.flash_peak if flashing else None,
+            remaining_flash_seconds=remaining_flash_seconds if flashing else 0.0,
+        )
+
+
+# Intensity lives in these values rather than in the `brightness` directive,
+# which is program-global and so cannot vary per slot. The directive carries the
+# user's brightness slider instead, as a master gain over these.
+#
+# Provisional. Numeric intensity is not perceived intensity -- one tier fraction
+# does not read as one tier across red, blue and green -- so expect to retune all
+# five against real hardware. Nothing outside this table needs to change when you
+# do.
+BAND_ALERT = SlotBand(steady="#3D0000", flash_peak="#FF0000")  # low 24% / high 100%
+BAND_WORKING = SlotBand(steady="#002A80", flash_peak=None)  # medium 50%
+BAND_DONE = SlotBand(steady="#003D18", flash_peak="#008033")  # low 24% / medium 50%
+
+
 # Rank 1 is most important. Eviction runs off this: a newcomer takes the slot of
 # the strictly least important occupant, and only if it outranks that occupant.
+# Ranks 3 and 4 render identically and differ here alone.
 MODE_SLOT_RANK: dict[AgentMode, int] = {
     AgentMode.BLOCKED_ERROR: 1,
     AgentMode.WAITING_FOR_INPUT: 1,
@@ -50,22 +86,15 @@ MODE_SLOT_RANK: dict[AgentMode, int] = {
     AgentMode.IDLE_READY: 4,
 }
 
-MODE_SLOT_COLOR: dict[AgentMode, str] = {
-    AgentMode.BLOCKED_ERROR: SLOT_AMBER,
-    AgentMode.WAITING_FOR_INPUT: SLOT_AMBER,
-    AgentMode.TOOL_RUNNING: SLOT_CYAN,
-    AgentMode.WORKING: SLOT_CYAN,
-    AgentMode.LONG_TASK_PROGRESS: SLOT_CYAN,
-    AgentMode.COMPLETED: SLOT_GREEN,
-    AgentMode.IDLE_READY: SLOT_GREEN,
+MODE_SLOT_BAND: dict[AgentMode, SlotBand] = {
+    AgentMode.BLOCKED_ERROR: BAND_ALERT,
+    AgentMode.WAITING_FOR_INPUT: BAND_ALERT,
+    AgentMode.TOOL_RUNNING: BAND_WORKING,
+    AgentMode.WORKING: BAND_WORKING,
+    AgentMode.LONG_TASK_PROGRESS: BAND_WORKING,
+    AgentMode.COMPLETED: BAND_DONE,
+    AgentMode.IDLE_READY: BAND_DONE,
 }
-
-# IDLE_READY (rank 4) holds a slot but never flashes: it means "a session exists
-# and has done nothing yet", which is not news. In practice it will almost never
-# light a slot at all, because IDLE_VISIBLE_SECONDS is 0.0 and so an idle status
-# is stale by the collection after the one that created it. The rank is here so
-# the eviction ordering is total.
-FLASHING_RANKS = frozenset({1, 2, 3})
 
 
 def slot_rank(mode: AgentMode) -> int | None:
@@ -73,25 +102,39 @@ def slot_rank(mode: AgentMode) -> int | None:
     return MODE_SLOT_RANK.get(mode)
 
 
-def slot_color(mode: AgentMode) -> str | None:
-    """Slot colour, or None for a mode that holds no slot."""
-    return MODE_SLOT_COLOR.get(mode)
+def slot_band(mode: AgentMode) -> SlotBand | None:
+    """Colour band, or None for a mode that holds no slot."""
+    return MODE_SLOT_BAND.get(mode)
 
 
 @dataclass(frozen=True)
 class Slot:
-    """One rendered LED position."""
+    """One rendered LED position.
+
+    ``flash_color`` and ``remaining_flash_seconds`` are keyword-only on purpose.
+    Argument two used to be a ``bool``; a stale positional ``True`` would stay
+    truthy, so ``.flashing`` would read correctly while the renderer emitted
+    ``0:True 900ms pulse`` -- visible only where a test asserts exact program
+    text. Keyword-only turns every stale call site into a TypeError instead.
+    """
 
     color: str
-    flashing: bool = False
-    remaining_flash_seconds: float = 0.0
+    flash_color: str | None = field(default=None, kw_only=True)
+    remaining_flash_seconds: float = field(default=0.0, kw_only=True)
+
+    @property
+    def flashing(self) -> bool:
+        return self.flash_color is not None
+
+
+EMPTY_SLOT = Slot(SLOT_EMPTY)
 
 
 @dataclass
 class _Occupant:
     key: str
     rank: int
-    color: str
+    band: SlotBand
     entered_at: datetime
 
 
@@ -136,22 +179,23 @@ class SlotAllocator:
             if occupant is not None and occupant.key not in pending:
                 self._slots[index] = None
 
-        # Hold. A session keeps its slot across state and colour changes; only a
-        # colour change restarts the flash clock, so WORKING -> TOOL_RUNNING
-        # (both cyan) leaves it running.
+        # Hold. A session keeps its slot across state and band changes; only a
+        # band change restarts the flash clock, so WORKING -> TOOL_RUNNING (both
+        # working) and BLOCKED_ERROR -> WAITING_FOR_INPUT (both alert) leave it
+        # running.
         for occupant in self._slots:
             if occupant is None:
                 continue
-            rank, color, updated_at = pending.pop(occupant.key)
+            rank, band, updated_at = pending.pop(occupant.key)
             occupant.rank = rank
-            if color != occupant.color:
-                occupant.color = color
+            if band != occupant.band:
+                occupant.band = band
                 occupant.entered_at = updated_at
 
         # Assign. Most important newcomer picks first, so a full strip gives the
         # single free slot to the session that most needs it.
         newcomers = sorted(pending.items(), key=lambda item: (item[1][0], item[1][2]))
-        for key, (rank, color, updated_at) in newcomers:
+        for key, (rank, band, updated_at) in newcomers:
             index = self._free_slot()
             if index is None:
                 index = self._evictable_slot(rank)
@@ -160,21 +204,21 @@ class SlotAllocator:
                 # session is simply not shown.
                 continue
             self._slots[index] = _Occupant(
-                key=key, rank=rank, color=color, entered_at=updated_at
+                key=key, rank=rank, band=band, entered_at=updated_at
             )
 
         return self._render(now)
 
     def _displayable(
         self, statuses: Iterable[AgentStatus]
-    ) -> dict[str, tuple[int, str, datetime]]:
-        displayable: dict[str, tuple[int, str, datetime]] = {}
+    ) -> dict[str, tuple[int, SlotBand, datetime]]:
+        displayable: dict[str, tuple[int, SlotBand, datetime]] = {}
         for status in statuses:
             rank = slot_rank(status.mode)
-            color = slot_color(status.mode)
-            if rank is None or color is None:
+            band = slot_band(status.mode)
+            if rank is None or band is None:
                 continue
-            candidate = (rank, color, status.updated_at)
+            candidate = (rank, band, status.updated_at)
             existing = displayable.get(status.agent_id)
             if existing is None or candidate[0] < existing[0]:
                 displayable[status.agent_id] = candidate
@@ -209,17 +253,10 @@ class SlotAllocator:
         slots: list[Slot] = []
         for occupant in self._slots:
             if occupant is None:
-                slots.append(Slot(color=SLOT_EMPTY))
+                slots.append(EMPTY_SLOT)
                 continue
-            remaining = 0.0
-            if occupant.rank in FLASHING_RANKS:
-                age = max(0.0, (now - occupant.entered_at).total_seconds())
-                remaining = max(0.0, self.flash_seconds - age)
-            slots.append(
-                Slot(
-                    color=occupant.color,
-                    flashing=remaining > 0.0,
-                    remaining_flash_seconds=remaining,
-                )
-            )
+            # No peakless-band guard here: `slot()` zeroes the remaining window
+            # for a band that cannot flash, so one decision point is enough.
+            age = max(0.0, (now - occupant.entered_at).total_seconds())
+            slots.append(occupant.band.slot(max(0.0, self.flash_seconds - age)))
         return tuple(slots)

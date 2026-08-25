@@ -18,13 +18,15 @@ from sidepulse.collector import (
     snapshot_from_statuses,
 )
 from sidepulse.led_slots import (
+    BAND_ALERT,
+    BAND_DONE,
+    BAND_WORKING,
     FLASH_SECONDS,
-    SLOT_AMBER,
-    SLOT_CYAN,
+    MODE_SLOT_BAND,
     SLOT_EMPTY,
-    SLOT_GREEN,
+    Slot,
     SlotAllocator,
-    slot_color,
+    slot_band,
     slot_rank,
 )
 from sidepulse.models import AgentMode, AgentStatus
@@ -67,25 +69,91 @@ class SlotRankTests(unittest.TestCase):
     def test_blocked_and_waiting_share_the_top_rank(self) -> None:
         self.assertEqual(slot_rank(AgentMode.BLOCKED_ERROR), 1)
         self.assertEqual(slot_rank(AgentMode.WAITING_FOR_INPUT), 1)
+        self.assertIs(slot_band(AgentMode.BLOCKED_ERROR), BAND_ALERT)
+        self.assertIs(slot_band(AgentMode.WAITING_FOR_INPUT), BAND_ALERT)
 
-    def test_working_modes_share_one_rank_and_one_colour(self) -> None:
+    def test_working_modes_share_one_rank_and_one_band(self) -> None:
         for mode in (
             AgentMode.TOOL_RUNNING,
             AgentMode.WORKING,
             AgentMode.LONG_TASK_PROGRESS,
         ):
             self.assertEqual(slot_rank(mode), 2)
-            self.assertEqual(slot_color(mode), SLOT_CYAN)
+            self.assertIs(slot_band(mode), BAND_WORKING)
 
     def test_completed_outranks_idle_though_both_are_green(self) -> None:
+        """The ranks are for eviction only; these two render identically."""
         self.assertEqual(slot_rank(AgentMode.COMPLETED), 3)
         self.assertEqual(slot_rank(AgentMode.IDLE_READY), 4)
-        self.assertEqual(slot_color(AgentMode.COMPLETED), SLOT_GREEN)
-        self.assertEqual(slot_color(AgentMode.IDLE_READY), SLOT_GREEN)
+        self.assertIs(slot_band(AgentMode.COMPLETED), BAND_DONE)
+        self.assertIs(slot_band(AgentMode.IDLE_READY), BAND_DONE)
 
     def test_unknown_holds_no_slot(self) -> None:
         self.assertIsNone(slot_rank(AgentMode.UNKNOWN))
-        self.assertIsNone(slot_color(AgentMode.UNKNOWN))
+        self.assertIsNone(slot_band(AgentMode.UNKNOWN))
+
+    def test_only_the_working_band_never_flashes(self) -> None:
+        """A None peak is what replaced FLASHING_RANKS.
+
+        Derived from ``MODE_SLOT_BAND`` rather than from the three named
+        constants, so a fourth band added later has to account for itself here
+        instead of slipping past a hardcoded list.
+        """
+        bands = set(MODE_SLOT_BAND.values())
+
+        self.assertEqual(
+            {band for band in bands if band.flash_peak is None}, {BAND_WORKING}
+        )
+        self.assertEqual(
+            {band for band in bands if band.flash_peak is not None},
+            {BAND_ALERT, BAND_DONE},
+        )
+
+    def test_every_flashing_band_peaks_brighter_than_it_settles(self) -> None:
+        """No channel may fall below the baseline, and the peak must be brighter.
+
+        ``pulse`` interpolates per channel, so "brighter overall" is not enough:
+        a peak that raises red while dropping blue would still dip that channel
+        below the settled colour on every blink, which is the one thing the
+        pulse-up shape exists to rule out. Hence the per-channel floor as well as
+        the total.
+
+        The hex values are provisional and expected to be re-tuned on hardware.
+        This is the invariant that must survive the tuning, so the band set is
+        derived rather than listed.
+        """
+        flashing = [
+            band
+            for band in set(MODE_SLOT_BAND.values())
+            if band.flash_peak is not None
+        ]
+        self.assertTrue(flashing)
+
+        for band in flashing:
+            with self.subTest(band=band):
+                for channel in (1, 3, 5):
+                    self.assertGreaterEqual(
+                        int(band.flash_peak[channel:channel + 2], 16),
+                        int(band.steady[channel:channel + 2], 16),
+                    )
+                steady = sum(int(band.steady[index:index + 2], 16) for index in (1, 3, 5))
+                peak = sum(int(band.flash_peak[index:index + 2], 16) for index in (1, 3, 5))
+                self.assertLess(steady, peak)
+
+
+class SlotShapeTests(unittest.TestCase):
+    def test_the_flash_fields_are_keyword_only(self) -> None:
+        """Positional construction has to raise, not silently render ``0:True``.
+
+        Argument two used to be a ``bool``, and nothing else would catch a
+        refactor that dropped ``kw_only``: a stale positional ``True`` stays
+        truthy, so ``.flashing`` would read correctly while the renderer emitted
+        ``0:True 900ms pulse``.
+        """
+        with self.assertRaises(TypeError):
+            Slot("#000000", "#FF0000")
+
+        self.assertEqual(Slot("#000000", flash_color="#FF0000").flash_color, "#FF0000")
 
 
 class SlotAssignmentTests(unittest.TestCase):
@@ -95,7 +163,7 @@ class SlotAssignmentTests(unittest.TestCase):
         slots = allocator.update((status("a", AgentMode.WORKING),), BASE)
 
         self.assertEqual(allocator.slot_for_key("a"), 7)
-        self.assertEqual(slots[7].color, SLOT_CYAN)
+        self.assertEqual(slots[7].color, BAND_WORKING.steady)
         self.assertEqual([slot.color for slot in slots[:7]], [SLOT_EMPTY] * 7)
 
     def test_a_session_holds_its_slot_across_colour_changes(self) -> None:
@@ -109,7 +177,7 @@ class SlotAssignmentTests(unittest.TestCase):
         )
 
         self.assertEqual(allocator.slot_for_key("a"), 7)
-        self.assertEqual(slots[7].color, SLOT_AMBER)
+        self.assertEqual(slots[7].color, BAND_ALERT.steady)
 
     def test_a_disappearing_session_releases_its_slot(self) -> None:
         allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
@@ -142,7 +210,7 @@ class SlotAssignmentTests(unittest.TestCase):
 
         self.assertIsNone(allocator.slot_for_key("held3"))
         self.assertEqual(allocator.slot_for_key("newcomer"), vacated)
-        self.assertEqual(slots[vacated].color, SLOT_GREEN)
+        self.assertEqual(slots[vacated].color, BAND_DONE.steady)
 
     def test_an_unknown_mode_is_never_given_a_slot(self) -> None:
         allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
@@ -177,7 +245,7 @@ class SlotEvictionTests(unittest.TestCase):
 
         self.assertEqual(allocator.slot_for_key("asker"), idle_slot)
         self.assertIsNone(allocator.slot_for_key("idler"))
-        self.assertEqual(slots[idle_slot].color, SLOT_AMBER)
+        self.assertEqual(slots[idle_slot].color, BAND_ALERT.steady)
 
     def test_a_less_important_newcomer_gets_no_slot(self) -> None:
         allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
@@ -193,7 +261,7 @@ class SlotEvictionTests(unittest.TestCase):
         )
 
         self.assertIsNone(allocator.slot_for_key("idler"))
-        self.assertEqual([slot.color for slot in slots], [SLOT_AMBER] * 8)
+        self.assertEqual([slot.color for slot in slots], [BAND_ALERT.steady] * 8)
 
     def test_an_equally_important_newcomer_gets_no_slot(self) -> None:
         allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
@@ -240,9 +308,12 @@ class FlashClockTests(unittest.TestCase):
         slots = allocator.update((status("a", AgentMode.WAITING_FOR_INPUT),), BASE)
 
         self.assertTrue(slots[7].flashing)
+        self.assertEqual(slots[7].color, BAND_ALERT.steady)
+        self.assertEqual(slots[7].flash_color, BAND_ALERT.flash_peak)
         self.assertAlmostEqual(slots[7].remaining_flash_seconds, FLASH_SECONDS)
 
     def test_a_slot_stops_flashing_once_the_window_passes(self) -> None:
+        """Settling drops the peak. The steady colour was already what line 1 held."""
         allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
         allocator.update((status("a", AgentMode.WAITING_FOR_INPUT),), BASE)
 
@@ -250,32 +321,54 @@ class FlashClockTests(unittest.TestCase):
         slots = allocator.update((status("a", AgentMode.WAITING_FOR_INPUT),), settled)
 
         self.assertFalse(slots[7].flashing)
+        self.assertIsNone(slots[7].flash_color)
         self.assertEqual(slots[7].remaining_flash_seconds, 0.0)
-        self.assertEqual(slots[7].color, SLOT_AMBER)
+        self.assertEqual(slots[7].color, BAND_ALERT.steady)
 
-    def test_the_flash_clock_survives_a_state_change_inside_one_colour(self) -> None:
+    def test_the_flash_clock_survives_a_state_change_inside_one_band(self) -> None:
+        """BLOCKED_ERROR and WAITING_FOR_INPUT are one band, so the clock runs on."""
         allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
-        allocator.update((status("a", AgentMode.WORKING),), BASE)
-
-        later = BASE + timedelta(seconds=60)
-        slots = allocator.update(
-            (status("a", AgentMode.TOOL_RUNNING, updated_at=later),), later
-        )
-
-        self.assertEqual(slots[7].color, SLOT_CYAN)
-        self.assertTrue(slots[7].flashing)
-        self.assertAlmostEqual(slots[7].remaining_flash_seconds, FLASH_SECONDS - 60)
-
-    def test_the_flash_clock_resets_when_the_colour_changes(self) -> None:
-        allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
-        allocator.update((status("a", AgentMode.WORKING),), BASE)
+        allocator.update((status("a", AgentMode.BLOCKED_ERROR),), BASE)
 
         later = BASE + timedelta(seconds=60)
         slots = allocator.update(
             (status("a", AgentMode.WAITING_FOR_INPUT, updated_at=later),), later
         )
 
-        self.assertEqual(slots[7].color, SLOT_AMBER)
+        self.assertEqual(slots[7].color, BAND_ALERT.steady)
+        self.assertTrue(slots[7].flashing)
+        self.assertAlmostEqual(slots[7].remaining_flash_seconds, FLASH_SECONDS - 60)
+
+    def test_the_working_bands_clock_survives_working_to_tool_running(self) -> None:
+        """The same guarantee for the one pair where Slot cannot show it.
+
+        BAND_WORKING has no flash_peak, so a working slot renders
+        remaining_flash_seconds = 0.0 at any age and the clock behind it is
+        invisible from outside. Reading the occupant directly is the only way to
+        check that WORKING -> TOOL_RUNNING does not restart it. Private, and worth
+        it: the alternative is an asserted invariant nobody verifies.
+        """
+        allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
+        allocator.update((status("a", AgentMode.WORKING),), BASE)
+        entered_at = allocator._slots[7].entered_at
+
+        later = BASE + timedelta(seconds=60)
+        allocator.update((status("a", AgentMode.TOOL_RUNNING, updated_at=later),), later)
+
+        self.assertEqual(allocator._slots[7].entered_at, entered_at)
+        self.assertEqual(allocator._slots[7].band, BAND_WORKING)
+
+    def test_the_flash_clock_resets_when_the_band_changes(self) -> None:
+        allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
+        allocator.update((status("a", AgentMode.COMPLETED),), BASE)
+
+        later = BASE + timedelta(seconds=60)
+        slots = allocator.update(
+            (status("a", AgentMode.WAITING_FOR_INPUT, updated_at=later),), later
+        )
+
+        self.assertEqual(slots[7].color, BAND_ALERT.steady)
+        self.assertEqual(slots[7].flash_color, BAND_ALERT.flash_peak)
         self.assertAlmostEqual(slots[7].remaining_flash_seconds, FLASH_SECONDS)
 
     def test_the_flash_clock_runs_from_the_status_timestamp_not_first_sight(self) -> None:
@@ -291,17 +384,42 @@ class FlashClockTests(unittest.TestCase):
             (stale_but_fresh,), BASE + timedelta(seconds=FLASH_SECONDS + 30)
         )
 
-        self.assertEqual(slots[7].color, SLOT_AMBER)
+        self.assertEqual(slots[7].color, BAND_ALERT.steady)
         self.assertFalse(slots[7].flashing)
 
-    def test_idle_never_flashes(self) -> None:
+    def test_the_working_band_never_flashes_at_any_age(self) -> None:
+        """Working is the boring state. There is no cache-warmth story to signal.
+
+        The five-minute threshold tracks prompt cache TTL: flashing means picking
+        this session up now is cheap. An actively running agent has nothing for a
+        settle to say, so blue holds one colour from the first frame.
+        """
+        allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
+
+        for offset in (0.0, 1.0, FLASH_SECONDS - 1, FLASH_SECONDS + 1):
+            with self.subTest(offset=offset):
+                slots = allocator.update(
+                    (status("a", AgentMode.WORKING),), BASE + timedelta(seconds=offset)
+                )
+                self.assertEqual(slots[7].color, BAND_WORKING.steady)
+                self.assertFalse(slots[7].flashing)
+                self.assertIsNone(slots[7].flash_color)
+                self.assertEqual(slots[7].remaining_flash_seconds, 0.0)
+
+    def test_idle_flashes_green_like_completed(self) -> None:
+        """Idle and completed share a band, so they share the flash.
+
+        In practice an idle slot will almost never appear -- IDLE_VISIBLE_SECONDS
+        is 0.0, so an idle status is stale by the collection after the one that
+        created it. Rank 4 exists to keep the eviction ordering total.
+        """
         allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
 
         slots = allocator.update((status("a", AgentMode.IDLE_READY),), BASE)
 
-        self.assertEqual(slots[7].color, SLOT_GREEN)
-        self.assertFalse(slots[7].flashing)
-        self.assertEqual(slots[7].remaining_flash_seconds, 0.0)
+        self.assertEqual(slots[7].color, BAND_DONE.steady)
+        self.assertEqual(slots[7].flash_color, BAND_DONE.flash_peak)
+        self.assertTrue(slots[7].flashing)
 
     def test_empty_slots_are_black_and_never_flash(self) -> None:
         allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
@@ -312,6 +430,7 @@ class FlashClockTests(unittest.TestCase):
         for slot in slots:
             self.assertEqual(slot.color, SLOT_EMPTY)
             self.assertFalse(slot.flashing)
+            self.assertIsNone(slot.flash_color)
 
 
 class SlotCountTests(unittest.TestCase):
@@ -328,7 +447,8 @@ class SlotCountTests(unittest.TestCase):
 
         self.assertEqual(len(slots), 2)
         self.assertEqual(
-            sorted(slot.color for slot in slots), sorted([SLOT_AMBER, SLOT_CYAN])
+            sorted(slot.color for slot in slots),
+            sorted([BAND_ALERT.steady, BAND_WORKING.steady]),
         )
 
 
@@ -388,7 +508,7 @@ class MultiagentStatusFeedTests(unittest.TestCase):
 
         self.assertEqual(
             sorted(slot.color for slot in slots if slot.color != SLOT_EMPTY),
-            sorted([SLOT_CYAN, SLOT_GREEN]),
+            sorted([BAND_WORKING.steady, BAND_DONE.steady]),
         )
 
     def test_a_subagent_shares_its_parent_session_slot(self) -> None:
@@ -428,7 +548,7 @@ class MultiagentStatusFeedTests(unittest.TestCase):
         slots = allocator.update(multiagent_statuses(snap), BASE)
 
         self.assertEqual(
-            [slot.color for slot in slots if slot.color != SLOT_EMPTY], [SLOT_AMBER]
+            [slot.color for slot in slots if slot.color != SLOT_EMPTY], [BAND_ALERT.steady]
         )
 
     def test_a_parent_wins_a_tie_against_its_own_subagent(self) -> None:

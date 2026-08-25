@@ -67,11 +67,11 @@ from sidepulse.install import (
 from sidepulse.keep_awake import KeepAwakeController, status_file_for_target
 from sidepulse import led_status as led_status_module
 from sidepulse.led_slots import (
+    BAND_ALERT,
+    BAND_DONE,
+    BAND_WORKING,
     FLASH_SECONDS,
-    SLOT_AMBER,
-    SLOT_CYAN,
     SLOT_EMPTY,
-    SLOT_GREEN,
     Slot,
     SlotAllocator,
 )
@@ -1879,9 +1879,9 @@ class AgentMonitorTests(unittest.TestCase):
                     synced.append((tuple(passed), now))
                     or led_status_module.MultiAgentLedWrite(
                         target=device.target,
-                        program="brightness 128\n0:#FF3A00",
+                        program="brightness 128\n0:#3D0000",
                         changed=True,
-                        slots=(Slot(SLOT_AMBER, True, FLASH_SECONDS),),
+                        slots=(BAND_ALERT.slot(FLASH_SECONDS),),
                     )
                 )
             ),
@@ -3714,8 +3714,8 @@ class AgentMonitorTests(unittest.TestCase):
             output = buffer.getvalue()
             self.assertEqual(exit_code, 0)
             self.assertIn("slots=2/8", output)
-            self.assertIn("#00FF66", output)
-            self.assertIn("#00E5FF", output)
+            self.assertIn(BAND_DONE.steady, output)
+            self.assertIn(BAND_WORKING.steady, output)
 
     def test_leds_command_gives_a_subagent_no_slot_of_its_own(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3832,10 +3832,11 @@ class AgentMonitorTests(unittest.TestCase):
             output = buffer.getvalue()
             self.assertEqual(exit_code, 0)
             self.assertIn("slots=2/8", output)
-            # Two occupied slots out of eight, both freshly changed so both flash.
-            self.assertIn("#FF3A00", output)
-            self.assertIn("#00E5FF", output)
-            self.assertIn("900ms pulse", output)
+            # Two occupied slots out of eight. Only the alert one flashes: the
+            # working band has no peak, however freshly it changed.
+            self.assertIn(BAND_ALERT.steady, output)
+            self.assertIn(BAND_WORKING.steady, output)
+            self.assertIn(f"{BAND_ALERT.flash_peak} 900ms pulse", output)
 
     def test_sidepulse_sidepulse_command_shape(self) -> None:
         parser = build_parser(prog="sidepulse agent-monitor")
@@ -4352,51 +4353,61 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertIn("#FF3A00 1.6s pulse", (device / "LEDS.LED").read_text())
 
     def test_multiagent_program_renders_a_baseline_and_a_flash_line(self) -> None:
+        """Line 1 is every slot's settled colour; line 2 pulses the recent ones up."""
         slots = (
-            Slot(SLOT_AMBER, True, FLASH_SECONDS),
-            Slot(SLOT_AMBER, False),
-            Slot(SLOT_CYAN, True, FLASH_SECONDS),
-            Slot(SLOT_CYAN, False),
-            Slot(SLOT_GREEN, True, FLASH_SECONDS),
-            Slot(SLOT_GREEN, False),
-            Slot(SLOT_EMPTY, False),
-            Slot(SLOT_EMPTY, False),
+            BAND_ALERT.slot(FLASH_SECONDS),
+            BAND_ALERT.slot(),
+            BAND_WORKING.slot(FLASH_SECONDS),
+            BAND_DONE.slot(FLASH_SECONDS),
+            BAND_DONE.slot(),
+            Slot(SLOT_EMPTY),
+            Slot(SLOT_EMPTY),
+            Slot(SLOT_EMPTY),
         )
 
-        program = program_for_slots(slots)
+        program = program_for_slots(slots, brightness=128)
 
         validate_led_text(program)
         self.assertEqual(
             program.splitlines(),
             [
                 "brightness 128",
-                "0:#FF3A00 1:#FF3A00 2:#00E5FF 3:#00E5FF "
-                "4:#00FF66 5:#00FF66 6:#000000 7:#000000",
-                "0:#000000 900ms pulse; 2:#000000 900ms pulse; 4:#000000 900ms pulse",
+                "0:#3D0000 1:#3D0000 2:#002A80 3:#003D18 "
+                "4:#003D18 5:#000000 6:#000000 7:#000000",
+                "0:#FF0000 900ms pulse; 3:#008033 900ms pulse",
                 "repeat 328",
             ],
         )
 
     def test_multiagent_program_omits_the_flash_line_when_nothing_is_recent(self) -> None:
-        slots = (Slot(SLOT_AMBER, False),) + (Slot(SLOT_EMPTY, False),) * 7
+        slots = (BAND_ALERT.slot(),) + (Slot(SLOT_EMPTY),) * 7
 
-        program = program_for_slots(slots)
+        program = program_for_slots(slots, brightness=128)
 
         validate_led_text(program)
         self.assertEqual(
             program.splitlines(),
             [
                 "brightness 128",
-                "0:#FF3A00 1:#000000 2:#000000 3:#000000 "
+                "0:#3D0000 1:#000000 2:#000000 3:#000000 "
                 "4:#000000 5:#000000 6:#000000 7:#000000",
             ],
         )
         self.assertNotIn("repeat", program)
         self.assertNotIn("pulse", program)
 
+    def test_multiagent_program_omits_the_flash_line_for_an_all_working_strip(self) -> None:
+        """No band on the strip flashes, so the program is one static line."""
+        program = program_for_slots((BAND_WORKING.slot(FLASH_SECONDS),) * 8)
+
+        validate_led_text(program)
+        self.assertEqual(len(program.splitlines()), 1)
+        self.assertNotIn("pulse", program)
+        self.assertNotIn("repeat", program)
+
     def test_multiagent_program_never_uses_the_off_keyword_for_a_slot(self) -> None:
         """``0:off`` is rejected by the parser with bad-index; ``0:#000000`` is not."""
-        program = program_for_slots((Slot(SLOT_EMPTY, False),) * 8)
+        program = program_for_slots((Slot(SLOT_EMPTY),) * 8)
 
         validate_led_text(program)
         self.assertNotIn("off", program)
@@ -4404,7 +4415,7 @@ class AgentMonitorTests(unittest.TestCase):
 
     def test_multiagent_repeat_count_covers_the_longest_remaining_flash(self) -> None:
         def repeat_line(remaining: float) -> str:
-            slots = (Slot(SLOT_CYAN, True, remaining),) + (Slot(SLOT_EMPTY, False),) * 7
+            slots = (BAND_ALERT.slot(remaining),) + (Slot(SLOT_EMPTY),) * 7
             return program_for_slots(slots).splitlines()[-1]
 
         # ceil(remaining_ms / 917ms), the measured blink cycle for a 900ms pulse.
@@ -4418,10 +4429,10 @@ class AgentMonitorTests(unittest.TestCase):
 
     def test_multiagent_repeat_count_follows_the_longest_flashing_slot(self) -> None:
         slots = (
-            Slot(SLOT_CYAN, True, 10.0),
-            Slot(SLOT_AMBER, True, 200.0),
-            Slot(SLOT_GREEN, True, 30.0),
-        ) + (Slot(SLOT_EMPTY, False),) * 5
+            BAND_DONE.slot(10.0),
+            BAND_ALERT.slot(200.0),
+            BAND_DONE.slot(30.0),
+        ) + (Slot(SLOT_EMPTY),) * 5
 
         program = program_for_slots(slots)
 
@@ -4429,37 +4440,66 @@ class AgentMonitorTests(unittest.TestCase):
 
     def test_multiagent_worst_case_program_fits_the_device_limits(self) -> None:
         """Eight occupied slots all flashing is the most bytes and lines it can emit."""
-        slots = (Slot(SLOT_AMBER, True, FLASH_SECONDS),) * 8
+        slots = (BAND_ALERT.slot(FLASH_SECONDS),) * 8
 
-        program = program_for_slots(slots)
+        program = program_for_slots(slots, brightness=128)
 
         validate_led_text(program)
         self.assertLessEqual(len(program.encode("utf-8")), MAX_LED_BYTES)
         self.assertLessEqual(len(program.splitlines()), MAX_LED_LINES)
         self.assertEqual(len(program.splitlines()), 4)
+        self.assertEqual(len(program.encode("utf-8")), 288)
 
-    def test_multiagent_program_uses_full_brightness_without_a_directive(self) -> None:
-        slots = (Slot(SLOT_GREEN, False),) + (Slot(SLOT_EMPTY, False),) * 7
+    def test_multiagent_program_defaults_to_full_brightness(self) -> None:
+        """Intensity is in the colours now, so the default must not scale them down.
 
-        program = program_for_slots(slots, brightness=255)
+        At 128 -- the old default -- "high intensity red" would have rendered at
+        half, halving the whole scheme.
+        """
+        program = program_for_slots((BAND_DONE.slot(),) + (Slot(SLOT_EMPTY),) * 7)
 
         self.assertNotIn("brightness", program)
 
-    def test_multiagent_program_renders_a_two_led_strip(self) -> None:
-        slots = (Slot(SLOT_AMBER, True, FLASH_SECONDS), Slot(SLOT_CYAN, False))
+    def test_multiagent_program_emits_the_directive_when_the_slider_is_down(self) -> None:
+        """The slider is a master gain over the bands, not a replacement for them."""
+        slots = (BAND_DONE.slot(),) + (Slot(SLOT_EMPTY),) * 7
 
-        program = program_for_slots(slots)
+        program = program_for_slots(slots, brightness=64)
+
+        self.assertEqual(program.splitlines()[0], "brightness 64")
+
+    def test_multiagent_program_renders_a_two_led_strip(self) -> None:
+        slots = (BAND_ALERT.slot(FLASH_SECONDS), BAND_WORKING.slot())
+
+        program = program_for_slots(slots, brightness=128)
 
         validate_led_text(program)
         self.assertEqual(
             program.splitlines(),
             [
                 "brightness 128",
-                "0:#FF3A00 1:#00E5FF",
-                "0:#000000 900ms pulse",
+                "0:#3D0000 1:#002A80",
+                "0:#FF0000 900ms pulse",
                 "repeat 328",
             ],
         )
+
+    def test_the_settle_write_leaves_the_baseline_byte_identical(self) -> None:
+        """Crossing five minutes only removes a line; it never restates line 1.
+
+        This is why `repeat` expiry is now harmless: the device is already holding
+        the settled appearance by the time the host notices the boundary, so a
+        dead app leaves the strip correct rather than frozen bright.
+        """
+        flashing = (BAND_ALERT.slot(FLASH_SECONDS),) + (Slot(SLOT_EMPTY),) * 7
+        settled = (BAND_ALERT.slot(),) + (Slot(SLOT_EMPTY),) * 7
+
+        before = program_for_slots(flashing, brightness=128).splitlines()
+        after = program_for_slots(settled, brightness=128).splitlines()
+
+        self.assertEqual(len(before), 4)
+        self.assertEqual(len(after), 2)
+        self.assertEqual(before[:2], after[:2])
 
     def test_multiagent_render_key_ignores_the_repeat_count(self) -> None:
         """The dedupe key must not move as the flash window ticks down.
@@ -4467,9 +4507,9 @@ class AgentMonitorTests(unittest.TestCase):
         Remaining flash time changes on every refresh. If it reached the key,
         the 15s timer alone would rewrite LEDS.LED forever.
         """
-        early = (Slot(SLOT_CYAN, True, FLASH_SECONDS),) + (Slot(SLOT_EMPTY, False),) * 7
-        late = (Slot(SLOT_CYAN, True, 12.0),) + (Slot(SLOT_EMPTY, False),) * 7
-        settled = (Slot(SLOT_CYAN, False),) + (Slot(SLOT_EMPTY, False),) * 7
+        early = (BAND_ALERT.slot(FLASH_SECONDS),) + (Slot(SLOT_EMPTY),) * 7
+        late = (BAND_ALERT.slot(12.0),) + (Slot(SLOT_EMPTY),) * 7
+        settled = (BAND_ALERT.slot(),) + (Slot(SLOT_EMPTY),) * 7
 
         self.assertEqual(slot_render_key(early, 128), slot_render_key(late, 128))
         self.assertNotEqual(slot_render_key(late, 128), slot_render_key(settled, 128))
@@ -4488,18 +4528,19 @@ class AgentMonitorTests(unittest.TestCase):
             self.skipTest(str(exc))
 
         vectors = [
-            (Slot(SLOT_EMPTY, False),) * 8,
-            (Slot(SLOT_AMBER, True, FLASH_SECONDS),) * 8,
-            (Slot(SLOT_GREEN, False),) * 8,
+            (Slot(SLOT_EMPTY),) * 8,
+            (BAND_ALERT.slot(FLASH_SECONDS),) * 8,
+            (BAND_WORKING.slot(),) * 8,
+            (BAND_DONE.slot(),) * 8,
             (
-                Slot(SLOT_AMBER, True, FLASH_SECONDS),
-                Slot(SLOT_AMBER, False),
-                Slot(SLOT_CYAN, True, 120.0),
-                Slot(SLOT_CYAN, False),
-                Slot(SLOT_GREEN, True, 1.0),
-                Slot(SLOT_GREEN, False),
-                Slot(SLOT_EMPTY, False),
-                Slot(SLOT_EMPTY, False),
+                BAND_ALERT.slot(FLASH_SECONDS),
+                BAND_ALERT.slot(),
+                BAND_WORKING.slot(),
+                BAND_DONE.slot(120.0),
+                BAND_DONE.slot(),
+                Slot(SLOT_EMPTY),
+                Slot(SLOT_EMPTY),
+                Slot(SLOT_EMPTY),
             ),
         ]
         for slots in vectors:
@@ -4507,6 +4548,51 @@ class AgentMonitorTests(unittest.TestCase):
             with self.subTest(program=program):
                 result = controller.parse(program, 0)
                 self.assertTrue(result.ok, f"{result.error_name} at line {result.line}")
+
+    def test_multiagent_flash_pulses_up_from_the_settled_colour(self) -> None:
+        """The blink must never go below the baseline, and must end on it.
+
+        Measured against sdled.wasm: a flashing alert slot rises from 61 to 254
+        and returns to 61, while a working slot absent from the flash line holds
+        every sample. The old pulse-to-black shape would put the minimum at 0 and
+        leave the post-repeat hold on the bright colour.
+        """
+        try:
+            from sidepulse.led_wasm import LedWasmUnavailableError, SdLedWasmController
+        except ImportError as exc:
+            self.skipTest(str(exc))
+
+        try:
+            engine = SdLedWasmController(led_count=8)
+        except LedWasmUnavailableError as exc:
+            self.skipTest(str(exc))
+
+        # remaining=1.0s gives `repeat 2`, a ~1834ms window, so the settled
+        # sample at 3000ms is safely past it without stepping 300 seconds.
+        slots = (BAND_ALERT.slot(1.0), BAND_WORKING.slot()) + (Slot(SLOT_EMPTY),) * 6
+        program = program_for_slots(slots)
+        self.assertEqual(program.splitlines()[-1], "repeat 2")
+
+        engine.reset(0)
+        self.assertTrue(engine.parse(program, 0).ok)
+
+        samples = [engine.step(moment) for moment in range(0, 1000, 50)]
+        alert_reds = [pixels[0][0] for pixels in samples]
+
+        steady_red = int(BAND_ALERT.steady[1:3], 16)
+        peak_red = int(BAND_ALERT.flash_peak[1:3], 16)
+        self.assertEqual(min(alert_reds), steady_red)
+        self.assertGreaterEqual(max(alert_reds), peak_red - 5)
+
+        working_rgb = tuple(
+            int(BAND_WORKING.steady[index:index + 2], 16) for index in (1, 3, 5)
+        )
+        for pixels in samples:
+            self.assertEqual(pixels[1], working_rgb)
+
+        settled = engine.step(3000)
+        self.assertEqual(settled[0], (steady_red, 0, 0))
+        self.assertEqual(settled[1], working_rgb)
 
     def test_multiagent_controller_reset_keeps_every_slot_assignment(self) -> None:
         """Sticky position is the reason placement is random at all.
@@ -4700,9 +4786,15 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertTrue(first.changed)
             self.assertFalse(second.changed)
             self.assertFalse(third.changed)
-            self.assertIn("7:#FF3A00", (device / "LEDS.LED").read_text())
+            self.assertIn(f"7:{BAND_ALERT.steady}", (device / "LEDS.LED").read_text())
 
     def test_multiagent_controller_writes_once_when_a_slot_settles(self) -> None:
+        """Ticking the window down is not a write; crossing five minutes is one, once.
+
+        And the write it does emit restates the baseline unchanged -- the device is
+        already holding the settled appearance by then, because `repeat` expired
+        onto it.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             device = Path(tmp) / "SidePulsePro"
             device.mkdir()
@@ -4739,6 +4831,14 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertNotIn("pulse", settling.program)
             self.assertNotIn("repeat", settling.program)
             self.assertFalse(after.changed)
+
+            # New: the settle write restates line 1 verbatim. Default brightness is
+            # 255 now, so there is no directive -- baseline, flash, repeat.
+            self.assertEqual(len(flashing.program.splitlines()), 3)
+            self.assertEqual(len(settling.program.splitlines()), 1)
+            self.assertEqual(
+                flashing.program.splitlines()[0], settling.program.splitlines()[0]
+            )
 
     def test_multiagent_controller_backs_off_after_a_write_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

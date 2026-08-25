@@ -15,7 +15,7 @@ from .device_writer import (
     resolve_target_path,
     write_led_program,
 )
-from .led_slots import SLOT_EMPTY, Slot, SlotAllocator
+from .led_slots import Slot, SlotAllocator
 from .models import AgentMode, AgentStatus
 
 
@@ -184,13 +184,18 @@ def apply_brightness(program: str, brightness: int | float = 255) -> str:
 # --- multiagent slot rendering -------------------------------------------------
 #
 # The strip becomes N independent slots instead of one aggregate indicator. Line
-# 1 is every slot's steady colour; line 2 dips only the recently-changed slots to
-# black and back. `pulse` returns to the line's start colour, so each cycle is a
-# blink against the baseline, and slots the flash line does not mention hold
-# rock steady. After the repeat count is exhausted the device holds its final
-# state, which is the baseline -- i.e. it settles to steady on its own.
+# 1 is every slot's *settled* colour; line 2 pulses only the recently-changed
+# slots up to their band's peak. `pulse` returns to the line's start colour, so
+# each cycle is a blink up from the baseline, and slots the flash line does not
+# mention hold rock steady. After the repeat count is exhausted the device holds
+# its final state -- which is the baseline, i.e. exactly the post-five-minute
+# appearance. That is why a dead app leaves the strip correct rather than frozen
+# on a state that has expired.
 
-SLOT_BRIGHTNESS = 128
+# Intensity lives in the band colours (see led_slots), so this directive is free
+# to carry the user's brightness slider as a master gain. 255 emits no directive
+# at all; anything lower scales every band together.
+SLOT_BRIGHTNESS = 255
 SLOT_FLASH_PULSE_MS = 900
 # Measured against resources/sdled.wasm, not derived from the pulse duration: a
 # `900ms pulse` blink completes every 917ms. Sampling `repeat 1|2|3` put the last
@@ -238,7 +243,7 @@ def program_for_slots(
     if flashing:
         lines.append(
             "; ".join(
-                f"{index}:{SLOT_EMPTY} {SLOT_FLASH_PULSE_MS}ms pulse"
+                f"{index}:{slots[index].flash_color} {SLOT_FLASH_PULSE_MS}ms pulse"
                 for index in flashing
             )
         )
@@ -257,7 +262,7 @@ def slot_render_key(
     would rewrite LEDS.LED every 15s forever.
     """
     return (normalize_brightness(brightness),) + tuple(
-        (slot.color, slot.flashing) for slot in slots
+        (slot.color, slot.flash_color) for slot in slots
     )
 
 
