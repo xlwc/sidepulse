@@ -3,6 +3,14 @@
 Date: 2026-08-24
 Status: accepted, implementing
 
+> **Superseded in part.** The state table, program shape and brightness handling
+> here were replaced by
+> [`2026-08-25-multiagent-led-colour-bands-design.md`](2026-08-25-multiagent-led-colour-bands-design.md).
+> The strip now carries three colour bands with their own intensity, the flash
+> pulses up from the settled colour rather than down to black, and the brightness
+> slider is live. Everything else in this document — slot allocation, eviction,
+> the status feed, sleep behaviour, the write budget — still holds.
+
 ## Summary
 
 Add a third `led_display` kind, `multiagent`, that treats the strip as N
