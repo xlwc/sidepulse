@@ -24,8 +24,11 @@ is distinguishable from "has been like this a while" at a glance.
 ## Non-goals
 
 - Sub-agents (Task-tool children) as separate slots. A slot is a top-level
-  session, keyed on `HookEvent.status_key` (`models.py:59`), which already
-  prefers `agent_id` and falls back to `session_id`.
+  session. This does *not* fall out of `HookEvent.status_key` (`models.py:59`) —
+  that key prefers `agent_id` over `session_id`, which is precisely what gives a
+  child a key distinct from its parent's. Folding them together is explicit
+  work, done in `collector.multiagent_statuses` before the allocator sees
+  anything, on the same session key the menu coalesces on.
 - Replacing aggregate mode. `agent` stays the default and stays the right choice
   for the 2-LED Dot.
 
@@ -37,8 +40,9 @@ one of four `LedDisplayState`s, then to a whole-strip program. `WORKING` is a
 chase animation that consumes all eight LEDs (`led_status.py:104`).
 
 In `multiagent` the aggregate stops driving the LEDs. The renderer consumes
-`snapshot.statuses` (`collector.py:82`) — the full fresh-status tuple — and emits
-one program describing all slots. `BatteryLedController.sync_snapshot` is the
+`collector.multiagent_statuses` — `snapshot.statuses` plus the `COMPLETED`
+sessions the aggregate path hides while anything is active, with sub-agents folded
+onto their parent — and emits one program describing all slots. `BatteryLedController.sync_snapshot` is the
 existing precedent for a controller taking richer state than a single enum, so
 this mirrors it rather than inventing a shape.
 
@@ -96,9 +100,9 @@ simulator run — through a node harness driving `sdled_parse` / `sdled_step`.
 
 ```text
 brightness 128
-0:#FF3A00 1:#FF3A00 2:#00E5FF 3:#00E5FF 4:#00FF66 5:#00FF66 6:#020204 7:#020204
+0:#FF3A00 1:#FF3A00 2:#00E5FF 3:#00E5FF 4:#00FF66 5:#00FF66 6:#000000 7:#000000
 0:#000000 900ms pulse; 2:#000000 900ms pulse; 4:#000000 900ms pulse
-repeat 327
+repeat 328
 ```
 
 Line 2 is the baseline: every slot's steady colour. Line 3 dips only the
@@ -115,7 +119,7 @@ the repeat count is the steady baseline.
 Two parser constraints found the hard way:
 
 - `repeat N` caps at 65535; `repeat 99999` fails with `bad-repeat`. Five minutes
-  at a ~916 ms cycle is ~327, so there is ample headroom.
+  at the measured 917 ms cycle is 328, so there is ample headroom.
 - `0:off` is rejected with `bad-index`. Indexed segments need an explicit
   `0:#000000`.
 
@@ -151,8 +155,11 @@ its current display colour was entered.
   third one" by repetition rather than by ordering rule.
 - **Hold.** A session keeps its slot while it stays displayable, across state
   and colour changes.
-- **Release.** A session's slot is freed when it leaves `snapshot.statuses` —
-  gone, or aged into `stale_statuses`.
+- **Release.** A session's slot is freed when it leaves the set the allocator
+  was fed — it ended, or it aged past its visibility window. Note that being
+  demoted into `stale_statuses` is *not* one of those routes: the aggregate path
+  demotes finished sessions as soon as anything is active, and
+  `multiagent_statuses` puts them back.
 - **Evict.** When no slot is free, a newcomer evicts the occupant of strictly
   lowest importance, and only if the newcomer is strictly more important than
   that occupant. Ties break on oldest state-entry timestamp. A newcomer no more

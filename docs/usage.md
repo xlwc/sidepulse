@@ -141,20 +141,42 @@ your `PATH`.
 Unlike the other three display kinds, multiagent always renders at brightness
 128 and does not read `brightness_for_device`. Eight LEDs lit at 255 are
 glaring. Wiring the setting through is a follow-up, marked at the call site in
-`status_bar.multiagent_controller_for_device`.
+`status_bar.multiagent_controller_for_device`. Until then the device submenu
+omits its brightness readout and slider in this mode rather than showing controls
+that do nothing.
 
 ### Slot positions are sticky per process, not persistent
 
 A session keeps its slot for as long as it stays visible, so you learn "mine is
 the third one" by repetition. Positions are assigned at random, and allocator
 state lives only in memory — restart the app and everything reshuffles. Slots
-survive sleep/wake, because the app is not killed by sleep.
+survive sleep/wake, because the app is not killed by sleep. They also survive
+every event that merely makes the app rewrite `LEDS.LED`: a battery preview on a
+power change, a brightness edit, a lid animation, a `/Volumes` signature change.
+Those reset the controller's belief about what the strip shows, which is what
+forces the rewrite, and nothing else — the slot map is left alone.
+
+### Sub-agents share their parent's LED
+
+A Claude session running Task-tool children reports a status per child, each with
+its own `agent_id`, so the raw status set has more entries than there are
+sessions. `collector.multiagent_statuses` folds them onto the parent's session
+key before the allocator runs, and the surviving status is the most important of
+the group. Three parallel sub-agents therefore light one LED, not four — and a
+child stopped on a permission prompt turns the parent's slot amber.
 
 ### The Screen Bar can disagree with the physical strip
 
 `sync_virtual_status_device` renders from the mode rather than reusing the
-strip's program, so it has its own allocator. Both show the same colours and the
-same counts, but the same session can sit at a different index on each.
+strip's program, so it has its own allocator, seeded independently. Colours agree,
+but nothing else is guaranteed:
+
+- **Positions differ.** Each allocator builds its own `random.Random`, so the same
+  session sits at a different index on the Screen Bar than on the strip. This is
+  true from first use, not something that drifts.
+- **Counts can differ.** `virtual_slot_allocator` is fixed at 8 slots, while a
+  physical device's count comes from `led_count_for_target`. Four live sessions
+  light four Screen Bar slots and two LEDs on a Dot.
 
 ### On a Dot, six of eight sessions would be invisible
 
@@ -178,7 +200,13 @@ it really has been waiting a long time, and its cache is cold.
 
 ## How long a slot stays lit
 
-A slot is held while its status is in the snapshot's fresh set:
+A slot is held while its status is in the set `collector.multiagent_statuses`
+builds. That is deliberately *not* `snapshot.statuses`, which is the aggregate
+indicator's set: there, one LED has to answer one question, so a single active
+session demotes every finished one out of sight. On a strip both fit, and green —
+"finished, output unread" — is most useful exactly while other sessions are still
+running. So finished sessions stay on the strip for their full window whatever
+else is happening:
 
 | Mode | Visible for | Constant |
 |---|---|---|
@@ -227,7 +255,7 @@ changed within the last five minutes:
 brightness 128
 0:#FF3A00 1:#000000 2:#000000 3:#00E5FF 4:#FF3A00 5:#000000 6:#000000 7:#FF3A00
 0:#000000 900ms pulse; 3:#000000 900ms pulse; 4:#000000 900ms pulse; 7:#000000 900ms pulse
-repeat 327
+repeat 328
 ```
 
 Line 2 is every slot's steady colour. Line 3 dips only the recently-changed

@@ -79,7 +79,10 @@ from .audit import (
 from .collector import (
     LiveAgentMonitor,
     SourceSpec,
+    coalesce_statuses_by_key,
+    multiagent_statuses,
     read_recent_lines_across_rotations,
+    session_coalesce_key,
 )
 from .device_writer import (
     DEFAULT_FILE_NAME,
@@ -497,7 +500,20 @@ class StatusBarController(NSObject):
                 battery_snapshot,
                 mac_sleep_snapshot,
             )
-            self.sync_leds(AgentMode.BLOCKED_ERROR, battery_snapshot, LED_DISPLAY_AGENT)
+            # Hold the last known slot vector rather than clearing. `sync_leds_now`
+            # recomputes the display kind per device and ignores the kind passed
+            # here, so a multiagent device would get `sync_statuses(())` and go
+            # all-black -- which is already how the strip says "nothing running".
+            self.sync_leds(
+                AgentMode.BLOCKED_ERROR,
+                battery_snapshot,
+                LED_DISPLAY_AGENT,
+                slot_statuses=(
+                    multiagent_statuses(self.last_snapshot)
+                    if self.last_snapshot is not None
+                    else ()
+                ),
+            )
             self.status_item.setMenu_(build_error_menu(exc))
             return
 
@@ -518,7 +534,7 @@ class StatusBarController(NSObject):
             snapshot.aggregate.mode,
             battery_snapshot,
             self.active_led_display_kind(battery_snapshot),
-            statuses=snapshot.statuses,
+            slot_statuses=multiagent_statuses(snapshot),
         )
         self.status_item.setMenu_(build_menu(snapshot, state, self))
 
@@ -1395,7 +1411,7 @@ class StatusBarController(NSObject):
                 self.last_snapshot.aggregate.mode,
                 self.last_battery_snapshot,
                 self.active_led_display_kind(self.last_battery_snapshot),
-                statuses=self.last_snapshot.statuses,
+                slot_statuses=multiagent_statuses(self.last_snapshot),
             )
 
     def set_virtual_status_device(self, enabled: bool) -> None:
@@ -1700,6 +1716,13 @@ class StatusBarController(NSObject):
         return LED_DISPLAY_AGENT
 
     def reset_led_controllers_for_display_change(self) -> None:
+        """Make every controller rewrite on the next sync.
+
+        Deliberately does *not* clear ``virtual_slot_allocator``: this runs after
+        every lid animation (`restore_led_display`), and `poll_lid_state` fires
+        one on each lid open and close, so clearing it moved every Screen Bar
+        session to a new LED whenever the lid was touched.
+        """
         self.led_controller.reset()
         self.battery_led_controller.reset()
         for controller in self.agent_led_controllers_by_device.values():
@@ -1708,7 +1731,6 @@ class StatusBarController(NSObject):
             controller.reset()
         for controller in self.multiagent_led_controllers_by_device.values():
             controller.reset()
-        self.virtual_slot_allocator.reset()
         self.last_led_display_kind_by_device.clear()
         self.last_led_error = None
 
@@ -1888,12 +1910,12 @@ class StatusBarController(NSObject):
         battery_snapshot: BatterySnapshot | None,
         display_kind: str,
         *,
-        statuses: tuple[AgentStatus, ...] = (),
+        slot_statuses: tuple[AgentStatus, ...] = (),
     ) -> None:
         if not self.leds_enabled:
             return
 
-        self.sync_virtual_status_device(mode, battery_snapshot, statuses=statuses)
+        self.sync_virtual_status_device(mode, battery_snapshot, slot_statuses=slot_statuses)
 
         if time.monotonic() < self.led_animation_until_monotonic:
             return
@@ -1903,7 +1925,7 @@ class StatusBarController(NSObject):
         self.led_sync_in_flight = True
         thread = threading.Thread(
             target=self.sync_leds_worker,
-            args=(mode, battery_snapshot, display_kind, statuses),
+            args=(mode, battery_snapshot, display_kind, slot_statuses),
             daemon=True,
         )
         thread.start()
@@ -1913,7 +1935,7 @@ class StatusBarController(NSObject):
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
         *,
-        statuses: tuple[AgentStatus, ...] = (),
+        slot_statuses: tuple[AgentStatus, ...] = (),
     ) -> None:
         if not SCREEN_BAR_FEATURE_ENABLED:
             self.virtual_status_device.hide()
@@ -1943,7 +1965,7 @@ class StatusBarController(NSObject):
             )
         elif display == LED_DISPLAY_MULTIAGENT:
             slots = self.virtual_slot_allocator.update(
-                statuses, datetime.now(timezone.utc)
+                slot_statuses, datetime.now(timezone.utc)
             )
             self.virtual_status_device.set_program(program_for_slots(slots))
         else:
@@ -1960,11 +1982,11 @@ class StatusBarController(NSObject):
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
         display_kind: str,
-        statuses: tuple[AgentStatus, ...] = (),
+        slot_statuses: tuple[AgentStatus, ...] = (),
     ) -> None:
         try:
             self.sync_leds_now(
-                mode, battery_snapshot, display_kind, statuses=statuses
+                mode, battery_snapshot, display_kind, slot_statuses=slot_statuses
             )
         finally:
             self.led_sync_in_flight = False
@@ -1975,7 +1997,7 @@ class StatusBarController(NSObject):
         battery_snapshot: BatterySnapshot | None,
         display_kind: str,
         *,
-        statuses: tuple[AgentStatus, ...] = (),
+        slot_statuses: tuple[AgentStatus, ...] = (),
     ) -> None:
         devices = [
             device for device in self.status_bar_devices()
@@ -2014,7 +2036,7 @@ class StatusBarController(NSObject):
                 )
             elif device_display_kind == LED_DISPLAY_MULTIAGENT:
                 result = self.multiagent_controller_for_device(device).sync_statuses(
-                    statuses
+                    slot_statuses
                 )
                 occupied = sum(1 for slot in result.slots if slot.color != SLOT_EMPTY)
                 label = f"{device.name} Multiagent {occupied}/{len(result.slots)}"
@@ -2475,7 +2497,14 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
     custom.setState_(1 if device.display == LED_DISPLAY_CUSTOM else 0)
     submenu.addItem_(custom)
 
-    if device.device_id != VIRTUAL_DEVICE_ID:
+    # Multiagent renders every slot at SLOT_BRIGHTNESS and never reads
+    # device.brightness (see multiagent_controller_for_device), so a readout here
+    # would report a number the strip does not use and the slider would do
+    # nothing. Omit both until the setting is wired through.
+    if (
+        device.device_id != VIRTUAL_DEVICE_ID
+        and device.display != LED_DISPLAY_MULTIAGENT
+    ):
         submenu.addItem_(NSMenuItem.separatorItem())
         submenu.addItem_(disabled_menu_item(f"Brightness {brightness_percent(device.brightness)}%"))
         submenu.addItem_(build_brightness_slider_item(device, target))
@@ -3884,7 +3913,7 @@ def restore_led_display(target, token_value) -> None:
             target.last_snapshot.aggregate.mode,
             target.last_battery_snapshot,
             target.active_led_display_kind(target.last_battery_snapshot),
-            statuses=target.last_snapshot.statuses,
+            slot_statuses=multiagent_statuses(target.last_snapshot),
         )
     else:
         target.refresh_(None)
@@ -4361,32 +4390,7 @@ def session_title_collision_key(status: AgentStatus) -> tuple[str, str]:
 
 
 def coalesced_menu_statuses(statuses) -> list[AgentStatus]:
-    return coalesce_statuses_by_key(statuses, menu_session_coalesce_key)
-
-
-def coalesce_statuses_by_key(statuses, key_fn) -> list[AgentStatus]:
-    by_key: dict[tuple[str, ...], AgentStatus] = {}
-    passthrough: list[AgentStatus] = []
-    for status in statuses:
-        key = key_fn(status)
-        if key is None:
-            passthrough.append(status)
-            continue
-        previous = by_key.get(key)
-        if previous is None or menu_status_sort_key(status) < menu_status_sort_key(previous):
-            by_key[key] = status
-    return [*by_key.values(), *passthrough]
-
-
-def menu_session_coalesce_key(status: AgentStatus) -> tuple[str, ...] | None:
-    if not status.session_id:
-        return None
-    return ("session", status.provider.lower(), status.session_id)
-
-
-def menu_status_sort_key(status: AgentStatus) -> tuple[int, int, float]:
-    subagent_penalty = 1 if ":agent:" in status.agent_id else 0
-    return (status.priority, subagent_penalty, -status.updated_at.timestamp())
+    return coalesce_statuses_by_key(statuses, session_coalesce_key)
 
 
 def menu_title_for_status(status: AgentStatus, now: datetime) -> str:

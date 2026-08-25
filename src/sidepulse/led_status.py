@@ -292,14 +292,24 @@ class MultiAgentLedController:
         self.last_error: str | None = None
         self.last_target: Path | None = None
         self.last_attempt_monotonic = 0.0
+        self.last_error_was_lookup = False
 
     def reset(self) -> None:
-        if self.allocator is not None:
-            self.allocator.reset()
+        """Forget what the strip is believed to show, not who is standing where.
+
+        Callers reach this on a battery preview, a brightness edit, a lid
+        animation and every ``/Volumes`` signature change -- routine events, none
+        of which mean the sessions moved. Clearing the allocator here would
+        reshuffle every position on all of them, and sticky position is the only
+        reason placement is random in the first place. The slot map needs no
+        explicit clearing anyway: ``SlotAllocator.update`` releases any occupant
+        missing from the incoming set, so it cleans itself.
+        """
         self.last_key = None
         self.last_error = None
         self.last_target = None
         self.last_attempt_monotonic = 0.0
+        self.last_error_was_lookup = False
 
     def sync_statuses(
         self,
@@ -310,11 +320,30 @@ class MultiAgentLedController:
         moment = now or datetime.now(timezone.utc)
         monotonic_now = time.monotonic()
 
+        # Backoff for the device lookup, separately from the write below. The
+        # lookup has no dedupe key to gate on -- the key needs a slot count, which
+        # needs the target -- so a failure here cannot fall through to the
+        # `error_retry_seconds` gate the way a write failure does. Without this,
+        # `leds --display multiagent` with nothing mounted re-ran
+        # `discover_devices()` on every tick.
+        if (
+            self.last_error_was_lookup
+            and monotonic_now - self.last_attempt_monotonic < self.error_retry_seconds
+        ):
+            return MultiAgentLedWrite(
+                target=self.last_target,
+                program="",
+                changed=False,
+                error=self.last_error,
+            )
+
         try:
             target = resolve_target_path(
                 device_path=self.device_path, file_name=self.file_name
             )
         except (DeviceWriteError, OSError) as exc:
+            self.last_attempt_monotonic = monotonic_now
+            self.last_error_was_lookup = True
             self.last_error = str(exc)
             return MultiAgentLedWrite(
                 target=self.last_target,
@@ -322,6 +351,8 @@ class MultiAgentLedController:
                 changed=False,
                 error=self.last_error,
             )
+
+        self.last_error_was_lookup = False
 
         slot_count = led_count_for_target(target)
         if self.allocator is None or self.allocator.slot_count != slot_count:

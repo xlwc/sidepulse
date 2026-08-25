@@ -2,9 +2,14 @@
 
 One LED is one top-level agent session. A session takes a slot when it becomes
 displayable, keeps it while it stays displayable, and gives it up when it drops
-out of the fresh-status set. Colour says what the session needs; a slot flashes
+out of the set it was fed. Colour says what the session needs; a slot flashes
 for the first five minutes after it enters a colour, so "changed recently" reads
 differently from "has been like this a while".
+
+"Top-level" is enforced upstream, in ``collector.multiagent_statuses``, not
+here: this module keys on ``AgentStatus.agent_id``, and a Task-tool sub-agent
+carries an ``agent_id`` distinct from its parent's. Fold sub-agents in before
+calling ``update``, or three parallel children light four LEDs.
 
 Standard library only, and no wall-clock reads: ``now`` is always passed in.
 That keeps the module unit-testable in isolation and keeps it importable with
@@ -104,8 +109,9 @@ class SlotAllocator:
         self._rng = rng if rng is not None else random.Random()
         self._slots: list[_Occupant | None] = [None] * self.slot_count
 
-    def reset(self) -> None:
-        self._slots = [None] * self.slot_count
+    # No reset(): there is no event that should reshuffle the strip. `update`
+    # releases occupants that leave the incoming set, so the map self-cleans, and
+    # a changed slot count builds a new allocator rather than clearing this one.
 
     def slot_for_key(self, key: str) -> int | None:
         for index, occupant in enumerate(self._slots):
@@ -116,11 +122,16 @@ class SlotAllocator:
     def update(
         self, statuses: Iterable[AgentStatus], now: datetime
     ) -> tuple[Slot, ...]:
-        """Fold the fresh-status set into the slot map and render it."""
+        """Fold the incoming status set into the slot map and render it.
+
+        Feed this ``collector.multiagent_statuses``, not ``snapshot.statuses``:
+        the latter hides finished sessions whenever anything is active, which on
+        a strip reads as "nothing finished" rather than "one LED, one answer".
+        """
         pending = self._displayable(statuses)
 
-        # Release. A slot is freed when its session leaves the fresh-status set,
-        # whether it is gone or has aged into stale_statuses.
+        # Release. A slot is freed when its session leaves the incoming set --
+        # by ageing out of its visibility window, or by ending.
         for index, occupant in enumerate(self._slots):
             if occupant is not None and occupant.key not in pending:
                 self._slots[index] = None
@@ -187,7 +198,8 @@ class SlotAllocator:
             return None
         weakest_rank = max(entry[0] for entry in occupied)
         if rank >= weakest_rank:
-            # Not strictly more important than every occupant.
+            # Ties do not displace: the newcomer has to outrank the weakest
+            # occupant on the strip, not merely match it.
             return None
         tied = [entry for entry in occupied if entry[0] == weakest_rank]
         tied.sort(key=lambda entry: (entry[1], entry[2]))

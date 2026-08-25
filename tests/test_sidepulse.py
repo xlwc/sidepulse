@@ -73,6 +73,7 @@ from sidepulse.led_slots import (
     SLOT_EMPTY,
     SLOT_GREEN,
     Slot,
+    SlotAllocator,
 )
 from sidepulse.led_status import (
     AgentLedController,
@@ -1612,6 +1613,81 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(labels[LED_DISPLAY_MULTIAGENT], "One LED Per Agent")
         self.assertEqual(len(set(labels.values())), len(LED_DISPLAY_CHOICES))
 
+    def test_status_bar_multiagent_submenu_omits_the_inert_brightness_controls(
+        self,
+    ) -> None:
+        """Multiagent renders at a fixed SLOT_BRIGHTNESS and never reads the setting.
+
+        Showing the readout anyway made the submenu claim "Brightness 100%" while
+        the strip wrote `brightness 128`, and dragging the slider changed nothing
+        on the device. Until the setting is wired through, the honest UI is no UI.
+        """
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        device = status_bar.StatusBarDevice(
+            device_id="/Volumes/SidePulsePro",
+            name="SidePulse Pro",
+            root=Path("/Volumes/SidePulsePro"),
+            target=Path("/Volumes/SidePulsePro/LEDS.LED"),
+            connected=True,
+            display=LED_DISPLAY_MULTIAGENT,
+            brightness=255,
+        )
+
+        submenu = status_bar.build_device_menu_item(
+            device, SimpleNamespace()
+        ).submenu()
+        titles = [
+            submenu.itemAtIndex_(index).title()
+            for index in range(submenu.numberOfItems())
+        ]
+        slider_count = sum(
+            1
+            for index in range(submenu.numberOfItems())
+            if submenu.itemAtIndex_(index).view() is not None
+        )
+
+        self.assertNotIn("Brightness 100%", titles)
+        self.assertEqual(slider_count, 0)
+        # The mode picker itself must survive, or there is no way back out.
+        self.assertIn("One LED Per Agent", titles)
+        self.assertIn("Agent Status", titles)
+
+    def test_status_bar_aggregate_submenu_keeps_the_brightness_controls(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        device = status_bar.StatusBarDevice(
+            device_id="/Volumes/SidePulsePro",
+            name="SidePulse Pro",
+            root=Path("/Volumes/SidePulsePro"),
+            target=Path("/Volumes/SidePulsePro/LEDS.LED"),
+            connected=True,
+            display=LED_DISPLAY_AGENT,
+            brightness=255,
+        )
+
+        submenu = status_bar.build_device_menu_item(
+            device, SimpleNamespace()
+        ).submenu()
+        titles = [
+            submenu.itemAtIndex_(index).title()
+            for index in range(submenu.numberOfItems())
+        ]
+        slider_count = sum(
+            1
+            for index in range(submenu.numberOfItems())
+            if submenu.itemAtIndex_(index).view() is not None
+        )
+
+        self.assertIn("Brightness 100%", titles)
+        self.assertEqual(slider_count, 1)
+
     def test_status_bar_device_menu_offers_the_multiagent_choice(self) -> None:
         try:
             from sidepulse import status_bar
@@ -1816,7 +1892,7 @@ class AgentMonitorTests(unittest.TestCase):
             AgentMode.WAITING_FOR_INPUT,
             None,
             LED_DISPLAY_MULTIAGENT,
-            statuses=statuses,
+            slot_statuses=statuses,
         )
 
         self.assertEqual(len(synced), 1)
@@ -2007,6 +2083,139 @@ class AgentMonitorTests(unittest.TestCase):
         validate_led_text(program)
         self.assertTrue(program.startswith("brightness 128\n"))
 
+    def test_refresh_error_holds_the_last_known_slot_vector(self) -> None:
+        """A monitor error must not read as "no sessions" on a multiagent strip.
+
+        `sync_leds_now` recomputes the display kind per device and ignores the
+        kind passed in, so the `LED_DISPLAY_AGENT` on this path does not keep a
+        multiagent device on the aggregate renderer. It gets `sync_statuses(())`,
+        which releases every slot and writes an all-black baseline — and all-black
+        already means "nothing running".
+        """
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+        status = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:a",
+            display_name="a",
+            mode=AgentMode.WORKING,
+            updated_at=base,
+            event_name="PreToolUse",
+            session_id="a",
+        )
+        synced: list[tuple[object, ...]] = []
+        fake = SimpleNamespace(
+            monitor=SimpleNamespace(
+                snapshot=lambda include_stale=False: (_ for _ in ()).throw(
+                    RuntimeError("socket gone")
+                )
+            ),
+            last_snapshot=MonitorSnapshot(
+                collected_at=base,
+                statuses=(status,),
+                stale_statuses=(),
+                sources=(),
+                aggregate=AggregateStatus(
+                    mode=AgentMode.WORKING, active_count=1, stale_count=0
+                ),
+            ),
+            set_status=lambda state: None,
+            read_battery_snapshot=lambda: None,
+            sync_keep_awake=lambda mode, battery: None,
+            read_mac_sleep_snapshot=lambda: None,
+            record_status_history=lambda *a: None,
+            sync_leds=lambda mode, battery, kind, slot_statuses=(): synced.append(
+                (mode, kind, slot_statuses)
+            ),
+            status_item=SimpleNamespace(setMenu_=lambda menu: None),
+        )
+
+        status_bar.StatusBarController.refresh_.callable(fake, None)
+
+        self.assertEqual(len(synced), 1)
+        self.assertEqual(synced[0][0], AgentMode.BLOCKED_ERROR)
+        self.assertEqual(synced[0][2], (status,))
+
+    def test_refresh_error_without_a_prior_snapshot_passes_no_slots(self) -> None:
+        """Nothing known yet is the one case where an empty strip is honest."""
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        synced: list[tuple[object, ...]] = []
+        fake = SimpleNamespace(
+            monitor=SimpleNamespace(
+                snapshot=lambda include_stale=False: (_ for _ in ()).throw(
+                    RuntimeError("socket gone")
+                )
+            ),
+            last_snapshot=None,
+            set_status=lambda state: None,
+            read_battery_snapshot=lambda: None,
+            sync_keep_awake=lambda mode, battery: None,
+            read_mac_sleep_snapshot=lambda: None,
+            record_status_history=lambda *a: None,
+            sync_leds=lambda mode, battery, kind, slot_statuses=(): synced.append(
+                (mode, kind, slot_statuses)
+            ),
+            status_item=SimpleNamespace(setMenu_=lambda menu: None),
+        )
+
+        status_bar.StatusBarController.refresh_.callable(fake, None)
+
+        self.assertEqual(len(synced), 1)
+        self.assertEqual(synced[0][2], ())
+
+    def test_display_change_reset_holds_the_screen_bar_slot_positions(self) -> None:
+        """The lid-animation route into this reset fires on every lid open and close.
+
+        Clearing the virtual allocator here reshuffled the Screen Bar each time.
+        """
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+        statuses = tuple(
+            AgentStatus(
+                provider="claude",
+                agent_id=f"claude:session:{name}",
+                display_name=name,
+                mode=AgentMode.WORKING,
+                updated_at=base,
+                event_name="PreToolUse",
+            )
+            for name in ("a", "b", "c")
+        )
+        allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
+        noop = SimpleNamespace(reset=lambda: None)
+        fake = SimpleNamespace(
+            led_controller=noop,
+            battery_led_controller=noop,
+            agent_led_controllers_by_device={},
+            battery_led_controllers_by_device={},
+            multiagent_led_controllers_by_device={},
+            virtual_slot_allocator=allocator,
+            last_led_display_kind_by_device={"x": "multiagent"},
+            last_led_error="old",
+        )
+
+        before = allocator.update(statuses, base)
+        status_bar.StatusBarController.reset_led_controllers_for_display_change(fake)
+        after = allocator.update(statuses, base + timedelta(seconds=15))
+
+        self.assertEqual(
+            [slot.color for slot in before], [slot.color for slot in after]
+        )
+        self.assertEqual(fake.last_led_display_kind_by_device, {})
+        self.assertIsNone(fake.last_led_error)
+
     def test_lid_animation_restore_forces_led_resync(self) -> None:
         try:
             from sidepulse import status_bar
@@ -2028,12 +2237,14 @@ class AgentMonitorTests(unittest.TestCase):
             last_snapshot=SimpleNamespace(
                 aggregate=SimpleNamespace(mode=AgentMode.WORKING),
                 statuses=(status,),
+                stale_statuses=(),
+                collected_at=datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc),
             ),
             last_battery_snapshot=object(),
             reset_led_controllers_for_display_change=lambda: calls.append(("reset", None)),
             active_led_display_kind=lambda snapshot: "agent",
-            sync_leds=lambda mode, snapshot, display, statuses=(): calls.append(
-                ("sync", (mode, snapshot, display, statuses))
+            sync_leds=lambda mode, snapshot, display, slot_statuses=(): calls.append(
+                ("sync", (mode, snapshot, display, slot_statuses))
             ),
             refresh_=lambda sender: calls.append(("refresh", sender)),
         )
@@ -3442,7 +3653,130 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(default.display, LED_DISPLAY_AGENT)
         self.assertEqual(multiagent.display, LED_DISPLAY_MULTIAGENT)
 
-    def test_leds_command_renders_one_slot_per_session_in_multiagent(self) -> None:
+    def test_leds_command_keeps_a_finished_session_green_beside_a_working_one(
+        self,
+    ) -> None:
+        """The demoted-COMPLETED case: the aggregate set hides it, the strip must not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "SidePulsePro"
+            device.mkdir()
+            base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+            snapshot = MonitorSnapshot(
+                collected_at=base,
+                statuses=(
+                    AgentStatus(
+                        provider="claude",
+                        agent_id="claude:session:busy",
+                        display_name="busy",
+                        mode=AgentMode.WORKING,
+                        updated_at=base,
+                        event_name="PreToolUse",
+                    ),
+                ),
+                stale_statuses=(
+                    AgentStatus(
+                        provider="codex",
+                        agent_id="codex:session:done",
+                        display_name="done",
+                        mode=AgentMode.COMPLETED,
+                        updated_at=base - timedelta(seconds=30),
+                        event_name="Stop",
+                        stale=True,
+                    ),
+                ),
+                sources=(),
+                aggregate=AggregateStatus(
+                    mode=AgentMode.WORKING, active_count=1, stale_count=1
+                ),
+            )
+            parser = build_parser(prog="sidepulse agent-monitor")
+            args = parser.parse_args(
+                [
+                    "leds",
+                    "--once",
+                    "--dry-run",
+                    "--display",
+                    LED_DISPLAY_MULTIAGENT,
+                    "--device",
+                    str(device),
+                ]
+            )
+
+            with patch.object(
+                cli_module, "monitor_from_args", lambda _args: SimpleNamespace(
+                    snapshot=lambda include_stale=False: snapshot
+                )
+            ):
+                buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    exit_code = cli_module.cmd_leds(args)
+
+            output = buffer.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn("slots=2/8", output)
+            self.assertIn("#00FF66", output)
+            self.assertIn("#00E5FF", output)
+
+    def test_leds_command_gives_a_subagent_no_slot_of_its_own(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "SidePulsePro"
+            device.mkdir()
+            base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+            snapshot = MonitorSnapshot(
+                collected_at=base,
+                statuses=(
+                    AgentStatus(
+                        provider="claude",
+                        agent_id="claude:session:d3f1",
+                        display_name="parent",
+                        mode=AgentMode.WORKING,
+                        updated_at=base,
+                        event_name="UserPromptSubmit",
+                        session_id="d3f1",
+                    ),
+                    AgentStatus(
+                        provider="claude",
+                        agent_id="claude:agent:ac7f1721ec697b403",
+                        display_name="child",
+                        mode=AgentMode.WORKING,
+                        updated_at=base,
+                        event_name="SubagentStart",
+                        session_id="d3f1",
+                    ),
+                ),
+                stale_statuses=(),
+                sources=(),
+                aggregate=AggregateStatus(
+                    mode=AgentMode.WORKING, active_count=2, stale_count=0
+                ),
+            )
+            parser = build_parser(prog="sidepulse agent-monitor")
+            args = parser.parse_args(
+                [
+                    "leds",
+                    "--once",
+                    "--dry-run",
+                    "--display",
+                    LED_DISPLAY_MULTIAGENT,
+                    "--device",
+                    str(device),
+                ]
+            )
+
+            with patch.object(
+                cli_module, "monitor_from_args", lambda _args: SimpleNamespace(
+                    snapshot=lambda include_stale=False: snapshot
+                )
+            ):
+                buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    exit_code = cli_module.cmd_leds(args)
+
+            output = buffer.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn("slots=1/8", output)
+
+
         with tempfile.TemporaryDirectory() as tmp:
             device = Path(tmp) / "SidePulsePro"
             device.mkdir()
@@ -4173,6 +4507,172 @@ class AgentMonitorTests(unittest.TestCase):
             with self.subTest(program=program):
                 result = controller.parse(program, 0)
                 self.assertTrue(result.ok, f"{result.error_name} at line {result.line}")
+
+    def test_multiagent_controller_reset_keeps_every_slot_assignment(self) -> None:
+        """Sticky position is the reason placement is random at all.
+
+        ``reset()`` fires on a battery preview, a brightness edit and every lid
+        animation. If it dropped the slot map, those routine events would
+        reshuffle the whole strip and "mine is the third one" would never hold.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "SidePulsePro"
+            device.mkdir()
+            controller = MultiAgentLedController(
+                device_path=device, rng=random.Random(1234)
+            )
+            base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+            statuses = tuple(
+                AgentStatus(
+                    provider="claude",
+                    agent_id=f"claude:session:{name}",
+                    display_name=name,
+                    mode=AgentMode.WORKING,
+                    updated_at=base,
+                    event_name="PreToolUse",
+                )
+                for name in ("a", "b", "c")
+            )
+
+            before = controller.sync_statuses(statuses, now=base)
+            controller.reset()
+            after = controller.sync_statuses(
+                statuses, now=base + timedelta(seconds=15)
+            )
+
+            self.assertEqual(
+                [slot.color for slot in before.slots],
+                [slot.color for slot in after.slots],
+            )
+
+    def test_multiagent_controller_reset_still_forces_the_next_write(self) -> None:
+        """Holding the slot map must not turn reset() into a no-op.
+
+        The point of the call is to forget what the strip is believed to show, so
+        the next sync rewrites even though the vector is unchanged.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "SidePulsePro"
+            device.mkdir()
+            controller = MultiAgentLedController(
+                device_path=device, rng=random.Random(1234)
+            )
+            base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+            statuses = (
+                AgentStatus(
+                    provider="claude",
+                    agent_id="claude:session:a",
+                    display_name="a",
+                    mode=AgentMode.WORKING,
+                    updated_at=base,
+                    event_name="PreToolUse",
+                ),
+            )
+
+            controller.sync_statuses(statuses, now=base)
+            unchanged = controller.sync_statuses(
+                statuses, now=base + timedelta(seconds=15)
+            )
+            controller.reset()
+            after_reset = controller.sync_statuses(
+                statuses, now=base + timedelta(seconds=30)
+            )
+
+            self.assertFalse(unchanged.changed)
+            self.assertTrue(after_reset.changed)
+
+    def test_multiagent_controller_backs_off_after_a_device_lookup_failure(self) -> None:
+        """`leds --display multiagent` with nothing mounted must not stat /Volumes every tick.
+
+        The lookup failure returns before the `error_retry_seconds` gate, so at the
+        default `--interval 1.0` it ran `discover_devices()` once a second forever.
+        """
+        controller = MultiAgentLedController(
+            device_path=None, error_retry_seconds=10.0, rng=random.Random(1234)
+        )
+        base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+        statuses = (
+            AgentStatus(
+                provider="claude",
+                agent_id="claude:session:a",
+                display_name="a",
+                mode=AgentMode.WORKING,
+                updated_at=base,
+                event_name="PreToolUse",
+            ),
+        )
+        lookups: list[int] = []
+
+        def failing_lookup(**_kwargs):
+            lookups.append(1)
+            raise DeviceWriteError("No SidePulse volume found")
+
+        clock = [1000.0]
+        with patch.object(led_status_module, "resolve_target_path", failing_lookup), \
+                patch.object(led_status_module.time, "monotonic", lambda: clock[0]):
+            first = controller.sync_statuses(statuses, now=base)
+            for tick in range(1, 10):
+                clock[0] = 1000.0 + tick
+                controller.sync_statuses(
+                    statuses, now=base + timedelta(seconds=tick)
+                )
+            within_window = len(lookups)
+
+            clock[0] = 1000.0 + 11
+            controller.sync_statuses(statuses, now=base + timedelta(seconds=11))
+
+        self.assertIsNotNone(first.error)
+        self.assertEqual(within_window, 1)
+        self.assertEqual(len(lookups), 2)
+
+    def test_multiagent_controller_retries_at_once_when_the_device_comes_back(
+        self,
+    ) -> None:
+        """Backoff must not outlive the failure it was throttling."""
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "SidePulsePro"
+            device.mkdir()
+            controller = MultiAgentLedController(
+                device_path=device, error_retry_seconds=10.0, rng=random.Random(1234)
+            )
+            base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+            statuses = (
+                AgentStatus(
+                    provider="claude",
+                    agent_id="claude:session:a",
+                    display_name="a",
+                    mode=AgentMode.WORKING,
+                    updated_at=base,
+                    event_name="PreToolUse",
+                ),
+            )
+            real_lookup = led_status_module.resolve_target_path
+            fail = [True]
+
+            def sometimes_failing(**kwargs):
+                if fail[0]:
+                    raise DeviceWriteError("No SidePulse volume found")
+                return real_lookup(**kwargs)
+
+            clock = [1000.0]
+            with patch.object(
+                led_status_module, "resolve_target_path", sometimes_failing
+            ), patch.object(led_status_module.time, "monotonic", lambda: clock[0]):
+                failed = controller.sync_statuses(statuses, now=base)
+                fail[0] = False
+                clock[0] = 1011.0
+                recovered = controller.sync_statuses(
+                    statuses, now=base + timedelta(seconds=11)
+                )
+                clock[0] = 1012.0
+                settled = controller.sync_statuses(
+                    statuses, now=base + timedelta(seconds=12)
+                )
+
+            self.assertIsNotNone(failed.error)
+            self.assertTrue(recovered.changed)
+            self.assertIsNone(recovered.error)
+            self.assertFalse(settled.changed)
 
     def test_multiagent_controller_skips_an_unchanged_slot_vector(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

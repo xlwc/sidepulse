@@ -1251,6 +1251,63 @@ def snapshot_from_statuses(
     )
 
 
+def multiagent_statuses(snapshot) -> tuple[AgentStatus, ...]:
+    """The status set one-LED-per-agent renders from.
+
+    Not ``snapshot.statuses``. That set is built for the *aggregate* indicator,
+    where one LED has to answer one question, so as soon as anything is active
+    every finished session is demoted into ``stale_statuses`` (see the
+    ``status_counts_active`` filter in ``snapshot_from_statuses``). A strip has
+    room for both, and green -- "finished, output unread" -- is most useful
+    precisely while other sessions are still running. So the sessions that were
+    demoted rather than aged out come back here, on the same
+    ``COMPLETED_VISIBLE_SECONDS`` window the aggregate path would have given
+    them had nothing else been active.
+
+    Sub-agents are then folded into their parent session, because a slot is a
+    top-level session. ``HookEvent.status_key`` prefers ``agent_id`` over
+    ``session_id``, so a Task-tool child keys distinctly from its parent and
+    would otherwise take a second LED -- three parallel sub-agents lighting four
+    slots, and crowding genuinely separate sessions off the strip. The parent's
+    slot takes the most important mode among the group, so a child stuck on a
+    permission prompt still shows amber.
+    """
+    statuses = [*snapshot.statuses]
+    now = snapshot.collected_at
+    statuses.extend(
+        status
+        for status in getattr(snapshot, "stale_statuses", ())
+        if status.mode == AgentMode.COMPLETED
+        and status.age_seconds(now) <= COMPLETED_VISIBLE_SECONDS
+    )
+    return tuple(coalesce_statuses_by_key(statuses, session_coalesce_key))
+
+
+def coalesce_statuses_by_key(statuses, key_fn) -> list[AgentStatus]:
+    by_key: dict[tuple[str, ...], AgentStatus] = {}
+    passthrough: list[AgentStatus] = []
+    for status in statuses:
+        key = key_fn(status)
+        if key is None:
+            passthrough.append(status)
+            continue
+        previous = by_key.get(key)
+        if previous is None or status_coalesce_sort_key(status) < status_coalesce_sort_key(previous):
+            by_key[key] = status
+    return [*by_key.values(), *passthrough]
+
+
+def session_coalesce_key(status: AgentStatus) -> tuple[str, ...] | None:
+    if not status.session_id:
+        return None
+    return ("session", status.provider.lower(), status.session_id)
+
+
+def status_coalesce_sort_key(status: AgentStatus) -> tuple[int, int, float]:
+    subagent_penalty = 1 if ":agent:" in status.agent_id else 0
+    return (status.priority, subagent_penalty, -status.updated_at.timestamp())
+
+
 def status_is_stale(
     status: AgentStatus,
     now: datetime,

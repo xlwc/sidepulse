@@ -16,7 +16,7 @@ from .battery import (
     read_battery_snapshot,
     render_battery_snapshot,
 )
-from .collector import AgentMonitor, SourceSpec, default_sources
+from .collector import AgentMonitor, SourceSpec, default_sources, multiagent_statuses
 from .device_writer import DEFAULT_FILE_NAME, DeviceWriteError, write_led_program
 from .hook import hook_log_main
 from .install import (
@@ -801,7 +801,7 @@ def _run_multiagent_leds(args: argparse.Namespace, monitor) -> int:
         while True:
             snapshot = monitor.snapshot(include_stale=args.all)
             result = leds.sync_statuses(
-                snapshot.statuses, now=snapshot.collected_at
+                multiagent_statuses(snapshot), now=snapshot.collected_at
             )
             if result.changed or result.error or args.once:
                 print(

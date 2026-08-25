@@ -11,6 +11,12 @@ import random
 import unittest
 from datetime import datetime, timedelta, timezone
 
+from sidepulse.collector import (
+    COMPLETED_VISIBLE_SECONDS,
+    IDLE_VISIBLE_SECONDS,
+    multiagent_statuses,
+    snapshot_from_statuses,
+)
 from sidepulse.led_slots import (
     FLASH_SECONDS,
     SLOT_AMBER,
@@ -32,6 +38,7 @@ def status(
     mode: AgentMode,
     *,
     updated_at: datetime = BASE,
+    session_id: str | None = None,
 ) -> AgentStatus:
     return AgentStatus(
         provider="claude",
@@ -40,6 +47,19 @@ def status(
         mode=mode,
         updated_at=updated_at,
         event_name="Stop",
+        session_id=session_id,
+    )
+
+
+def snapshot(*statuses: AgentStatus, collected_at: datetime = BASE):
+    return snapshot_from_statuses(
+        statuses,
+        collected_at=collected_at,
+        sources=(),
+        stale_after_seconds=60 * 60.0,
+        tool_running_timeout_seconds=10 * 60.0,
+        completed_visible_seconds=COMPLETED_VISIBLE_SECONDS,
+        idle_visible_seconds=IDLE_VISIBLE_SECONDS,
     )
 
 
@@ -310,6 +330,164 @@ class SlotCountTests(unittest.TestCase):
         self.assertEqual(
             sorted(slot.color for slot in slots), sorted([SLOT_AMBER, SLOT_CYAN])
         )
+
+
+class MultiagentStatusFeedTests(unittest.TestCase):
+    """What reaches the allocator, as opposed to what the allocator does with it.
+
+    ``snapshot.statuses`` is the aggregate indicator's set, and it deliberately
+    hides finished sessions while anything is active. A strip has room for both,
+    so the feed is not the same set.
+    """
+
+    def test_completed_sessions_keep_their_slot_while_another_is_active(self) -> None:
+        snap = snapshot(
+            status("done-a", AgentMode.COMPLETED),
+            status("done-b", AgentMode.COMPLETED),
+            status("done-c", AgentMode.COMPLETED),
+            status("busy", AgentMode.TOOL_RUNNING),
+        )
+
+        keys = {status.agent_id for status in multiagent_statuses(snap)}
+
+        self.assertEqual(keys, {"done-a", "done-b", "done-c", "busy"})
+
+    def test_a_completed_session_drops_out_once_it_ages_past_its_window(self) -> None:
+        snap = snapshot(
+            status(
+                "old",
+                AgentMode.COMPLETED,
+                updated_at=BASE - timedelta(seconds=COMPLETED_VISIBLE_SECONDS + 1),
+            ),
+            status("busy", AgentMode.WORKING),
+        )
+
+        keys = {status.agent_id for status in multiagent_statuses(snap)}
+
+        self.assertEqual(keys, {"busy"})
+
+    def test_idle_sessions_stay_out_of_the_feed(self) -> None:
+        """IDLE_VISIBLE_SECONDS is 0, so an idle status is stale on arrival."""
+        snap = snapshot(
+            status("idle", AgentMode.IDLE_READY),
+            status("busy", AgentMode.WORKING),
+        )
+
+        keys = {status.agent_id for status in multiagent_statuses(snap)}
+
+        self.assertEqual(keys, {"busy"})
+
+    def test_a_completed_session_renders_green_beside_a_working_one(self) -> None:
+        snap = snapshot(
+            status("done", AgentMode.COMPLETED),
+            status("busy", AgentMode.TOOL_RUNNING),
+        )
+        allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
+
+        slots = allocator.update(multiagent_statuses(snap), BASE)
+
+        self.assertEqual(
+            sorted(slot.color for slot in slots if slot.color != SLOT_EMPTY),
+            sorted([SLOT_CYAN, SLOT_GREEN]),
+        )
+
+    def test_a_subagent_shares_its_parent_session_slot(self) -> None:
+        snap = snapshot(
+            status(
+                "claude:session:d3f1",
+                AgentMode.WORKING,
+                session_id="d3f1",
+            ),
+            status(
+                "claude:agent:ac7f1721ec697b403",
+                AgentMode.TOOL_RUNNING,
+                session_id="d3f1",
+            ),
+        )
+
+        statuses = multiagent_statuses(snap)
+
+        self.assertEqual(len(statuses), 1)
+
+    def test_a_subagent_lends_its_parent_the_more_important_mode(self) -> None:
+        """A child waiting on a permission prompt has to surface on the parent's slot."""
+        snap = snapshot(
+            status(
+                "claude:session:d3f1",
+                AgentMode.WORKING,
+                session_id="d3f1",
+            ),
+            status(
+                "claude:agent:ac7f1721ec697b403",
+                AgentMode.WAITING_FOR_INPUT,
+                session_id="d3f1",
+            ),
+        )
+        allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
+
+        slots = allocator.update(multiagent_statuses(snap), BASE)
+
+        self.assertEqual(
+            [slot.color for slot in slots if slot.color != SLOT_EMPTY], [SLOT_AMBER]
+        )
+
+    def test_a_parent_wins_a_tie_against_its_own_subagent(self) -> None:
+        """Same mode both sides: the top-level session is the one that survives."""
+        snap = snapshot(
+            status("claude:session:d3f1", AgentMode.WORKING, session_id="d3f1"),
+            status("claude:agent:aaa", AgentMode.WORKING, session_id="d3f1"),
+        )
+
+        statuses = multiagent_statuses(snap)
+
+        self.assertEqual(
+            [status.agent_id for status in statuses], ["claude:session:d3f1"]
+        )
+
+    def test_three_parallel_subagents_light_one_slot_not_four(self) -> None:
+        snap = snapshot(
+            status("claude:session:d3f1", AgentMode.WORKING, session_id="d3f1"),
+            status("claude:agent:aaa", AgentMode.WORKING, session_id="d3f1"),
+            status("claude:agent:bbb", AgentMode.WORKING, session_id="d3f1"),
+            status("claude:agent:ccc", AgentMode.WORKING, session_id="d3f1"),
+        )
+        allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
+
+        slots = allocator.update(multiagent_statuses(snap), BASE)
+
+        self.assertEqual(sum(1 for slot in slots if slot.color != SLOT_EMPTY), 1)
+
+    def test_separate_sessions_keep_separate_slots(self) -> None:
+        snap = snapshot(
+            status("claude:session:aaa", AgentMode.WORKING, session_id="aaa"),
+            status("claude:session:bbb", AgentMode.WORKING, session_id="bbb"),
+        )
+
+        statuses = multiagent_statuses(snap)
+
+        self.assertEqual(len(statuses), 2)
+
+    def test_a_session_without_a_session_id_keeps_its_own_slot(self) -> None:
+        """No session_id means nothing to coalesce on, so it must pass through."""
+        snap = snapshot(
+            status("codex:unknown", AgentMode.WORKING),
+            status("claude:session:aaa", AgentMode.WORKING, session_id="aaa"),
+        )
+
+        statuses = multiagent_statuses(snap)
+
+        self.assertEqual(len(statuses), 2)
+
+    def test_same_session_id_across_providers_stays_separate(self) -> None:
+        grok = status("grok:session:shared", AgentMode.WORKING, session_id="shared")
+        snap = snapshot(
+            status("claude:session:shared", AgentMode.WORKING, session_id="shared"),
+            AgentStatus(**{**grok.__dict__, "provider": "grok"}),
+        )
+
+        statuses = multiagent_statuses(snap)
+
+        self.assertEqual(len(statuses), 2)
 
 
 if __name__ == "__main__":
