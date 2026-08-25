@@ -36,14 +36,19 @@ cache-warmth story: it is running, and it will still be running in six minutes.
 The cost is that a session working for an hour looks identical to one that started
 two seconds ago. Working is the boring state.
 
+The urgency axis is intensity: red peaks at full and green at half, and after
+five minutes both settle *below* a working slot's steady mid-intensity — so once
+things are quiet, hue is what tells them apart, not brightness.
+
 Intensity lives in those hex values, not in the `brightness` directive, which is
 program-global and so cannot vary per slot. The directive carries your brightness
 slider on top, as a master gain over all three bands.
 
 The hex values are provisional. Numeric intensity is not perceived intensity, and
 one tier fraction does not read as one tier across red, blue and green — expect
-them to be retuned against hardware. They are all in one table in
-`led_slots.py`, so tuning them touches nothing else.
+them to be retuned against hardware. They are all in the `BAND_ALERT` /
+`BAND_WORKING` / `BAND_DONE` table in `led_slots.py`, so tuning them touches
+nothing else.
 
 ## Turning it on
 
@@ -155,20 +160,24 @@ your `PATH`.
 ### Turning the slider down can hide the settled colours
 
 Per-device brightness works in this mode: the slider emits `brightness N`, which
-scales all three bands together. The settled colours are already the dim end of
-each band, so at a low slider setting they can quantize to nearly nothing — at
-25%, `#3D0000` is an effective red of about 15/255.
+scales all three bands together. Red and green settle at the dim end of their
+band and blue holds mid-intensity, so at a low slider setting the settled colours
+can quantize to nearly nothing — at 25%, `#3D0000` is an effective red of about
+15/255.
 
 That is accepted rather than floored. Dimming the strip to almost nothing is a
 reasonable thing to want from a brightness slider, and a floor would surprise
 whoever asked for it. If settled slots are too faint for you, raise the slider or
-raise the `steady` values in `led_slots.py`.
+raise the `SlotBand.steady` values in `led_slots.py`.
 
-If you used this mode before the slider was wired up, expect a one-off surprise:
-the strip ignored your brightness setting and rendered at a fixed 128, so
-whatever the slider was left at now applies for the first time. A strip that
-looks too dark after upgrading is almost always this, and the submenu now shows
-the percentage next to the slider, so it is one drag to fix.
+If you used this mode before the bands landed, expect the strip to look darker.
+That is mostly the bands, not your slider: a settled alert slot is now an
+effective red of 61/255 where the old flat amber ran at 128, and it is meant to
+be. The slider is a second, independent change — it was hidden in this mode and
+ignored by the renderer, so whatever it was left at (255 unless you moved it
+while the device was on another display kind) now applies for the first time.
+The submenu shows the current percentage above the slider, so check it before
+reaching for it.
 
 ### Slot positions are sticky per process, not persistent
 
@@ -226,7 +235,7 @@ strip stays on `INIT.LED` until some agent genuinely changes state. Aggregate
 mode has this same gap; multiagent inherits it unchanged.
 
 Flash clocks are wall-clock and run from `AgentStatus.updated_at`, so a session
-that was waiting when the lid closed renders steady on wake. That is correct —
+that was waiting when the lid closed renders settled on wake. That is correct —
 it really has been waiting a long time, and its cache is cold.
 
 ## How long a slot stays lit
@@ -247,7 +256,7 @@ else is happening:
 
 `IDLE_READY` is in the state table for completeness and to keep the eviction
 ordering total, but with `IDLE_VISIBLE_SECONDS = 0.0` an idle status is stale by
-the next collection. In practice the strip shows three colours, not four.
+the next collection. In practice the strip shows three bands, not four.
 
 ## When there are more sessions than LEDs
 
@@ -289,7 +298,7 @@ changed within the last five minutes. At default brightness there is no
 repeat 328
 ```
 
-Line 1 is every slot's settled colour. Line 2 pulses only the recently-changed
+Line 1 is every slot's baseline colour. Line 2 pulses only the recently-changed
 slots up to their band's peak and back; `pulse` returns to the line's start
 colour, so each cycle is a blink up from the baseline and unmentioned LEDs hold
 rock steady. Slot 3 is working and so never appears on line 2 at all, however
@@ -306,9 +315,13 @@ forever.
 
 Because the count is finite *and* line 1 is the baseline, a dead app leaves a
 device holding the settled appearance — not one blinking indefinitely, and not
-one frozen on the bright pre-settle colour either. The five-minute write is
-therefore visually a no-op: by the time the host notices the boundary the device
-already looks right, and the write only removes line 2.
+one frozen on the bright pre-settle colour either. For the last slot to settle,
+that five-minute write is visually a no-op: the count has already run out and the
+device is holding the settled look before the host notices the boundary. For an
+earlier one it is not — `repeat` is sized to the longest remaining flash, so a
+slot that crosses its own five-minute mark keeps blinking until the next refresh
+drops it from line 2. Either way the write only ever touches line 2; line 1 does
+not move.
 
 Two `LEDS.LED` parser constraints worth knowing if you edit the renderer, since
 `validate_led_text` checks only size and cannot catch either:

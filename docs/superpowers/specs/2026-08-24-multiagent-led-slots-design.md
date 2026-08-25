@@ -3,13 +3,17 @@
 Date: 2026-08-24
 Status: accepted, implementing
 
-> **Superseded in part.** The state table, program shape and brightness handling
-> here were replaced by
+> **Superseded in part.** The state table, the program shape, brightness
+> handling and the flash clock's rank rule here were replaced by
 > [`2026-08-25-multiagent-led-colour-bands-design.md`](2026-08-25-multiagent-led-colour-bands-design.md).
 > The strip now carries three colour bands with their own intensity, the flash
-> pulses up from the settled colour rather than down to black, and the brightness
-> slider is live. Everything else in this document — slot allocation, eviction,
-> the status feed, sleep behaviour, the write budget — still holds.
+> pulses up from the settled colour rather than down to black, whether a slot
+> blinks is a property of its band and not of its rank (`FLASHING_RANKS` is
+> gone — the working band never flashes and rank 4 no longer never-flashes), and
+> the brightness slider is live. Ranks survive for eviction alone. Everything
+> else in this document — slot allocation, eviction, the status feed, sleep
+> behaviour, the write budget — still holds, except that the dedupe key is now
+> per-slot `(colour, flash colour)`.
 
 ## Summary
 
