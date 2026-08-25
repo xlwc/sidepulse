@@ -32,7 +32,16 @@ TERMINAL_APP_CHOICES = (
 LED_DISPLAY_AGENT = "agent"
 LED_DISPLAY_BATTERY = "battery"
 LED_DISPLAY_CUSTOM = "custom"
-LED_DISPLAY_CHOICES = (LED_DISPLAY_AGENT, LED_DISPLAY_BATTERY, LED_DISPLAY_CUSTOM)
+# One LED per agent session instead of one aggregate indicator. Worth choosing
+# per device: eight slots is the point of it, so the 2-LED Dot usually stays on
+# aggregate `agent`.
+LED_DISPLAY_MULTIAGENT = "multiagent"
+LED_DISPLAY_CHOICES = (
+    LED_DISPLAY_AGENT,
+    LED_DISPLAY_BATTERY,
+    LED_DISPLAY_CUSTOM,
+    LED_DISPLAY_MULTIAGENT,
+)
 SLEEP_PREVENTION_NEVER = "never"
 SLEEP_PREVENTION_AGENTS = "agents"
 SLEEP_PREVENTION_ALWAYS = "always"

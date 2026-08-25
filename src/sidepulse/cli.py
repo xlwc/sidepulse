@@ -27,7 +27,8 @@ from .install import (
     uninstall_codex_hooks,
     uninstall_grok_hooks,
 )
-from .led_status import AgentLedController, LedStatusWrite
+from .led_slots import SLOT_EMPTY
+from .led_status import AgentLedController, LedStatusWrite, MultiAgentLedController
 from .lid_sleep import (
     install_sleep_helper,
     sleep_helper_install_command,
@@ -44,9 +45,11 @@ from .providers import (
     default_log_path,
 )
 from .settings import (
+    LED_DISPLAY_AGENT,
     LED_DISPLAY_BATTERY,
     LED_DISPLAY_CUSTOM,
     LED_DISPLAY_CHOICES,
+    LED_DISPLAY_MULTIAGENT,
     load_settings,
     save_settings,
 )
@@ -618,6 +621,16 @@ def build_parser(prog: str = "agent-monitor") -> argparse.ArgumentParser:
     )
     leds.add_argument("--dry-run", action="store_true", help="Show writes without touching the device.")
     leds.add_argument("--once", action="store_true", help="Write the current status once and exit.")
+    leds.add_argument(
+        "--display",
+        choices=(LED_DISPLAY_AGENT, LED_DISPLAY_MULTIAGENT),
+        default=LED_DISPLAY_AGENT,
+        help=(
+            "'agent' collapses every session to one whole-strip state; "
+            "'multiagent' gives each session its own LED. "
+            f"Default: {LED_DISPLAY_AGENT}."
+        ),
+    )
     leds.set_defaults(func=cmd_leds)
 
     status_bar = subparsers.add_parser("status-bar", help="Install and start the macOS menu-bar app.")
@@ -751,6 +764,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
 def cmd_leds(args: argparse.Namespace) -> int:
     monitor = monitor_from_args(args)
+    multiagent = getattr(args, "display", LED_DISPLAY_AGENT) == LED_DISPLAY_MULTIAGENT
+    if multiagent:
+        return _run_multiagent_leds(args, monitor)
+
     leds = AgentLedController(
         device_path=args.device,
         file_name=args.file_name,
@@ -763,6 +780,33 @@ def cmd_leds(args: argparse.Namespace) -> int:
             result = leds.sync_mode(snapshot.aggregate.mode)
             if result.changed or result.error or args.once:
                 print(render_led_sync_result(result, snapshot, dry_run=args.dry_run))
+                sys.stdout.flush()
+
+            if args.once:
+                return 2 if result.error else 0
+
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 0
+
+
+def _run_multiagent_leds(args: argparse.Namespace, monitor) -> int:
+    leds = MultiAgentLedController(
+        device_path=args.device,
+        file_name=args.file_name,
+        dry_run=args.dry_run,
+    )
+
+    try:
+        while True:
+            snapshot = monitor.snapshot(include_stale=args.all)
+            result = leds.sync_statuses(
+                snapshot.statuses, now=snapshot.collected_at
+            )
+            if result.changed or result.error or args.once:
+                print(
+                    render_multiagent_led_result(result, dry_run=args.dry_run)
+                )
                 sys.stdout.flush()
 
             if args.once:
@@ -1042,6 +1086,25 @@ def render_led_sync_result(result: LedStatusWrite, snapshot, dry_run: bool = Fal
         )
     ]
     if dry_run and result.program:
+        lines.append(result.program)
+    return "\n".join(lines)
+
+
+def render_multiagent_led_result(result, dry_run: bool = False) -> str:
+    occupied = sum(1 for slot in result.slots if slot.color != SLOT_EMPTY)
+    summary = f"slots={occupied}/{len(result.slots)}"
+    if result.error:
+        return f"LEDs: multiagent {summary} error={result.error}"
+
+    action = "would write" if dry_run else "wrote"
+    target = result.target if result.target is not None else "-"
+    flashing = sum(1 for slot in result.slots if slot.flashing)
+    lines = [
+        f"LEDs: {action} multiagent to {target} ({summary}, flashing={flashing})"
+    ]
+    # Unlike aggregate mode there is no one-word label for the strip, so the
+    # program text is the readable form whether or not this is a dry run.
+    if result.program:
         lines.append(result.program)
     return "\n".join(lines)
 

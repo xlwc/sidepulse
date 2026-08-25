@@ -103,13 +103,16 @@ from .install import (
     uninstall_codex_hooks,
     uninstall_grok_hooks,
 )
+from .led_slots import SLOT_EMPTY, SlotAllocator
 from .led_status import (
     AgentLedController,
+    MultiAgentLedController,
     apply_brightness,
     brightness_percent,
     normalize_brightness,
     normalized_device_name,
     program_for_display_state,
+    program_for_slots,
     write_mode_to_leds,
     display_state_for_mode,
 )
@@ -162,6 +165,7 @@ from .settings import (
     LED_DISPLAY_AGENT,
     LED_DISPLAY_BATTERY,
     LED_DISPLAY_CUSTOM,
+    LED_DISPLAY_MULTIAGENT,
     LID_ANIMATION_CLOSED,
     LID_ANIMATION_OPEN,
     SLEEP_PREVENTION_AGENTS,
@@ -399,6 +403,11 @@ class StatusBarController(NSObject):
         self.battery_led_controller = BatteryLedController()
         self.agent_led_controllers_by_device = {}
         self.battery_led_controllers_by_device = {}
+        self.multiagent_led_controllers_by_device = {}
+        # The Screen Bar is synced separately from the physical strip, so it
+        # needs its own allocator. Slot positions can therefore differ between
+        # the Screen Bar and a physical Pro showing the same sessions.
+        self.virtual_slot_allocator = SlotAllocator(slot_count=8)
         self.last_led_display_kind_by_device = {}
         self.device_errors = {}
         self.leds_enabled = True
@@ -509,6 +518,7 @@ class StatusBarController(NSObject):
             snapshot.aggregate.mode,
             battery_snapshot,
             self.active_led_display_kind(battery_snapshot),
+            statuses=snapshot.statuses,
         )
         self.status_item.setMenu_(build_menu(snapshot, state, self))
 
@@ -733,6 +743,10 @@ class StatusBarController(NSObject):
     @objc.IBAction
     def setDeviceDisplayAgent_(self, sender):
         self.set_device_display(sender.representedObject(), LED_DISPLAY_AGENT)
+
+    @objc.IBAction
+    def setDeviceDisplayMultiagent_(self, sender):
+        self.set_device_display(sender.representedObject(), LED_DISPLAY_MULTIAGENT)
 
     @objc.IBAction
     def setDeviceDisplayBattery_(self, sender):
@@ -1381,6 +1395,7 @@ class StatusBarController(NSObject):
                 self.last_snapshot.aggregate.mode,
                 self.last_battery_snapshot,
                 self.active_led_display_kind(self.last_battery_snapshot),
+                statuses=self.last_snapshot.statuses,
             )
 
     def set_virtual_status_device(self, enabled: bool) -> None:
@@ -1680,6 +1695,8 @@ class StatusBarController(NSObject):
             return LED_DISPLAY_BATTERY
         if snapshot is not None and time.monotonic() < self.battery_preview_until:
             return LED_DISPLAY_BATTERY
+        if self.settings.led_display == LED_DISPLAY_MULTIAGENT:
+            return LED_DISPLAY_MULTIAGENT
         return LED_DISPLAY_AGENT
 
     def reset_led_controllers_for_display_change(self) -> None:
@@ -1689,6 +1706,9 @@ class StatusBarController(NSObject):
             controller.reset()
         for controller in self.battery_led_controllers_by_device.values():
             controller.reset()
+        for controller in self.multiagent_led_controllers_by_device.values():
+            controller.reset()
+        self.virtual_slot_allocator.reset()
         self.last_led_display_kind_by_device.clear()
         self.last_led_error = None
 
@@ -1699,6 +1719,9 @@ class StatusBarController(NSObject):
         battery_controller = self.battery_led_controllers_by_device.get(device_id)
         if battery_controller is not None:
             battery_controller.reset()
+        multiagent_controller = self.multiagent_led_controllers_by_device.get(device_id)
+        if multiagent_controller is not None:
+            multiagent_controller.reset()
         self.last_led_display_kind_by_device.pop(device_id, None)
         self.device_errors.pop(device_id, None)
         self.last_led_error = None
@@ -1719,6 +1742,19 @@ class StatusBarController(NSObject):
             self.battery_led_controllers_by_device[device.device_id] = controller
         controller.device_path = device.target
         controller.brightness = device.brightness
+        return controller
+
+    def multiagent_controller_for_device(
+        self, device: StatusBarDevice
+    ) -> MultiAgentLedController:
+        controller = self.multiagent_led_controllers_by_device.get(device.device_id)
+        if controller is None:
+            controller = MultiAgentLedController(device_path=device.target)
+            self.multiagent_led_controllers_by_device[device.device_id] = controller
+        controller.device_path = device.target
+        # Deliberately not device.brightness: slots render at SLOT_BRIGHTNESS so
+        # eight lit LEDs are readable rather than glaring. Per-device brightness
+        # in multiagent mode is not wired up yet.
         return controller
 
     def status_bar_devices(self, *, remember: bool = True) -> list[StatusBarDevice]:
@@ -1842,6 +1878,8 @@ class StatusBarController(NSObject):
             return LED_DISPLAY_BATTERY
         if battery_snapshot is not None and time.monotonic() < self.battery_preview_until:
             return LED_DISPLAY_BATTERY
+        if device.display == LED_DISPLAY_MULTIAGENT:
+            return LED_DISPLAY_MULTIAGENT
         return LED_DISPLAY_AGENT
 
     def sync_leds(
@@ -1849,11 +1887,13 @@ class StatusBarController(NSObject):
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
         display_kind: str,
+        *,
+        statuses: tuple[AgentStatus, ...] = (),
     ) -> None:
         if not self.leds_enabled:
             return
 
-        self.sync_virtual_status_device(mode, battery_snapshot)
+        self.sync_virtual_status_device(mode, battery_snapshot, statuses=statuses)
 
         if time.monotonic() < self.led_animation_until_monotonic:
             return
@@ -1863,7 +1903,7 @@ class StatusBarController(NSObject):
         self.led_sync_in_flight = True
         thread = threading.Thread(
             target=self.sync_leds_worker,
-            args=(mode, battery_snapshot, display_kind),
+            args=(mode, battery_snapshot, display_kind, statuses),
             daemon=True,
         )
         thread.start()
@@ -1872,6 +1912,8 @@ class StatusBarController(NSObject):
         self,
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
+        *,
+        statuses: tuple[AgentStatus, ...] = (),
     ) -> None:
         if not SCREEN_BAR_FEATURE_ENABLED:
             self.virtual_status_device.hide()
@@ -1899,6 +1941,11 @@ class StatusBarController(NSObject):
                     brightness=device.brightness,
                 )
             )
+        elif display == LED_DISPLAY_MULTIAGENT:
+            slots = self.virtual_slot_allocator.update(
+                statuses, datetime.now(timezone.utc)
+            )
+            self.virtual_status_device.set_program(program_for_slots(slots))
         else:
             self.virtual_status_device.set_program(
                 program_for_display_state(
@@ -1913,9 +1960,12 @@ class StatusBarController(NSObject):
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
         display_kind: str,
+        statuses: tuple[AgentStatus, ...] = (),
     ) -> None:
         try:
-            self.sync_leds_now(mode, battery_snapshot, display_kind)
+            self.sync_leds_now(
+                mode, battery_snapshot, display_kind, statuses=statuses
+            )
         finally:
             self.led_sync_in_flight = False
 
@@ -1924,6 +1974,8 @@ class StatusBarController(NSObject):
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
         display_kind: str,
+        *,
+        statuses: tuple[AgentStatus, ...] = (),
     ) -> None:
         devices = [
             device for device in self.status_bar_devices()
@@ -1960,6 +2012,12 @@ class StatusBarController(NSObject):
                     f"{device.name} Battery {battery_snapshot.percent}% "
                     f"{format_watts(battery_snapshot.adapter_power)}"
                 )
+            elif device_display_kind == LED_DISPLAY_MULTIAGENT:
+                result = self.multiagent_controller_for_device(device).sync_statuses(
+                    statuses
+                )
+                occupied = sum(1 for slot in result.slots if slot.color != SLOT_EMPTY)
+                label = f"{device.name} Multiagent {occupied}/{len(result.slots)}"
             else:
                 result = self.agent_controller_for_device(device).sync_mode(mode)
                 label = f"{device.name} {result.label}"
@@ -2386,6 +2444,16 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
     agent.setRepresentedObject_(device.device_id)
     agent.setState_(1 if device.display == LED_DISPLAY_AGENT else 0)
     submenu.addItem_(agent)
+
+    multiagent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "One LED Per Agent",
+        "setDeviceDisplayMultiagent:",
+        "",
+    )
+    multiagent.setTarget_(target)
+    multiagent.setRepresentedObject_(device.device_id)
+    multiagent.setState_(1 if device.display == LED_DISPLAY_MULTIAGENT else 0)
+    submenu.addItem_(multiagent)
 
     battery = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
         "Battery Level",
@@ -3816,6 +3884,7 @@ def restore_led_display(target, token_value) -> None:
             target.last_snapshot.aggregate.mode,
             target.last_battery_snapshot,
             target.active_led_display_kind(target.last_battery_snapshot),
+            statuses=target.last_snapshot.statuses,
         )
     else:
         target.refresh_(None)
