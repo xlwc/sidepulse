@@ -185,8 +185,12 @@ reaching for it.
 ### Slot positions are sticky per process, not persistent
 
 A session keeps its slot for as long as it stays visible, so you learn "mine is
-the third one" by repetition. Positions are assigned at random, and allocator
-state lives only in memory — restart the app and everything reshuffles. Slots
+the third one" by repetition. The first session of a run lands at random. Every
+newcomer after it takes the free slot farthest from the nearest occupied one, and
+draws at random between slots that tie, so sessions spread across the strip
+instead of clustering at one end. A session that already holds a slot never moves,
+not even when the session beside it exits. Allocator state lives only in memory —
+restart the app and everything reshuffles. Slots
 survive sleep/wake, because the app is not killed by sleep. They also survive
 every event that merely makes the app rewrite `LEDS.LED`: a battery preview on a
 power change, a brightness edit, a lid animation, a `/Volumes` signature change.

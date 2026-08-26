@@ -164,7 +164,10 @@ its current display colour was entered.
 - **Assign.** A session that becomes displayable and holds no slot takes a
   uniformly random free slot. Random rather than left-packed, per the request:
   position is arbitrary but sticky, so you learn "my sidepulse session is the
-  third one" by repetition rather than by ordering rule.
+  third one" by repetition rather than by ordering rule. **Superseded** by
+  `2026-08-25-session-exit-and-slot-spacing-design.md`: the draw now prefers the
+  free slot farthest from the nearest occupied one. The first session of a run
+  still lands anywhere.
 - **Hold.** A session keeps its slot while it stays displayable, across state
   and colour changes.
 - **Release.** A session's slot is freed when it leaves the set the allocator

@@ -222,6 +222,117 @@ class SlotAssignmentTests(unittest.TestCase):
         self.assertEqual([slot.color for slot in slots], [SLOT_EMPTY] * 8)
 
 
+class RecordingRandom(random.Random):
+    """A ``Random`` that records every candidate list and picks a fixed position.
+
+    Seeded placement pins where one session lands. It cannot show *which* slots
+    were on offer, and that is the whole content of the spacing rule -- so these
+    tests read the candidate lists instead of a drawn index.
+    """
+
+    def __init__(self, pick: int = 0) -> None:
+        super().__init__(0)
+        self.pick = pick
+        self.candidates: list[list[int]] = []
+
+    def choice(self, seq):  # type: ignore[override]
+        offered = list(seq)
+        self.candidates.append(offered)
+        return offered[self.pick]
+
+
+class SlotSpacingTests(unittest.TestCase):
+    """A newcomer takes the free slot farthest from the nearest occupied one.
+
+    Distance is the absolute difference of two indexes. The strip is a line, so it
+    does not wrap from slot 7 to slot 0.
+    """
+
+    def test_the_first_session_may_land_anywhere(self) -> None:
+        """An empty strip offers every slot, which keeps the seeded tests honest."""
+        rng = RecordingRandom()
+        allocator = SlotAllocator(slot_count=8, rng=rng)
+
+        allocator.update((status("a", AgentMode.WORKING),), BASE)
+
+        self.assertEqual(rng.candidates, [[0, 1, 2, 3, 4, 5, 6, 7]])
+
+    def test_a_newcomer_takes_the_far_end_of_the_strip(self) -> None:
+        allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
+        allocator.update((status("a", AgentMode.WORKING),), BASE)
+        self.assertEqual(allocator.slot_for_key("a"), 7)
+
+        later = BASE + timedelta(seconds=5)
+        allocator.update(
+            (
+                status("a", AgentMode.WORKING),
+                status("b", AgentMode.WORKING, updated_at=later),
+            ),
+            later,
+        )
+
+        self.assertEqual(allocator.slot_for_key("b"), 0)
+
+    def test_two_new_sessions_land_at_least_four_slots_apart(self) -> None:
+        """Slots 3 and 4 are the worst openers, and each leaves a free slot at 4."""
+        for seed in range(12):
+            with self.subTest(seed=seed):
+                allocator = SlotAllocator(slot_count=8, rng=random.Random(seed))
+                allocator.update((status("a", AgentMode.WORKING),), BASE)
+                later = BASE + timedelta(seconds=5)
+                allocator.update(
+                    (
+                        status("a", AgentMode.WORKING),
+                        status("b", AgentMode.WORKING, updated_at=later),
+                    ),
+                    later,
+                )
+
+                first = allocator.slot_for_key("a")
+                second = allocator.slot_for_key("b")
+
+                self.assertIsNotNone(first)
+                self.assertIsNotNone(second)
+                self.assertGreaterEqual(abs(first - second), 4)
+
+    def test_a_third_session_splits_the_remaining_gap(self) -> None:
+        """Slots 0 and 7 taken leaves slots 3 and 4 tied on distance 3.
+
+        Both must be on offer. A rule that returned one of them would left-pack the
+        middle of the strip.
+        """
+        for pick, expected in ((0, 3), (-1, 4)):
+            with self.subTest(pick=pick):
+                rng = RecordingRandom(pick)
+                allocator = SlotAllocator(slot_count=8, rng=rng)
+                first = status("a", AgentMode.WORKING)
+                second = status("b", AgentMode.WORKING)
+                third = status("c", AgentMode.WORKING)
+                allocator.update((first,), BASE)
+                allocator.update((first, second), BASE)
+
+                allocator.update((first, second, third), BASE)
+
+                self.assertEqual(rng.candidates[-1], [3, 4])
+                self.assertEqual(allocator.slot_for_key("c"), expected)
+
+    def test_an_occupant_keeps_its_index_when_a_newcomer_arrives(self) -> None:
+        """Spacing applies to an assignment. The strip never re-spaces itself."""
+        allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
+        allocator.update((status("a", AgentMode.WORKING),), BASE)
+
+        later = BASE + timedelta(seconds=5)
+        allocator.update(
+            (
+                status("a", AgentMode.WORKING),
+                status("b", AgentMode.WORKING, updated_at=later),
+            ),
+            later,
+        )
+
+        self.assertEqual(allocator.slot_for_key("a"), 7)
+
+
 class SlotEvictionTests(unittest.TestCase):
     def fill(self, allocator: SlotAllocator, mode: AgentMode, count: int = 8) -> None:
         allocator.update(

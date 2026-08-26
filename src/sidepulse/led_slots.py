@@ -236,12 +236,32 @@ class SlotAllocator:
         return displayable
 
     def _free_slot(self) -> int | None:
+        """The free slot farthest from the nearest occupied one, ties at random.
+
+        Spacing, not left-packing: three sessions on slots 5, 6 and 7 read as one
+        smear on a strip, and a gap is what makes a slot findable at a glance.
+        Distance is the absolute difference of two indexes, so it does not wrap
+        from slot 7 to slot 0 -- the strip is a line, and the ends look like ends.
+
+        The tie draw is what keeps a position worth learning. An empty strip offers
+        every slot, so the first session of a run lands anywhere, exactly as it did
+        before spacing. Only an assignment spaces itself. A session that already
+        holds a slot never moves, because re-spacing the strip whenever a session
+        in the middle left would move LEDs the user reads by position.
+        """
         free = [index for index, occupant in enumerate(self._slots) if occupant is None]
         if not free:
             return None
-        # Random rather than left-packed: position is arbitrary but sticky, so
-        # you learn "my sidepulse session is the third one" by repetition.
-        return self._rng.choice(free)
+        occupied = [
+            index for index, occupant in enumerate(self._slots) if occupant is not None
+        ]
+        if not occupied:
+            return self._rng.choice(free)
+        gaps = {
+            index: min(abs(index - taken) for taken in occupied) for index in free
+        }
+        widest = max(gaps.values())
+        return self._rng.choice([index for index in free if gaps[index] == widest])
 
     def _evictable_slot(self, rank: int) -> int | None:
         occupied = [
