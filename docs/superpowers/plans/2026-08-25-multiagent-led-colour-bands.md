@@ -1461,6 +1461,58 @@ Leave it running and start an agent session in another terminal. Watch for:
 - After five minutes, a red slot stops blinking and holds dim red — with no visible jump at the moment it settles.
 - Killing the process leaves the strip on the settled colours, not frozen bright.
 
+Only the third bullet is still open. The other three passed on 2026-08-25.
+
+**Check the third bullet in under a minute.** Do not wait five minutes for it. The
+five-minute window is not what you are checking. You are checking two instants:
+`repeat` expiring, and the baseline-only rewrite landing. A short `repeat`
+reproduces both. Substitute your own volume name if the device is not mounted at
+`/Volumes/SidePulse`.
+
+1. Suspend the menu-bar app, so that it does not overwrite the file on the next
+   hook event.
+
+```sh
+kill -STOP "$(pgrep -f 'sidepulse status-bar')"
+```
+
+2. Write a flashing alert slot with a window of about three seconds. Watch the
+   blink stop.
+
+```sh
+printf '0:#3D0000 1:#000000 2:#000000 3:#000000 4:#000000 5:#000000 6:#000000 7:#000000\n0:#FF0000 900ms pulse\nrepeat 3\n' > /Volumes/SidePulse/LEDS.LED
+```
+
+Expected: slot 0 blinks red about three times, then holds dim red. It must not go
+dark between blinks. It must not jump at the moment it stops.
+
+3. Write the settled program. It is the same baseline with the flash line removed,
+   which is exactly what the host writes at the five-minute boundary. Watch the
+   moment it lands.
+
+```sh
+printf '0:#3D0000 1:#000000 2:#000000 3:#000000 4:#000000 5:#000000 6:#000000 7:#000000\n' > /Volumes/SidePulse/LEDS.LED
+```
+
+Expected: slot 0 does not change at all. The device already holds this baseline,
+because `repeat` expired onto it in step 2.
+
+4. Resume the app.
+
+```sh
+kill -CONT "$(pgrep -f 'sidepulse status-bar')"
+```
+
+Do **not** suspend the app with `sidepulse status-bar stop`. That sets
+`uninstall = True` and removes the LaunchAgent plist.
+
+This checks the appearance alone, which is the correct division of work. The
+host's five-minute boundary stays covered by
+`test_multiagent_controller_writes_once_when_a_slot_settles`, and the pulse shape
+stays covered against `sdled.wasm` by
+`test_multiagent_flash_pulses_up_from_the_settled_colour`. Your eyes are the only
+thing those two tests cannot supply.
+
 - [x] **Step 3: Confirm the slider moves the strip**
 
 Restart the menu-bar app so it picks up the new code, then drag the brightness slider in the device submenu:
