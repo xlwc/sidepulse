@@ -6837,6 +6837,59 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(snapshot.aggregate.mode, AgentMode.WORKING)
             self.assertEqual(snapshot.statuses[0].event_name, "PostToolUse")
 
+    def test_session_end_is_not_swallowed_by_a_pending_permission_prompt(self) -> None:
+        """Exiting while a prompt is unanswered must still register as the last word.
+
+        ``should_ignore_status_transition`` drops a status when the previous one was
+        ``WAITING_FOR_INPUT`` from a ``PermissionRequest`` and permissions are still
+        pending -- which a ``SessionEnd`` otherwise matches exactly. It survives only
+        because ``track_pending_permissions`` empties that set on ``SessionEnd`` and
+        both call sites (``collector.py:212`` and ``:417``) call it *before* the
+        ignore check. Swap those two lines and a session you abandoned at a
+        permission prompt keeps reporting ``WAITING_FOR_INPUT`` forever.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "claude.jsonl"
+            now = datetime.now(timezone.utc)
+            session_id = "claude-abandoned-at-prompt"
+            command = "rm -rf /tmp/scratch"
+            events = [
+                {
+                    "logged_at": now.isoformat(),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "cwd": "/tmp/project",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                {
+                    "logged_at": (now + timedelta(seconds=1)).isoformat(),
+                    "hook_event_name": "PermissionRequest",
+                    "session_id": session_id,
+                    "cwd": "/tmp/project",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                {
+                    "logged_at": (now + timedelta(seconds=2)).isoformat(),
+                    "hook_event_name": "SessionEnd",
+                    "session_id": session_id,
+                    "cwd": "/tmp/project",
+                    "reason": "prompt_input_exit",
+                },
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("claude", log),),
+                stale_after_seconds=3600,
+            )
+            snapshot = monitor.snapshot()
+
+            self.assertEqual(len(snapshot.statuses), 1)
+            self.assertEqual(snapshot.statuses[0].event_name, "SessionEnd")
+            self.assertEqual(snapshot.statuses[0].mode, AgentMode.COMPLETED)
+
     def test_post_tool_use_does_not_stay_working_indefinitely(self) -> None:
         now = datetime.now(timezone.utc)
         status = AgentStatus(
