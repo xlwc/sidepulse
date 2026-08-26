@@ -1,7 +1,26 @@
 # Session exit clears its slot, and new slots spread out
 
 Date: 2026-08-25
-Status: accepted, implementing
+Status: implemented
+
+## Status
+
+Both commits landed on `my-customizations`. The exit filter is `8436a02`, and the
+spacing rule is `8494550`. Each carries its own tests and the doc changes its code
+invalidated.
+
+The suite passes at 387 tests. One failure is environmental:
+`test_hook_event_server_receives_socket_message` cannot `bind` a Unix socket in
+the sandbox, and it fails on a clean tree the same way.
+
+The spacing rule is checked on hardware. A restarted app put two live sessions on
+slots 0 and 7 of a mounted SidePulse Pro, where the uniform draw had put three
+sessions on 5, 6 and 7.
+
+**Known gaps:** the exit path is unchecked on hardware. Nobody has watched a slot
+go dark on the strip within a second of leaving a session. The feed tests cover the
+filter, and `sidepulse agent-monitor leds --once --dry-run --display multiagent`
+prints what the strip would hold.
 
 ## Summary
 
