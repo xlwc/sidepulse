@@ -75,6 +75,7 @@ from sidepulse.led_slots import (
     SLOT_EMPTY,
     Slot,
     SlotAllocator,
+    slot_band,
 )
 from sidepulse.led_status import (
     AgentLedController,
@@ -6941,6 +6942,147 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(snapshot.statuses[0].event_name, "SessionEnd")
         self.assertEqual(snapshot.statuses[0].mode, AgentMode.COMPLETED)
         self.assertEqual(collector_module.multiagent_statuses(snapshot), ())
+
+    @staticmethod
+    def _subagent_permission_prompt_events(
+        now: datetime, session_id: str, *, agent_id: str | None
+    ) -> list[dict]:
+        """The hook sequence a permission prompt raised inside a Task produces.
+
+        ``agent_id`` is who raised it: the sub-agent's id, or None for the parent.
+        Claude Code's ``Notification`` payload never carries one either way -- it
+        has only ``session_id``, ``prompt_id``, ``message`` and
+        ``notification_type`` -- so the mirror it fires a few seconds after the
+        ``PermissionRequest`` always lands on the parent's key.
+        """
+        command = "pytest -q"
+        child: dict = {"agent_id": agent_id} if agent_id else {}
+        return [
+            {
+                "logged_at": now.isoformat(),
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Task",
+                "tool_input": {"subagent_type": "general-purpose"},
+            },
+            {
+                "logged_at": (now + timedelta(seconds=1)).isoformat(),
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                **child,
+            },
+            {
+                "logged_at": (now + timedelta(seconds=2)).isoformat(),
+                "hook_event_name": "PermissionRequest",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                **child,
+            },
+            {
+                "logged_at": (now + timedelta(seconds=8)).isoformat(),
+                "hook_event_name": "Notification",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "message": "Claude needs your permission",
+                "notification_type": "permission_prompt",
+            },
+            {
+                "logged_at": (now + timedelta(seconds=45)).isoformat(),
+                "hook_event_name": "PostToolUse",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "tool_response": "{}",
+                **child,
+            },
+        ]
+
+    def test_answering_a_subagents_prompt_stops_pinning_the_session_on_ask(self) -> None:
+        """The permission mirror has to expire with the prompt it mirrors.
+
+        A ``Notification`` carries no ``agent_id``, so a prompt raised inside a
+        Task lands on the parent's key while the ``PermissionRequest`` that caused
+        it lands on the child's. Answering it clears the child's key, and the
+        parent emits nothing more until the Task returns -- so the mirror is the
+        parent's newest status for as long as the sub-agent runs. It is
+        ``WAITING_FOR_INPUT``, which outranks the child's ``WORKING`` on the
+        priority-first sort in ``status_coalesce_sort_key``, so the session reads
+        Ask for minutes after the prompt was answered. Observed on the strip as a
+        steady red LED over six minutes of sub-agent work.
+        """
+        now = datetime.now(timezone.utc)
+        session_id = "claude-subagent-permission-mirror"
+        monitor = LiveAgentMonitor(stale_after_seconds=3600)
+
+        for event in self._subagent_permission_prompt_events(
+            now, session_id, agent_id="a94aab97f06a0367c"
+        ):
+            record = parse_log_line("claude", json.dumps(event))
+            self.assertIsNotNone(record)
+            monitor.ingest_record(record)
+
+        statuses = collector_module.multiagent_statuses(monitor.snapshot())
+
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(slot_band(statuses[0].mode), BAND_WORKING)
+
+    def test_the_parents_own_permission_prompt_still_reads_as_ask(self) -> None:
+        """The guard against over-expiring the mirror.
+
+        When the parent raises the prompt, the ``PermissionRequest`` and the
+        ``Notification`` land on the same key, and nothing has been answered: the
+        ``PostToolUse`` that ends this sequence is a *different* agent's. The
+        session still needs a human, so it has to keep reading Ask.
+        """
+        now = datetime.now(timezone.utc)
+        session_id = "claude-parent-permission-prompt"
+        monitor = LiveAgentMonitor(stale_after_seconds=3600)
+
+        events = self._subagent_permission_prompt_events(now, session_id, agent_id=None)
+        events[-1]["agent_id"] = "a94aab97f06a0367c"
+        events[-1]["tool_input"] = {"command": "git status"}
+        for event in events:
+            record = parse_log_line("claude", json.dumps(event))
+            self.assertIsNotNone(record)
+            monitor.ingest_record(record)
+
+        statuses = collector_module.multiagent_statuses(monitor.snapshot())
+
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(slot_band(statuses[0].mode), BAND_ALERT)
+
+    def test_the_scan_path_also_expires_a_subagent_permission_mirror(self) -> None:
+        """``AgentMonitor`` is the CLI's monitor and rebuilds from the logs.
+
+        It reaches the same ignore check by a different route, so a fix landed only
+        in ``LiveAgentMonitor.ingest_record`` leaves ``sidepulse leds`` and
+        ``sidepulse status`` reporting Ask while the sub-agent works.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "claude.jsonl"
+            now = datetime.now(timezone.utc)
+            session_id = "claude-scan-permission-mirror"
+            events = self._subagent_permission_prompt_events(
+                now, session_id, agent_id="a94aab97f06a0367c"
+            )
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("claude", log),),
+                stale_after_seconds=3600,
+            )
+
+            statuses = collector_module.multiagent_statuses(monitor.snapshot())
+
+            self.assertEqual(len(statuses), 1)
+            self.assertEqual(slot_band(statuses[0].mode), BAND_WORKING)
 
     def test_an_ended_session_reaches_the_aggregate_but_not_the_strip(self) -> None:
         """One exit, two answers, on purpose.

@@ -212,6 +212,21 @@ winning child's. That is what keeps the slot still: the allocator keys its map o
 otherwise read as one session leaving and another arriving, and the LED would move
 twice per sub-agent.
 
+A permission prompt raised inside a child is the one case where the fold is not
+enough on its own. Claude Code reports such a prompt twice: as a
+`PermissionRequest` carrying the child's `agent_id`, and a few seconds later as a
+`Notification` carrying no `agent_id` at all, which therefore lands on the parent's
+key. Answering the prompt clears the child's copy and nothing clears the parent's,
+because a parent blocked inside the Task tool emits no hook of its own until the
+Task returns — so the parent's newest status stays `WAITING_FOR_INPUT`, outranks
+every child's `WORKING` on the priority-first sort, and holds the slot red for the
+rest of the sub-agent's run. `collector.notification_mirrors_another_agents_permission`
+drops that duplicate. It costs nothing, because the child's own request already
+raises the alert and expires it on the right event, and it fires only for a
+duplicate whose request was seen recently under a different key — so a parent's own
+prompt, or a prompt whose `PermissionRequest` hook never arrived, still turns the
+slot red.
+
 ### The Screen Bar can disagree with the physical strip
 
 `sync_virtual_status_device` renders from the mode rather than reusing the
