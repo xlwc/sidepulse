@@ -10,6 +10,30 @@
 
 **Spec:** [`docs/superpowers/specs/2026-08-25-multiagent-led-colour-bands-design.md`](../specs/2026-08-25-multiagent-led-colour-bands-design.md)
 
+## Status
+
+Tasks 1 to 4 are complete and committed. Task 5 is the only live task, and it
+holds one open check.
+
+The step boxes inside Tasks 1 to 4 stay unticked on purpose. Several of those
+steps are transient. Nobody can confirm "run the tests and check that they fail"
+after the fact, so a tick there would assert something unchecked. This table
+records the end state instead, which anybody can check today.
+
+| Task | State | What proves it |
+|---|---|---|
+| 1. Pulse-up shape | complete | `test_multiagent_flash_pulses_up_from_the_settled_colour` and `test_multiagent_programs_parse_in_the_firmware_engine` both pass |
+| 2. Colour bands | complete | `BAND_ALERT`, `BAND_WORKING` and `BAND_DONE` live in `led_slots.py`, and `SLOT_BRIGHTNESS` is 255 |
+| 3. Brightness slider | complete | `multiagent_controller_for_device` assigns `controller.brightness`, and the Screen Bar branch of `sync_virtual_status_device` passes it as well |
+| 4. Documentation | complete | `test_usage_doc_hexes_match_led_slots` passes, and `docs/usage.md` holds only the six band hexes |
+| 5. Device check | one check open | see the results table in Task 5 |
+
+`FLASHING_RANKS` survives in exactly one place, the `SlotBand` docstring, which
+says what it replaced. Task 2 asked for that sentence. It is not a leftover.
+
+`2026-08-25-session-exit-and-slot-spacing-design.md` builds on this work. It
+changes when a slot goes dark and where a new slot lands. It changes no colour.
+
 ---
 
 ## Before you start
