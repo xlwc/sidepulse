@@ -1258,11 +1258,17 @@ def multiagent_statuses(snapshot) -> tuple[AgentStatus, ...]:
     where one LED has to answer one question, so as soon as anything is active
     every finished session is demoted into ``stale_statuses`` (see the
     ``status_counts_active`` filter in ``snapshot_from_statuses``). A strip has
-    room for both, and green -- "finished, output unread" -- is most useful
-    precisely while other sessions are still running. So the sessions that were
-    demoted rather than aged out come back here, on the same
+    room for both, and the done band -- "finished, output unread" -- is most
+    useful precisely while other sessions are still running. So the sessions that
+    were demoted rather than aged out come back here, on the same
     ``COMPLETED_VISIBLE_SECONDS`` window the aggregate path would have given
     them had nothing else been active.
+
+    A session that reported ``SessionEnd`` then goes, with its sub-agents. You
+    closed that window, so the output behind its slot is unreachable rather than
+    unread, and holding the slot for the rest of the completed window reports a
+    session that no longer exists. The aggregate path keeps the ``COMPLETED``
+    mapping either way; only this feed drops the session.
 
     Sub-agents are then folded into their parent session, because a slot is a
     top-level session. ``HookEvent.status_key`` prefers ``agent_id`` over
@@ -1270,7 +1276,7 @@ def multiagent_statuses(snapshot) -> tuple[AgentStatus, ...]:
     would otherwise take a second LED -- three parallel sub-agents lighting four
     slots, and crowding genuinely separate sessions off the strip. The parent's
     slot takes the most important mode among the group, so a child stuck on a
-    permission prompt still shows amber.
+    permission prompt still shows the alert band.
     """
     statuses = [*snapshot.statuses]
     now = snapshot.collected_at
@@ -1280,7 +1286,43 @@ def multiagent_statuses(snapshot) -> tuple[AgentStatus, ...]:
         if status.mode == AgentMode.COMPLETED
         and status.age_seconds(now) <= COMPLETED_VISIBLE_SECONDS
     )
-    return tuple(coalesce_statuses_by_key(statuses, session_coalesce_key))
+    ended = ended_session_keys(snapshot)
+    live = [
+        status
+        for status in statuses
+        if status.event_name != "SessionEnd"
+        and session_coalesce_key(status) not in ended
+    ]
+    return tuple(coalesce_statuses_by_key(live, session_coalesce_key))
+
+
+def ended_session_keys(snapshot) -> set[tuple[str, ...]]:
+    """Session keys of the sessions that reported ``SessionEnd``.
+
+    Collected from every status the snapshot holds, fresh and stale alike, rather
+    than from the display list ``multiagent_statuses`` builds. A ``SessionEnd``
+    status is itself ``COMPLETED``, so it reaches that list only inside
+    ``COMPLETED_VISIBLE_SECONDS``, while a sub-agent status keyed to the same
+    session stays displayable for the whole ``stale_after_seconds`` hour. Key off
+    the display list and the filter stops firing 20 minutes after the exit: the
+    slot goes dark, then relights on the child's band, at a fresh index, for a
+    session that is gone. Nothing ages the ``SessionEnd`` status out of
+    ``stale_statuses`` inside a process lifetime, because ``LiveAgentMonitor``
+    never prunes ``statuses_by_key``.
+
+    A status with no ``session_id`` has no key, and ``None`` never enters the set.
+    Otherwise one exit with no session id would darken every session-id-less slot
+    on the strip. Such a status still gives up its own slot, on the
+    ``event_name`` test in ``multiagent_statuses``.
+    """
+    keys: set[tuple[str, ...]] = set()
+    for status in (*snapshot.statuses, *getattr(snapshot, "stale_statuses", ())):
+        if status.event_name != "SessionEnd":
+            continue
+        key = session_coalesce_key(status)
+        if key is not None:
+            keys.add(key)
+    return keys
 
 
 def coalesce_statuses_by_key(statuses, key_fn) -> list[AgentStatus]:

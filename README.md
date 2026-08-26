@@ -326,6 +326,12 @@ an active session for the full stale window, and the LEDs return to the very
 dim Idle pattern. Idle/session-start records also do not count as active
 sessions.
 
+Exiting the session ends that window early on the one-LED-per-agent strip. A
+`SessionEnd` event gives the slot up within a second, because the output behind a
+Done LED is unreachable once you close the window rather than merely unread. The
+20 minutes are what a session gets when it stops without a `SessionEnd` event, and
+the status bar and the aggregate LED keep the full window either way.
+
 Status detection is strongest when the agent tells the monitor its intended
 handoff state explicitly. A final assistant message can include a hidden marker
 line:

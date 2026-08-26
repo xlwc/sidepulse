@@ -6890,6 +6890,131 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(snapshot.statuses[0].event_name, "SessionEnd")
             self.assertEqual(snapshot.statuses[0].mode, AgentMode.COMPLETED)
 
+    def test_the_push_path_keeps_a_session_end_after_a_permission_prompt(self) -> None:
+        """The same call order, on the socket-fed monitor the LED strip runs on.
+
+        ``test_session_end_is_not_swallowed_by_a_pending_permission_prompt`` pins
+        ``AgentMonitor``, which is the CLI's monitor. Move
+        ``track_pending_permissions`` after the ignore check inside
+        ``LiveAgentMonitor.ingest_record`` and that test still passes, while a
+        session abandoned at a permission prompt keeps its slot on the strip for
+        ever.
+        """
+        now = datetime.now(timezone.utc)
+        session_id = "claude-push-abandoned-at-prompt"
+        command = "rm -rf /tmp/scratch"
+        events = [
+            {
+                "logged_at": now.isoformat(),
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            },
+            {
+                "logged_at": (now + timedelta(seconds=1)).isoformat(),
+                "hook_event_name": "PermissionRequest",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            },
+            {
+                "logged_at": (now + timedelta(seconds=2)).isoformat(),
+                "hook_event_name": "SessionEnd",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "reason": "prompt_input_exit",
+            },
+        ]
+        monitor = LiveAgentMonitor(stale_after_seconds=3600)
+
+        for event in events:
+            record = parse_log_line("claude", json.dumps(event))
+            self.assertIsNotNone(record)
+            monitor.ingest_record(record)
+
+        snapshot = monitor.snapshot()
+
+        self.assertEqual(len(snapshot.statuses), 1)
+        self.assertEqual(snapshot.statuses[0].event_name, "SessionEnd")
+        self.assertEqual(snapshot.statuses[0].mode, AgentMode.COMPLETED)
+
+    def test_an_ended_session_reaches_the_aggregate_but_not_the_strip(self) -> None:
+        """One exit, two answers, on purpose.
+
+        The aggregate indicator has one LED for the whole machine, so an exit that
+        followed finished work still reads as Done there. The strip has one LED per
+        session, and that session is gone, so it gives the slot up.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "claude.jsonl"
+            now = datetime.now(timezone.utc)
+            session_id = "claude-exited"
+            events = [
+                {
+                    "logged_at": now.isoformat(),
+                    "hook_event_name": "Stop",
+                    "session_id": session_id,
+                    "cwd": "/tmp/project",
+                },
+                {
+                    "logged_at": (now + timedelta(seconds=1)).isoformat(),
+                    "hook_event_name": "SessionEnd",
+                    "session_id": session_id,
+                    "cwd": "/tmp/project",
+                    "reason": "prompt_input_exit",
+                },
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("claude", log),),
+                stale_after_seconds=3600,
+            )
+            snapshot = monitor.snapshot()
+
+            self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
+            self.assertEqual(collector_module.multiagent_statuses(snapshot), ())
+
+    def test_a_cleared_session_gives_up_its_slot(self) -> None:
+        """``/clear`` sends ``SessionEnd`` with ``reason`` set to ``clear``.
+
+        The filter never reads ``reason``. ``/clear`` deletes the transcript, so
+        the output behind a done-band slot is gone rather than unread.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "claude.jsonl"
+            now = datetime.now(timezone.utc)
+            session_id = "claude-cleared"
+            events = [
+                {
+                    "logged_at": now.isoformat(),
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": session_id,
+                    "cwd": "/tmp/project",
+                    "prompt": "work on the thing",
+                },
+                {
+                    "logged_at": (now + timedelta(seconds=1)).isoformat(),
+                    "hook_event_name": "SessionEnd",
+                    "session_id": session_id,
+                    "cwd": "/tmp/project",
+                    "reason": "clear",
+                },
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("claude", log),),
+                stale_after_seconds=3600,
+            )
+            snapshot = monitor.snapshot()
+
+            self.assertEqual(snapshot.statuses[0].event_name, "SessionEnd")
+            self.assertEqual(collector_module.multiagent_statuses(snapshot), ())
+
     def test_post_tool_use_does_not_stay_working_indefinitely(self) -> None:
         now = datetime.now(timezone.utc)
         status = AgentStatus(

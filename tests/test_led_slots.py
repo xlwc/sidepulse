@@ -41,6 +41,7 @@ def status(
     *,
     updated_at: datetime = BASE,
     session_id: str | None = None,
+    event_name: str = "Stop",
 ) -> AgentStatus:
     return AgentStatus(
         provider="claude",
@@ -48,7 +49,7 @@ def status(
         display_name=key,
         mode=mode,
         updated_at=updated_at,
-        event_name="Stop",
+        event_name=event_name,
         session_id=session_id,
     )
 
@@ -608,6 +609,94 @@ class MultiagentStatusFeedTests(unittest.TestCase):
         statuses = multiagent_statuses(snap)
 
         self.assertEqual(len(statuses), 2)
+
+
+class EndedSessionFeedTests(unittest.TestCase):
+    """A session that reported ``SessionEnd`` holds no slot.
+
+    Exiting a window is the one signal that says the LED behind it is finished
+    being useful, so the strip gives that slot up at once rather than holding it
+    for ``COMPLETED_VISIBLE_SECONDS``. The filter is session-keyed rather than
+    status-keyed, because a sub-agent status outranks its parent's ``SessionEnd``
+    on both sides of the coalesce step.
+    """
+
+    def test_an_ended_session_gives_up_its_slot(self) -> None:
+        snap = snapshot(
+            status(
+                "claude:session:gone",
+                AgentMode.COMPLETED,
+                session_id="gone",
+                event_name="SessionEnd",
+            ),
+            status("claude:session:busy", AgentMode.WORKING, session_id="busy"),
+        )
+
+        keys = {item.agent_id for item in multiagent_statuses(snap)}
+
+        self.assertEqual(keys, {"claude:session:busy"})
+
+    def test_an_ended_session_takes_its_waiting_subagent_off_the_strip(self) -> None:
+        """The sub-agent outlives the exit by 40 minutes, and must not relight the slot.
+
+        A parent's ``SessionEnd`` status reaches the display list only inside
+        ``COMPLETED_VISIBLE_SECONDS``, while its child stays displayable for
+        ``stale_after_seconds`` -- an hour in this snapshot. Collect the ended keys
+        from the display list rather than from every status the snapshot holds, and
+        the filter stops firing at the 20 minute mark: the slot goes dark, then
+        comes back on the alert band, at a different index, for a session that no
+        longer exists. The 60 second offset alone passes with that bug present.
+        """
+        parent = status(
+            "claude:session:gone",
+            AgentMode.COMPLETED,
+            session_id="gone",
+            event_name="SessionEnd",
+        )
+        child = status(
+            "claude:agent:ac7f1721ec697b403",
+            AgentMode.WAITING_FOR_INPUT,
+            session_id="gone",
+            updated_at=BASE - timedelta(seconds=60),
+        )
+
+        for offset in (60.0, COMPLETED_VISIBLE_SECONDS + 60.0, 45 * 60.0):
+            with self.subTest(seconds_after_exit=offset):
+                snap = snapshot(
+                    parent, child, collected_at=BASE + timedelta(seconds=offset)
+                )
+
+                self.assertEqual(multiagent_statuses(snap), ())
+
+    def test_a_session_end_with_no_session_id_leaves_other_slots_alone(self) -> None:
+        """``session_coalesce_key`` is None here, and None must not match anything.
+
+        A None key inside the ended set removes every session-id-less status on the
+        strip, so one exit would darken an unrelated working session.
+        """
+        snap = snapshot(
+            status(
+                "grok:unknown",
+                AgentMode.COMPLETED,
+                event_name="SessionEnd",
+            ),
+            status("codex:unknown", AgentMode.WORKING),
+        )
+
+        keys = {item.agent_id for item in multiagent_statuses(snap)}
+
+        self.assertEqual(keys, {"codex:unknown"})
+
+    def test_a_completed_session_that_never_ended_keeps_its_window(self) -> None:
+        """The backstop for a crash and a killed terminal, which send no ``SessionEnd``."""
+        snap = snapshot(
+            status("claude:session:done", AgentMode.COMPLETED, session_id="done"),
+            collected_at=BASE + timedelta(seconds=COMPLETED_VISIBLE_SECONDS - 60),
+        )
+
+        keys = {item.agent_id for item in multiagent_statuses(snap)}
+
+        self.assertEqual(keys, {"claude:session:done"})
 
 
 if __name__ == "__main__":

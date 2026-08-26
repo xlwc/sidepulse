@@ -249,8 +249,8 @@ indicator's set: there, one LED has to answer one question, so a single active
 session demotes every finished one out of sight. On a strip both fit, and the
 finished band —
 "finished, output unread" — is most useful exactly while other sessions are still
-running. So finished sessions stay on the strip for their full window whatever
-else is happening:
+running. So a finished session stays on the strip for its full window however
+busy the rest of the machine is, and only its own exit cuts that short:
 
 | Mode | Visible for | Constant |
 |---|---|---|
@@ -261,6 +261,25 @@ else is happening:
 `IDLE_READY` is in the state table for completeness and to keep the eviction
 ordering total, but with `IDLE_VISIBLE_SECONDS = 0.0` an idle status is stale by
 the next collection. In practice the strip shows three bands, not four.
+
+### Exiting the session beats every row of that table
+
+A session that reports `SessionEnd` gives its slot up within a second, along with
+every sub-agent it was running. The write follows the socket event, so it does not
+wait for the 15 s refresh. The windows above are what a session gets when it stops
+*without* saying so — a crash, a killed terminal, a `kill -9`.
+
+`/clear` counts as an exit. It also starts a new session id, so the cleared window
+takes a fresh slot at your next prompt rather than reclaiming the old one, and the
+strip shows nothing for it in between.
+
+Only this feed drops an ended session. The menu-bar icon and the aggregate LED
+still read an exit as Done for the full 20 minutes.
+
+The cost is a real one: exit a window the moment an agent finishes and you lose
+the chartreuse LED that says its output is unread. `collector.multiagent_statuses`
+takes that trade because you closed the window, so there is nothing left to go
+back and read.
 
 ## When there are more sessions than LEDs
 
