@@ -64,16 +64,24 @@ class SlotBand:
 # which is program-global and so cannot vary per slot. The directive carries the
 # user's brightness slider instead, as a master gain over these.
 #
-# Provisional. Numeric intensity is not perceived intensity -- one tier fraction
-# does not read as one tier across red, blue and green -- so expect to retune all
-# five against real hardware. No code outside this table needs to change when you
-# do, but the three exact-program-text tests in tests/test_sidepulse.py and the
-# colour table, worked example and two effective-intensity figures in
-# docs/usage.md all restate these values. The tests fail loudly; the doc is
-# guarded by the hex-parity test in tests/test_packaging.py.
-BAND_ALERT = SlotBand(steady="#3D0000", flash_peak="#FF0000")  # low 24% / high 100%
-BAND_WORKING = SlotBand(steady="#002A80", flash_peak=None)  # medium 50%
-BAND_DONE = SlotBand(steady="#003D18", flash_peak="#008033")  # low 24% / medium 50%
+# Chosen by eye on a mounted SidePulse Pro on 2026-08-25, one band at a time,
+# against hue ramps written to the strip. Numeric intensity is not perceived
+# intensity -- one tier fraction does not read as one tier across red, blue and
+# green -- which is why the tiers below are uneven and why blue sits above the
+# nominal medium. No code outside this table needs to change when you retune, but
+# the three exact-program-text tests in tests/test_sidepulse.py and the colour
+# table, worked example and two effective-intensity figures in docs/usage.md all
+# restate these values. The tests fail loudly; the doc is guarded by the
+# hex-parity test in tests/test_packaging.py.
+#
+# Hue notes, since the secondary channels look like typos and are not. Alert peaks
+# one step warm of pure red, chosen over pure red on the strip. Working is pure
+# blue with no green at all, so it cannot be confused with either other band, and
+# is turned up to compensate for blue contributing least to perceived brightness.
+# Done is chartreuse rather than green, and carries red deliberately.
+BAND_ALERT = SlotBand(steady="#3D0000", flash_peak="#FF1000")  # low 24% / high 100%
+BAND_WORKING = SlotBand(steady="#0000A0", flash_peak=None)  # 63%
+BAND_DONE = SlotBand(steady="#1E3D00", flash_peak="#408000")  # low 24% / medium 50%
 
 
 # Rank 1 is most important. Eviction runs off this: a newcomer takes the slot of

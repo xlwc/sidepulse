@@ -15,12 +15,12 @@ This file is the operational half: how to turn it on, and what will surprise you
 
 | Band | Settled | Flashes up to | Means | Modes |
 |---|---|---|---|---|
-| Red | `#3D0000` | `#FF0000` | that session wants something from you | `BLOCKED_ERROR`, `WAITING_FOR_INPUT` |
-| Blue | `#002A80` | — never flashes | working | `TOOL_RUNNING`, `WORKING`, `LONG_TASK_PROGRESS` |
-| Green | `#003D18` | `#008033` | finished, output unread | `COMPLETED`, `IDLE_READY` |
+| Red | `#3D0000` | `#FF1000` | that session wants something from you | `BLOCKED_ERROR`, `WAITING_FOR_INPUT` |
+| Blue | `#0000A0` | — never flashes | working | `TOOL_RUNNING`, `WORKING`, `LONG_TASK_PROGRESS` |
+| Chartreuse | `#1E3D00` | `#408000` | finished, output unread | `COMPLETED`, `IDLE_READY` |
 | Off | `#000000` | — | empty slot | — |
 
-Red and green **blink for the first five minutes** after a session enters the
+Red and chartreuse **blink for the first five minutes** after a session enters the
 band, pulsing up from the settled colour and back, then hold settled. Settled is
 not "stale" — it is "this has been true for a while".
 
@@ -36,17 +36,19 @@ cache-warmth story: it is running, and it will still be running in six minutes.
 The cost is that a session working for an hour looks identical to one that started
 two seconds ago. Working is the boring state.
 
-The urgency axis is intensity: red peaks at full and green at half, and after
-five minutes both settle *below* a working slot's steady mid-intensity — so once
+The urgency axis is intensity: red peaks at full and chartreuse at half, and
+after five minutes both settle *below* a working slot's steady 63% — so once
 things are quiet, hue is what tells them apart, not brightness.
 
 Intensity lives in those hex values, not in the `brightness` directive, which is
 program-global and so cannot vary per slot. The directive carries your brightness
 slider on top, as a master gain over all three bands.
 
-The hex values are provisional. Numeric intensity is not perceived intensity, and
-one tier fraction does not read as one tier across red, blue and green — expect
-them to be retuned against hardware. The code has them in one place, the
+The hex values were chosen by eye on a mounted device, one band at a time, which
+is why the tiers are uneven and the secondary channels look arbitrary. Numeric
+intensity is not perceived intensity: blue carries no green at all and is turned
+up to 63% to hold its own beside red, and the finished band is chartreuse rather
+than green. The code has them in one place, the
 `BAND_ALERT` / `BAND_WORKING` / `BAND_DONE` table in `led_slots.py`; this file
 restates them in the table above, in the worked example further down and in two
 effective-intensity figures, so a retune moves those too.
@@ -161,8 +163,8 @@ your `PATH`.
 ### Turning the slider down can hide the settled colours
 
 Per-device brightness works in this mode: the slider emits `brightness N`, which
-scales all three bands together. Red and green settle at the dim end of their
-band and blue holds mid-intensity, so at a low slider setting the settled colours
+scales all three bands together. Red and chartreuse settle at the dim end of
+their band and blue holds 63%, so at a low slider setting the settled colours
 can quantize to nearly nothing — at 25%, `#3D0000` is an effective red of about
 15/255.
 
@@ -244,7 +246,8 @@ it really has been waiting a long time, and its cache is cold.
 A slot is held while its status is in the set `collector.multiagent_statuses`
 builds. That is deliberately *not* `snapshot.statuses`, which is the aggregate
 indicator's set: there, one LED has to answer one question, so a single active
-session demotes every finished one out of sight. On a strip both fit, and green —
+session demotes every finished one out of sight. On a strip both fit, and the
+finished band —
 "finished, output unread" — is most useful exactly while other sessions are still
 running. So finished sessions stay on the strip for their full window whatever
 else is happening:
@@ -294,8 +297,8 @@ changed within the last five minutes. At default brightness there is no
 `brightness` directive at all; the intensity you see is the bands':
 
 ```text
-0:#3D0000 1:#000000 2:#000000 3:#002A80 4:#3D0000 5:#000000 6:#000000 7:#3D0000
-0:#FF0000 900ms pulse; 4:#FF0000 900ms pulse; 7:#FF0000 900ms pulse
+0:#3D0000 1:#000000 2:#000000 3:#0000A0 4:#3D0000 5:#000000 6:#000000 7:#3D0000
+0:#FF1000 900ms pulse; 4:#FF1000 900ms pulse; 7:#FF1000 900ms pulse
 repeat 328
 ```
 

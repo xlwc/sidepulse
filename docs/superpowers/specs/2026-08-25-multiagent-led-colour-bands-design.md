@@ -51,17 +51,24 @@ class SlotBand:
     flash_peak: str | None  # pulse target; None means this band never flashes
 
 
-BAND_ALERT = SlotBand(steady="#3D0000", flash_peak="#FF0000")   # low 24% / high 100%
-BAND_WORKING = SlotBand(steady="#002A80", flash_peak=None)      # medium 50%
-BAND_DONE = SlotBand(steady="#003D18", flash_peak="#008033")    # low 24% / medium 50%
+BAND_ALERT = SlotBand(steady="#3D0000", flash_peak="#FF1000")   # low 24% / high 100%
+BAND_WORKING = SlotBand(steady="#0000A0", flash_peak=None)      # 63%
+BAND_DONE = SlotBand(steady="#1E3D00", flash_peak="#408000")    # low 24% / medium 50%
 ```
+
+Those are the values chosen on hardware on 2026-08-25, replacing the ones this
+document proposed. Hue moved as well as intensity, and only the settled red
+survived unchanged: the alert peak went one step warm of pure red, working went
+to pure blue with no green in it and up to 63% to hold its own beside red, and
+the finished band went from green to chartreuse. Grep `led_slots.py` rather than
+trusting this block, which is a record of the design and not the live table.
 
 | Rank | `AgentMode` | Band | First 5 minutes | After 5 minutes |
 |---|---|---|---|---|
 | 1 | `BLOCKED_ERROR`, `WAITING_FOR_INPUT` | alert | red, low↔high blink | red, low steady |
 | 2 | `TOOL_RUNNING`, `WORKING`, `LONG_TASK_PROGRESS` | working | blue, medium steady | unchanged |
-| 3 | `COMPLETED` | done | green, low↔medium blink | green, low steady |
-| 4 | `IDLE_READY` | done | green, low↔medium blink | green, low steady |
+| 3 | `COMPLETED` | done | chartreuse, low↔medium blink | chartreuse, low steady |
+| 4 | `IDLE_READY` | done | chartreuse, low↔medium blink | chartreuse, low steady |
 | — | `UNKNOWN` | — | holds no slot | holds no slot |
 
 Blocked and waiting-for-input share rank 1, because the source request listed
@@ -111,8 +118,8 @@ The flash inverts. Today line 1 holds each slot's colour and line 2 pulses it
 settled colour and line 2 pulses *up to the peak*.
 
 ```text
-0:#3D0000 1:#3D0000 2:#002A80 3:#003D18 4:#003D18 5:#000000 6:#000000 7:#000000
-0:#FF0000 900ms pulse; 3:#008033 900ms pulse
+0:#3D0000 1:#3D0000 2:#0000A0 3:#1E3D00 4:#1E3D00 5:#000000 6:#000000 7:#000000
+0:#FF1000 900ms pulse; 3:#408000 900ms pulse
 repeat 328
 ```
 

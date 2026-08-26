@@ -1424,8 +1424,28 @@ at both instants.
 | The settle shows no visible jump at the moment it happens | pass |
 | Killing the process leaves the strip on the settled colours | for about three minutes, then dark — see the keepalive note |
 | The slider shows in multiagent mode, and dragging it dims the strip | pass |
-| The bands need a retune | no |
+| The bands need a retune | yes — done 2026-08-25, see below |
 | The 917 ms blink cycle holds on hardware | pass — `repeat 100` in 103 s by eye, against 91.7 s predicted |
+
+**Retuned on hardware, same session.** The values the plan shipped read well
+enough to pass every check above, and were then tuned anyway by looking at hue
+ramps on the strip, one band at a time. Four of the five moved:
+
+| Band | Was | Now |
+|---|---|---|
+| alert peak | `#FF0000` | `#FF1000` — one step warm of pure red |
+| alert settled | `#3D0000` | unchanged, which is why the two effective-intensity figures in `docs/usage.md` still read 61 and 15 |
+| working | `#002A80` | `#0000A0` — pure blue, no green at all, and up from 50% to 63% |
+| done peak | `#008033` | `#408000` — chartreuse, carrying red on purpose |
+| done settled | `#003D18` | `#1E3D00` — the new peak's hue at the same dim tier |
+
+Step 4 predicted three exact-program-text tests would fail. Two did.
+`test_multiagent_program_omits_the_flash_line_when_nothing_is_recent` asserts only
+the settled red and black, and the settled red did not move.
+
+The settled chartreuse is the one value nobody chose off a ramp; it was derived to
+match the new peak's hue at the old dim tier, then reviewed in place on a mixed
+strip. It is the first thing to look at if the finished band reads badly.
 
 Three results look like defects and are not. Read these before you re-check
 anything on hardware.

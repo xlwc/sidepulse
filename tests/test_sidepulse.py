@@ -4488,9 +4488,9 @@ class AgentMonitorTests(unittest.TestCase):
             program.splitlines(),
             [
                 "brightness 128",
-                "0:#3D0000 1:#3D0000 2:#002A80 3:#003D18 "
-                "4:#003D18 5:#000000 6:#000000 7:#000000",
-                "0:#FF0000 900ms pulse; 3:#008033 900ms pulse",
+                "0:#3D0000 1:#3D0000 2:#0000A0 3:#1E3D00 "
+                "4:#1E3D00 5:#000000 6:#000000 7:#000000",
+                "0:#FF1000 900ms pulse; 3:#408000 900ms pulse",
                 "repeat 328",
             ],
         )
@@ -4594,8 +4594,8 @@ class AgentMonitorTests(unittest.TestCase):
             program.splitlines(),
             [
                 "brightness 128",
-                "0:#3D0000 1:#002A80",
-                "0:#FF0000 900ms pulse",
+                "0:#3D0000 1:#0000A0",
+                "0:#FF1000 900ms pulse",
                 "repeat 328",
             ],
         )
