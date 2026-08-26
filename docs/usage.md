@@ -309,7 +309,8 @@ Turn the slider down and a `brightness N` line appears above line 1, scaling all
 three bands together.
 
 `repeat` is `ceil(longest_remaining_flash / 917ms)` — 917 ms being the measured
-blink cycle for a `900ms pulse`, not a value derived from the pulse duration. It
+blink cycle for a `900ms pulse`, not a value derived from the pulse duration, and
+confirmed against a physical strip as well as the firmware parser. It
 counts down as the flash window closes, which is why the write-dedupe key
 excludes it; keying on the program text would rewrite `LEDS.LED` every 15 s
 forever.

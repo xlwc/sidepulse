@@ -12,9 +12,8 @@
 
 ## Status
 
-All five tasks are complete and committed. Task 5's hardware checks all passed;
-what it left open is one measurement it could not take, named at the end of that
-task.
+All five tasks are complete and committed. Every check in Task 5 passed on
+hardware, including the `917 ms` blink cycle that only the device could confirm.
 
 The step boxes inside Tasks 1 to 4 stay unticked on purpose. Several of those
 steps are transient. Nobody can confirm "run the tests and check that they fail"
@@ -1426,6 +1425,7 @@ at both instants.
 | Killing the process leaves the strip on the settled colours | for about three minutes, then dark — see the keepalive note |
 | The slider shows in multiagent mode, and dragging it dims the strip | pass |
 | The bands need a retune | no |
+| The 917 ms blink cycle holds on hardware | pass — `repeat 100` in 103 s by eye, against 91.7 s predicted |
 
 Three results look like defects and are not. Read these before you re-check
 anything on hardware.
@@ -1457,13 +1457,16 @@ anything on hardware.
   is 20 minutes. Three lit LEDs for two live sessions is correct.
   `2026-08-25-session-exit-and-slot-spacing-design.md` changes this behaviour.
 
-One thing this task did not verify. The `917 ms` blink cycle behind
-`slot_repeat_count` is measured against `sdled.wasm`, not against hardware, and it
-sets how long the flash really lasts — if the device's cycle were half that, the
-window would be two and a half minutes rather than the five the cache-TTL
-rationale rests on. Timing `repeat 100` by eye (about 92 s if 917 ms is right)
-was attempted and produced nothing usable, because the reader powered the device
-off mid-test for the reason above. It stays open, and it needs the keepalive loop.
+The `917 ms` blink cycle behind `slot_repeat_count` was measured against
+`sdled.wasm` rather than hardware, and it decides how long a flash really lasts —
+at half that value the window would be two and a half minutes, not the five the
+prompt-cache rationale rests on. Now checked on the device: `repeat 100` ran
+103 s by wall clock, including the watcher's reaction and typing time, against
+91.7 s predicted. Nothing near the 46 s a half-length cycle would give. The
+constant holds, and `repeat 328` really does blink for about five minutes.
+
+That measurement needs the keepalive loop above. The first attempt at it returned
+nothing, because the reader powered the device off mid-run.
 
 The band rename left one stale word behind. The `multiagent_statuses` docstring in
 `collector.py` says a child on a permission prompt shows "amber", and the strip
