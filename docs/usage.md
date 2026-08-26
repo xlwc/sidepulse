@@ -206,6 +206,12 @@ key before the allocator runs, and the surviving status is the most important of
 the group. Three parallel sub-agents therefore light one LED, not four — and a
 child stopped on a permission prompt turns the parent's slot red.
 
+The surviving status is handed to the allocator under the parent's key, not the
+winning child's. That is what keeps the slot still: the allocator keys its map on
+`agent_id`, so a child that outranks its parent and then hands the rank back would
+otherwise read as one session leaving and another arriving, and the LED would move
+twice per sub-agent.
+
 ### The Screen Bar can disagree with the physical strip
 
 `sync_virtual_status_device` renders from the mode rather than reusing the
@@ -269,16 +275,31 @@ the next collection. In practice the strip shows three bands, not four.
 ### Exiting the session beats every row of that table
 
 A session that reports `SessionEnd` gives its slot up within a second, along with
-every sub-agent it was running. The write follows the socket event, so it does not
-wait for the 15 s refresh. The windows above are what a session gets when it stops
-*without* saying so — a crash, a killed terminal, a `kill -9`.
+every sub-agent it was running. The write follows the socket event rather than the
+15 s refresh. Two states defer it to that refresh anyway: an LED animation still
+running (a battery preview on a power change, a lid animation), and a previous LED
+write still in flight. `StatusBarController.sync_leds` drops the write in both, and
+nothing replays it, so the slot can stay lit for up to another 15 seconds.
+`sync_virtual_status_device` runs before either check, so only a mounted device
+waits and the Screen Bar goes dark on time.
+
+Reporting an exit at all needs a provider whose hook event set carries
+`SessionEnd`, which today means Claude and Grok. `providers.CODEX_EVENTS` has no
+such event, and `install` writes Codex hooks from exactly that tuple, so a Codex
+session never says it exited and its slot keeps the window in the table above.
+
+The windows above are also what any session gets when it stops *without* saying
+so — a crash, a killed terminal, a `kill -9`.
 
 `/clear` counts as an exit. It also starts a new session id, so the cleared window
 takes a fresh slot at your next prompt rather than reclaiming the old one, and the
 strip shows nothing for it in between.
 
-Only this feed drops an ended session. The menu-bar icon and the aggregate LED
-still read an exit as Done for the full 20 minutes.
+Only this feed drops an ended session. The menu-bar icon and the aggregate LED keep
+the `COMPLETED` mapping, so an exit still reads as Done there. That is the
+aggregate's own window rather than the strip's: up to 20 minutes, and only while
+nothing else is running, because one LED answering for the whole machine demotes
+every finished session as soon as anything is active.
 
 The cost is a real one: exit a window the moment an agent finishes and you lose
 the chartreuse LED that says its output is unread. `collector.multiagent_statuses`

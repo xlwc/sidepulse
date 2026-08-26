@@ -274,7 +274,11 @@ class SlotSpacingTests(unittest.TestCase):
         self.assertEqual(allocator.slot_for_key("b"), 0)
 
     def test_two_new_sessions_land_at_least_four_slots_apart(self) -> None:
-        """Slots 3 and 4 are the worst openers, and each leaves a free slot at 4."""
+        """Slots 3 and 4 are the worst openers, and each still leaves a gap of 4.
+
+        With slot 3 taken the widest gap is at index 7, and with slot 4 taken it is
+        at index 0. Neither is a free slot *at* index 4.
+        """
         for seed in range(12):
             with self.subTest(seed=seed):
                 allocator = SlotAllocator(slot_count=8, rng=random.Random(seed))
@@ -662,6 +666,59 @@ class MultiagentStatusFeedTests(unittest.TestCase):
         self.assertEqual(
             [slot.color for slot in slots if slot.color != SLOT_EMPTY], [BAND_ALERT.steady]
         )
+
+    def test_a_winning_subagent_carries_its_parents_key(self) -> None:
+        """The child lends its mode, not its identity.
+
+        ``SlotAllocator._displayable`` keys the slot map on ``agent_id``. Return
+        the child's own key here and the allocator sees one key leave and another
+        arrive, so the session's LED moves for as long as the child outranks it.
+        """
+        snap = snapshot(
+            status(
+                "claude:session:d3f1",
+                AgentMode.WORKING,
+                session_id="d3f1",
+            ),
+            status(
+                "claude:agent:ac7f1721ec697b403",
+                AgentMode.WAITING_FOR_INPUT,
+                session_id="d3f1",
+            ),
+        )
+
+        statuses = multiagent_statuses(snap)
+
+        self.assertEqual(
+            [(item.agent_id, item.mode) for item in statuses],
+            [("claude:session:d3f1", AgentMode.WAITING_FOR_INPUT)],
+        )
+
+    def test_a_session_keeps_its_index_while_a_subagent_outranks_it(self) -> None:
+        """Two rank crossings, one index. The user reads a slot by position.
+
+        A child hitting a permission prompt outranks its ``WORKING`` parent, and
+        resolving back to ``WORKING`` hands the rank back. Both crossings change
+        which status wins the coalesce, and neither may move the LED.
+        """
+        allocator = SlotAllocator(slot_count=8, rng=random.Random(1234))
+        parent = status("claude:session:d3f1", AgentMode.WORKING, session_id="d3f1")
+        rounds = (
+            (parent,),
+            (
+                parent,
+                status("claude:agent:aaa", AgentMode.WAITING_FOR_INPUT, session_id="d3f1"),
+            ),
+            (parent, status("claude:agent:aaa", AgentMode.WORKING, session_id="d3f1")),
+        )
+
+        indexes = []
+        for statuses in rounds:
+            allocator.update(multiagent_statuses(snapshot(*statuses)), BASE)
+            indexes.append(allocator.slot_for_key("claude:session:d3f1"))
+
+        self.assertNotIn(None, indexes)
+        self.assertEqual(len(set(indexes)), 1, indexes)
 
     def test_a_parent_wins_a_tie_against_its_own_subagent(self) -> None:
         """Same mode both sides: the top-level session is the one that survives."""

@@ -5,11 +5,13 @@ Status: implemented
 
 ## Status
 
-Both commits landed on `my-customizations`. The exit filter is `8436a02`, and the
-spacing rule is `8494550`. Each carries its own tests and the doc changes its code
-invalidated.
+Two of the three commits landed on `my-customizations`. The exit filter is
+`8436a02`. The spacing rule is `8494550`. The session re-key of the feed is in the
+working tree, uncommitted, together with this spec change and the review-round
+fixes listed under commit 3. Each commit carries its own tests and the doc changes
+its code invalidated.
 
-The suite passes at 387 tests. One failure is environmental:
+The suite passes at 389 tests. One failure is environmental:
 `test_hook_event_server_receives_socket_message` cannot `bind` a Unix socket in
 the sandbox, and it fails on a clean tree the same way.
 
@@ -22,9 +24,13 @@ go dark on the strip within a second of leaving a session. The feed tests cover 
 filter, and `sidepulse agent-monitor leds --once --dry-run --display multiagent`
 prints what the strip would hold.
 
+**Known gaps:** the session re-key is unchecked on hardware too. The falsifier that
+found the movement drives `SlotAllocator` directly, and the fix is read back the
+same way.
+
 ## Summary
 
-Two independent changes to the multiagent strip.
+Three changes to the multiagent strip.
 
 A session that ends gives up its LED at once. Today it holds the done band for 20
 minutes. `mode_for_event` maps `SessionEnd` to `COMPLETED`, and
@@ -34,13 +40,18 @@ A new session takes the free slot whose nearest occupied slot is farthest away.
 Today `SlotAllocator._free_slot` picks a free slot at random, so occupied slots
 cluster.
 
-The two changes share no state and touch different files. They land as two
+A session keeps one index while a sub-agent outranks it. Today the winner of the
+coalesce reaches the allocator under its own `agent_id`, so a Task-tool child moves
+its parent's LED.
+
+The three changes share no state and touch different functions. They land as three
 commits.
 
 ## Goals
 
 - An LED goes dark when you exit the session behind it.
 - Occupied LEDs spread across the strip while the strip has room.
+- A session that holds a slot holds one index, whichever of its statuses wins.
 - The aggregate indicator keeps the behaviour it has today.
 - Add no new timer, no new stored state, and no new `AgentMode`.
 
@@ -48,7 +59,7 @@ commits.
 
 - Changing the 20-minute window for a session that stops without a `SessionEnd`
   event. A crash and a killed terminal still rely on that window.
-- Moving a session that already holds a slot.
+- Re-spacing the strip when a session in the middle leaves.
 - Changing eviction, or which session outranks which.
 - Reading the `reason` field of a `SessionEnd` payload.
 - Enabling multiagent on the Dot.
@@ -193,9 +204,49 @@ which is the path the strip runs on, so this design adds a test there.
 Unix socket, and the LED write follows that event. It does not wait for the 15
 second timer.
 
+Two states defer the write to that timer anyway. `StatusBarController.sync_leds`
+returns without writing while an LED animation window is open, and again while a
+previous write is in flight. Neither state queues the dropped write. The slot then
+goes dark on the next refresh instead, up to 15 seconds later.
+`sync_virtual_status_device` runs before both checks, so the Screen Bar keeps the
+one-second behaviour and only a mounted device waits.
+
+Codex reports no exit at all. `providers.CODEX_EVENTS` has no `SessionEnd`, and
+`install` writes Codex hooks from exactly that tuple. Every row of the table above
+holds for Claude and for Grok. A Codex session gets the "Today" column.
+
 **Known gaps:** exit a window the moment an agent finishes, and you lose the done
 band that says the output is unread. The design accepts this. You closed the
 window, so you cannot read that output any more.
+
+## A sub-agent does not move its parent's LED
+
+`multiagent_statuses` hands each surviving status to the allocator under its
+session's key. `session_keyed` replaces the `agent_id` of a status that carries a
+`session_id` with the key `HookEvent.status_key` builds for the parent. A status
+with no `session_id` keeps its own `agent_id`, because it has no session to key on.
+
+The mode still comes from the winner of the coalesce. A child stopped on a
+permission prompt still turns the parent's slot red.
+
+**Previously:** the winner reached the allocator under its own `agent_id`.
+`coalesce_statuses_by_key` returns whichever member of the session ranks highest,
+and `status_coalesce_sort_key` lets a child on `WAITING_FOR_INPUT` beat a parent on
+`WORKING`. `SlotAllocator._displayable` keys its map on `agent_id`, so the
+allocator read that child as one session leaving and another arriving. One
+Task-tool child therefore moved the LED twice: once when it took the rank, and once
+when it handed the rank back. On an 8-slot strip seeded with `random.Random(1234)`
+the index went 7, then 1, then 0.
+
+**Rejected:** teach `SlotAllocator._displayable` to key on the session. The
+module docstring of `led_slots.py` says a slot is a top-level session and that
+`collector.multiagent_statuses` is what enforces it, so the session concept belongs
+upstream of the allocator.
+
+The movement predates both other changes, because `multiagent_statuses` already
+coalesced by session. The guarantee is what is new: the exit filter's commit added
+the sentence "A session that already holds a slot never moves" to `docs/usage.md`,
+and that sentence was false for any session running a Task-tool child.
 
 ## New slots spread across the strip
 
@@ -225,10 +276,19 @@ Spacing applies when the allocator assigns a slot. The strip does not re-space
 itself when a session in the middle leaves.
 
 Re-spacing would move live sessions. That destroys the property that makes a
-position worth learning.
+position worth learning. `session_keyed` holds the same property from the other
+side, by keeping one key per session while the session is displayable.
 
 **Known gaps:** sessions that start and stop repeatedly can still cluster the
 strip. The design accepts this.
+
+**Known gaps:** on a two-session strip, the next newcomer takes the index the
+session that just left was holding, every time rather than one time in seven. The
+second session sat at the free slot farthest from the first, so once it leaves, its
+index is still the only widest gap from the one remaining occupant. The uniform draw
+spread that across the free slots. To get the spread back, a slot freed in the same
+`update` call has to lose the tie-break rather than win it, which this design does
+not do.
 
 ### Eviction does not change
 
@@ -274,7 +334,9 @@ For the scope boundary and the call order, in `tests/test_sidepulse.py`:
   `PermissionRequest`. Feed `PreToolUse`, then `PermissionRequest`, then
   `SessionEnd` for one session, and check that the surviving status is `SessionEnd`
   on mode `COMPLETED`. This design's payoff rides on that push path, and the
-  existing call-order test covers `AgentMonitor` only.
+  existing call-order test covers `AgentMonitor` only. Check that
+  `multiagent_statuses` returns nothing for that snapshot as well. The status
+  assertions alone pass with either half of the filter deleted.
 
 For the spacing rule, in `tests/test_led_slots.py`:
 
@@ -286,10 +348,22 @@ For the spacing rule, in `tests/test_led_slots.py`:
 - A session that already holds a slot keeps its index when another session
   arrives.
 
+For the session key, in `MultiagentStatusFeedTests` in `tests/test_led_slots.py`:
+
+- A winning sub-agent status reaches the feed under its parent's key, and keeps its
+  own mode.
+- A session keeps one index across two rank crossings. Feed the parent alone, then
+  the parent with a child on `WAITING_FOR_INPUT`, then the parent with that child on
+  `WORKING`, and read the index back through `slot_for_key` after each. Assert that
+  the three indexes are one index rather than a seeded value: the content of the
+  test is that the index does not change.
+
 ## Commits
 
-Two commits, in this order. Either one reverts without the other. Each commit
-carries the doc changes its own code invalidates.
+Three commits, in this order. The code and the tests of each one revert without the
+others. This spec does not: `8436a02` carries the whole spec rewrite, including the
+sections that describe the spacing rule in `8494550`. Each commit carries the doc
+changes its own code invalidates.
 
 1. The `SessionEnd` filter in `collector.multiagent_statuses`, with its tests.
    Two doc claims go stale. The "How long a slot stays lit" section of
@@ -302,3 +376,10 @@ carries the doc changes its own code invalidates.
    of `docs/usage.md` says positions are assigned at random, which after this
    commit describes the first position alone. The "Random rather than
    left-packed" comment on `_free_slot` is the sentence the new rule replaces.
+3. `session_keyed` in `collector.multiagent_statuses`, with its tests. One doc
+   claim becomes true rather than stale: `docs/usage.md` says a session that
+   already holds a slot never moves. This commit also closes the review round on
+   the first two commits — the provider condition and the deferred write in
+   `docs/usage.md` and `README.md`, the strip assertion on the push-path test, the
+   `getattr` default in `ended_session_keys`, and a test docstring that read a
+   distance as an index.

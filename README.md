@@ -328,9 +328,13 @@ sessions.
 
 Exiting the session ends that window early on the one-LED-per-agent strip. A
 `SessionEnd` event gives the slot up within a second, because the output behind a
-Done LED is unreachable once you close the window rather than merely unread. The
-20 minutes are what a session gets when it stops without a `SessionEnd` event, and
-the status bar and the aggregate LED keep the full window either way.
+Done LED is unreachable once you close the window rather than merely unread. An LED
+animation or an in-flight write defers that to the next 15 s refresh. Claude and
+Grok send the event. Codex has no `SessionEnd` hook, so a Codex slot keeps the full
+window. The 20 minutes are what any session gets when it stops without a
+`SessionEnd` event. The status bar and the aggregate LED still read the exit as
+Done, on the aggregate's own window: up to 20 minutes, and only while nothing else
+is running. `docs/usage.md` has the detail.
 
 Status detection is strongest when the agent tells the monitor its intended
 handoff state explicitly. A final assistant message can include a hidden marker

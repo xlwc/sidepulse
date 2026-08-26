@@ -6940,6 +6940,7 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(len(snapshot.statuses), 1)
         self.assertEqual(snapshot.statuses[0].event_name, "SessionEnd")
         self.assertEqual(snapshot.statuses[0].mode, AgentMode.COMPLETED)
+        self.assertEqual(collector_module.multiagent_statuses(snapshot), ())
 
     def test_an_ended_session_reaches_the_aggregate_but_not_the_strip(self) -> None:
         """One exit, two answers, on purpose.

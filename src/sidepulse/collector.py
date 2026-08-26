@@ -4,7 +4,7 @@ import json
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -1276,7 +1276,8 @@ def multiagent_statuses(snapshot) -> tuple[AgentStatus, ...]:
     would otherwise take a second LED -- three parallel sub-agents lighting four
     slots, and crowding genuinely separate sessions off the strip. The parent's
     slot takes the most important mode among the group, so a child stuck on a
-    permission prompt still shows the alert band.
+    permission prompt still shows the alert band -- and it takes that mode under
+    the parent's key, so the slot does not move when the rank crosses.
     """
     statuses = [*snapshot.statuses]
     now = snapshot.collected_at
@@ -1293,7 +1294,30 @@ def multiagent_statuses(snapshot) -> tuple[AgentStatus, ...]:
         if status.event_name != "SessionEnd"
         and session_coalesce_key(status) not in ended
     ]
-    return tuple(coalesce_statuses_by_key(live, session_coalesce_key))
+    return tuple(
+        session_keyed(status)
+        for status in coalesce_statuses_by_key(live, session_coalesce_key)
+    )
+
+
+def session_keyed(status: AgentStatus) -> AgentStatus:
+    """The status re-keyed to its own session, so a slot survives a rank crossing.
+
+    ``coalesce_statuses_by_key`` returns whichever member of a session won, and a
+    sub-agent on a permission prompt outranks its ``WORKING`` parent. That winner
+    carries the *child's* ``agent_id``, while ``SlotAllocator._displayable`` keys
+    the slot map on ``agent_id`` -- so the allocator would see one key leave and
+    another arrive, release the slot and re-assign it, twice per sub-agent, for a
+    session that never stopped being displayable. A strip position is worth
+    learning only if it holds still.
+
+    The key is the one ``HookEvent.status_key`` builds for the parent itself, so
+    nothing changes in the ordinary case where the parent is the winner. A status
+    with no ``session_id`` has no session to key on, and keeps a slot of its own.
+    """
+    if not status.session_id:
+        return status
+    return replace(status, agent_id=f"{status.provider}:session:{status.session_id}")
 
 
 def ended_session_keys(snapshot) -> set[tuple[str, ...]]:
@@ -1314,9 +1338,14 @@ def ended_session_keys(snapshot) -> set[tuple[str, ...]]:
     Otherwise one exit with no session id would darken every session-id-less slot
     on the strip. Such a status still gives up its own slot, on the
     ``event_name`` test in ``multiagent_statuses``.
+
+    ``stale_statuses`` is read as an attribute rather than through a ``getattr``
+    default: ``MonitorSnapshot`` declares it, and a snapshot that somehow lacked
+    it should raise here rather than silently halve the key set, which is the
+    20 minute relight above arriving with nothing to show for it.
     """
     keys: set[tuple[str, ...]] = set()
-    for status in (*snapshot.statuses, *getattr(snapshot, "stale_statuses", ())):
+    for status in (*snapshot.statuses, *snapshot.stale_statuses):
         if status.event_name != "SessionEnd":
             continue
         key = session_coalesce_key(status)
