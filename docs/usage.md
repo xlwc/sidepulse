@@ -316,7 +316,11 @@ forever.
 
 Because the count is finite *and* line 1 is the baseline, a dead app leaves a
 device holding the settled appearance — not one blinking indefinitely, and not
-one frozen on the bright pre-settle colour either. For the last slot to settle,
+one frozen on the bright pre-settle colour either. On the MacBook built-in SD
+reader that holds for about three minutes and then the strip goes dark, because a
+dead app also stops the once-a-minute `keepalive` touch and the reader powers the
+device off after three minutes of inactivity. Dark is still the point; frozen
+bright is what the pulse-up shape avoids. For the last slot to settle,
 that five-minute write is visually a no-op: the count has already run out and the
 device is holding the settled look before the host notices the boundary. For an
 earlier one it is not — `repeat` is sized to the longest remaining flash, so a

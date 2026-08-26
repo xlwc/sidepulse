@@ -12,8 +12,9 @@
 
 ## Status
 
-Tasks 1 to 4 are complete and committed. Task 5 is the only live task, and it
-holds one open check.
+All five tasks are complete and committed. Task 5's hardware checks all passed;
+what it left open is one measurement it could not take, named at the end of that
+task.
 
 The step boxes inside Tasks 1 to 4 stay unticked on purpose. Several of those
 steps are transient. Nobody can confirm "run the tests and check that they fail"
@@ -26,7 +27,7 @@ records the end state instead, which anybody can check today.
 | 2. Colour bands | complete | `BAND_ALERT`, `BAND_WORKING` and `BAND_DONE` live in `led_slots.py`, and `SLOT_BRIGHTNESS` is 255 |
 | 3. Brightness slider | complete | `multiagent_controller_for_device` assigns `controller.brightness`, and the Screen Bar branch of `sync_virtual_status_device` passes it as well |
 | 4. Documentation | complete | `test_usage_doc_hexes_match_led_slots` passes, and `docs/usage.md` holds only the six band hexes |
-| 5. Device check | one check open | see the results table in Task 5 |
+| 5. Device check | complete | see the results table in Task 5 |
 
 `FLASHING_RANKS` survives in exactly one place, the `SlotBand` docstring, which
 says what it replaced. Task 2 asked for that sentence. It is not a leftover.
@@ -1409,8 +1410,10 @@ The suite proves the program text. It cannot prove that red reads as urgent and 
 **Files:**
 - No files change unless the colours read badly. If they do, the five constants in `src/sidepulse/led_slots.py` move — and with them the three exact-program-text tests and the five `docs/usage.md` spots listed in Step 4.
 
-**Checked on 2026-08-25, against a mounted SidePulse Pro.** Steps 1, 3 and 4
-pass. Step 2 keeps its box open for one visual check.
+**Checked on 2026-08-25, against a mounted SidePulse Pro.** All four steps pass.
+The settle check ran the short-`repeat` procedure in Step 2 rather than waiting
+five minutes: three blinks, then a hold, then the baseline-only rewrite, watched
+at both instants.
 
 | Check | Result |
 |---|---|
@@ -1419,14 +1422,33 @@ pass. Step 2 keeps its box open for one visual check.
 | A working session holds one steady blue, and does not blink | pass |
 | A finished session flashes green, then settles | pass |
 | A red slot stops blinking after five minutes, and holds dim red | pass |
-| The settle shows no visible jump at the moment it happens | not checked |
-| Killing the process leaves the strip on the settled colours | not checked, optional |
+| The settle shows no visible jump at the moment it happens | pass |
+| Killing the process leaves the strip on the settled colours | for about three minutes, then dark — see the keepalive note |
 | The slider shows in multiagent mode, and dragging it dims the strip | pass |
 | The bands need a retune | no |
 
-Two results look like defects and are not. Read these before you re-check
+Three results look like defects and are not. Read these before you re-check
 anything on hardware.
 
+- **A dark strip is the first thing you will see, and the check itself causes it.**
+  `LEDS_FORMAT.md` records that the MacBook built-in SD reader powers the device
+  off after three minutes of filesystem inactivity, which is why
+  `keep_awake.poke_status_file` touches `keepalive` once a minute. Suspending or
+  killing the status-bar app stops those touches, so about three minutes into any
+  procedure that suspends it, every LED goes off at once — mid-program, whatever
+  the program says. It looks exactly like a firmware fault or a settle gone wrong.
+  Either keep the whole check under three minutes from the last touch, or hold the
+  device up yourself while the app is stopped:
+
+  ```sh
+  while touch /Volumes/SidePulse/keepalive; do sleep 30; done   # Ctrl-C when done
+  ```
+
+  This is also the honest answer to the last row of the table. A dead app leaves
+  the strip on the settled colours for as long as the reader stays powered, and
+  then dark. Dark rather than frozen bright is still the outcome the pulse-up
+  shape was chosen for, but "holds the settled appearance" has a three-minute
+  expiry on this reader.
 - A band change restarts the flash clock. Answering a permission prompt walks a
   session through red, blue, red, so each answer rebases the five-minute
   countdown. Time a settle from the last event for that session. Do not time it
@@ -1434,6 +1456,14 @@ anything on hardware.
 - A session that ends keeps its green slot for `COMPLETED_VISIBLE_SECONDS`, which
   is 20 minutes. Three lit LEDs for two live sessions is correct.
   `2026-08-25-session-exit-and-slot-spacing-design.md` changes this behaviour.
+
+One thing this task did not verify. The `917 ms` blink cycle behind
+`slot_repeat_count` is measured against `sdled.wasm`, not against hardware, and it
+sets how long the flash really lasts — if the device's cycle were half that, the
+window would be two and a half minutes rather than the five the cache-TTL
+rationale rests on. Timing `repeat 100` by eye (about 92 s if 917 ms is right)
+was attempted and produced nothing usable, because the reader powered the device
+off mid-test for the reason above. It stays open, and it needs the keepalive loop.
 
 The band rename left one stale word behind. The `multiagent_statuses` docstring in
 `collector.py` says a child on a permission prompt shows "amber", and the strip
@@ -1448,7 +1478,7 @@ same function.
 
 Expected: a program whose baseline line uses only the six hexes from Task 4 Step 8, and no `brightness` line at all — the CLI relies on the controller default, which is now 255.
 
-- [ ] **Step 2: Drive a real strip, if one is mounted**
+- [x] **Step 2: Drive a real strip, if one is mounted**
 
 ```sh
 ls /Volumes | grep -i sidepulse && .venv/bin/python -m sidepulse agent-monitor leds --display multiagent
@@ -1461,13 +1491,20 @@ Leave it running and start an agent session in another terminal. Watch for:
 - After five minutes, a red slot stops blinking and holds dim red — with no visible jump at the moment it settles.
 - Killing the process leaves the strip on the settled colours, not frozen bright.
 
-Only the third bullet is still open. The other three passed on 2026-08-25.
+All four bullets were checked on 2026-08-25. The third passed by the short-window
+procedure below rather than by waiting five minutes. The fourth holds only until
+the reader powers the device off, which is the keepalive note above, not a
+property of the program.
 
 **Check the third bullet in under a minute.** Do not wait five minutes for it. The
 five-minute window is not what you are checking. You are checking two instants:
 `repeat` expiring, and the baseline-only rewrite landing. A short `repeat`
 reproduces both. Substitute your own volume name if the device is not mounted at
 `/Volumes/SidePulse`.
+
+Under a minute is also what keeps the reader powered. Step 1 stops the app's
+keepalive touches, and three minutes after the last one every LED goes off
+mid-program — see the keepalive note above before you read that as a fault.
 
 1. Suspend the menu-bar app, so that it does not overwrite the file on the next
    hook event.
