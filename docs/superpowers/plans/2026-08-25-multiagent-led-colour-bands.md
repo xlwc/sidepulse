@@ -1385,7 +1385,38 @@ The suite proves the program text. It cannot prove that red reads as urgent and 
 **Files:**
 - No files change unless the colours read badly. If they do, the five constants in `src/sidepulse/led_slots.py` move — and with them the three exact-program-text tests and the five `docs/usage.md` spots listed in Step 4.
 
-- [ ] **Step 1: Print the program without touching the device**
+**Checked on 2026-08-25, against a mounted SidePulse Pro.** Steps 1, 3 and 4
+pass. Step 2 keeps its box open for one visual check.
+
+| Check | Result |
+|---|---|
+| The baseline uses only the six band hexes, and the program has no `brightness` line | pass |
+| A waiting session blinks red, and never goes dark between blinks | pass |
+| A working session holds one steady blue, and does not blink | pass |
+| A finished session flashes green, then settles | pass |
+| A red slot stops blinking after five minutes, and holds dim red | pass |
+| The settle shows no visible jump at the moment it happens | not checked |
+| Killing the process leaves the strip on the settled colours | not checked, optional |
+| The slider shows in multiagent mode, and dragging it dims the strip | pass |
+| The bands need a retune | no |
+
+Two results look like defects and are not. Read these before you re-check
+anything on hardware.
+
+- A band change restarts the flash clock. Answering a permission prompt walks a
+  session through red, blue, red, so each answer rebases the five-minute
+  countdown. Time a settle from the last event for that session. Do not time it
+  from the moment the LED first turned red.
+- A session that ends keeps its green slot for `COMPLETED_VISIBLE_SECONDS`, which
+  is 20 minutes. Three lit LEDs for two live sessions is correct.
+  `2026-08-25-session-exit-and-slot-spacing-design.md` changes this behaviour.
+
+The band rename left one stale word behind. The `multiagent_statuses` docstring in
+`collector.py` says a child on a permission prompt shows "amber", and the strip
+shows red. Fix it in the first commit of the session-exit work, which edits that
+same function.
+
+- [x] **Step 1: Print the program without touching the device**
 
 ```sh
 .venv/bin/python -m sidepulse agent-monitor leds --once --dry-run --display multiagent
@@ -1406,7 +1437,7 @@ Leave it running and start an agent session in another terminal. Watch for:
 - After five minutes, a red slot stops blinking and holds dim red — with no visible jump at the moment it settles.
 - Killing the process leaves the strip on the settled colours, not frozen bright.
 
-- [ ] **Step 3: Confirm the slider moves the strip**
+- [x] **Step 3: Confirm the slider moves the strip**
 
 Restart the menu-bar app so it picks up the new code, then drag the brightness slider in the device submenu:
 
@@ -1416,7 +1447,7 @@ launchctl kickstart -k gui/$(id -u)/io.sidepulse.agentstatus
 
 Expected: the readout and slider are present in multiagent mode, and dragging visibly changes the strip. Do **not** use `sidepulse status-bar stop && start` as a restart — `stop` sets `uninstall = True` and removes the LaunchAgent plist.
 
-- [ ] **Step 4: Retune only if needed, then commit**
+- [x] **Step 4: Retune only if needed, then commit**
 
 If the bands read badly — most likely blue looking far weaker than red, or the settled colours being too faint to see — change only `BAND_ALERT`, `BAND_WORKING`, and `BAND_DONE` in `src/sidepulse/led_slots.py`. Then follow the restatements, because a retune is not a one-file edit.
 
