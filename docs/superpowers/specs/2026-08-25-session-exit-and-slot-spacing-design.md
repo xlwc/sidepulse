@@ -5,11 +5,10 @@ Status: implemented
 
 ## Status
 
-Two of the three commits landed on `my-customizations`. The exit filter is
-`8436a02`. The spacing rule is `8494550`. The session re-key of the feed is in the
-working tree, uncommitted, together with this spec change and the review-round
-fixes listed under commit 3. Each commit carries its own tests and the doc changes
-its code invalidated.
+Three commits landed on `my-customizations`. The exit filter is `8436a02`. The
+spacing rule is `8494550`. The session re-key of the feed is `fedefb4`, together
+with the review-round fixes listed under commit 3. Each commit carries its own
+tests and the doc changes its code invalidated.
 
 The suite passes at 389 tests. One failure is environmental:
 `test_hook_event_server_receives_socket_message` cannot `bind` a Unix socket in
