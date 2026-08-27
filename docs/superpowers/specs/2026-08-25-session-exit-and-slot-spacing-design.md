@@ -8,9 +8,9 @@ Status: implemented
 Five commits landed on `my-customizations`. The exit filter is `8436a02`. The
 spacing rule is `8494550`. The session re-key of the feed is `fedefb4`, together
 with the review-round fixes listed under commit 3. The permission-mirror drop is
-`460ed8b`. The second review round is a fifth commit, which reworks that drop
-rather than adding to it. Each commit carries its own tests and the doc changes
-its code invalidated.
+`460ed8b`. The second review round is `e0c4876`, which reworks that drop rather
+than adding to it. Each commit carries its own tests and the doc changes its code
+invalidated.
 
 The suite passes at 398 tests. `test_hook_event_server_receives_socket_message`
 fails when the sandbox denies a Unix socket `bind`, and it fails on a clean tree
