@@ -7084,6 +7084,301 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(len(statuses), 1)
             self.assertEqual(slot_band(statuses[0].mode), BAND_WORKING)
 
+    def test_a_parents_own_prompt_does_not_strand_a_childs_mirror(self) -> None:
+        """Two prompts open at once in one session, and both answered.
+
+        The parent dispatches a Task and makes a tool call of its own in the same
+        turn. The child's ``PermissionRequest`` arrives first under the child's
+        key, the parent's arrives a second later under the session's, and both are
+        answered before the child's ``Notification`` mirror lands. Remembering one
+        key per session loses the child's the moment the parent's overwrites it, so
+        the mirror reads as a prompt nobody raised and the slot goes back to steady
+        red -- the symptom this whole area exists to remove, reached by a second
+        route.
+
+        Every key that raised a prompt inside the mirror window has to stay
+        readable, not just the last one.
+        """
+        now = datetime.now(timezone.utc)
+        session_id = "claude-two-open-prompts"
+        child_id = "a94aab97f06a0367c"
+        child_command = "pytest -q"
+        parent_command = "git status"
+        events = [
+            {
+                "logged_at": now.isoformat(),
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Task",
+                "tool_input": {"subagent_type": "general-purpose"},
+            },
+            {
+                "logged_at": (now + timedelta(seconds=2)).isoformat(),
+                "hook_event_name": "PermissionRequest",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": child_command},
+                "agent_id": child_id,
+            },
+            {
+                "logged_at": (now + timedelta(seconds=3)).isoformat(),
+                "hook_event_name": "PermissionRequest",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": parent_command},
+            },
+            {
+                "logged_at": (now + timedelta(seconds=5)).isoformat(),
+                "hook_event_name": "PostToolUse",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": child_command},
+                "tool_response": "{}",
+                "agent_id": child_id,
+            },
+            {
+                "logged_at": (now + timedelta(seconds=6)).isoformat(),
+                "hook_event_name": "PostToolUse",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": parent_command},
+                "tool_response": "{}",
+            },
+            {
+                "logged_at": (now + timedelta(seconds=9)).isoformat(),
+                "hook_event_name": "Notification",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "message": "Claude needs your permission",
+                "notification_type": "permission_prompt",
+            },
+        ]
+
+        monitor = LiveAgentMonitor(stale_after_seconds=3600)
+        for event in events:
+            record = parse_log_line("claude", json.dumps(event))
+            self.assertIsNotNone(record)
+            monitor.ingest_record(record)
+
+        statuses = collector_module.multiagent_statuses(monitor.snapshot())
+
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(slot_band(statuses[0].mode), BAND_WORKING)
+
+    def test_a_prompt_raised_before_the_mirror_window_stops_dropping_mirrors(
+        self,
+    ) -> None:
+        """The window has to expire per key, not just bound the newest key.
+
+        A child raises a prompt and answers it. Minutes later the parent raises one
+        of its own, and its mirror follows. Keeping every key a session ever used
+        would find the child's stale entry, read the parent's mirror as the child's,
+        and drop the alert the human is waiting behind.
+        """
+        now = datetime.now(timezone.utc)
+        session_id = "claude-stale-child-prompt"
+        child_id = "a94aab97f06a0367c"
+        events = [
+            {
+                "logged_at": now.isoformat(),
+                "hook_event_name": "PermissionRequest",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest -q"},
+                "agent_id": child_id,
+            },
+            {
+                "logged_at": (now + timedelta(seconds=10)).isoformat(),
+                "hook_event_name": "PostToolUse",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest -q"},
+                "tool_response": "{}",
+                "agent_id": child_id,
+            },
+            {
+                "logged_at": (now + timedelta(seconds=300)).isoformat(),
+                "hook_event_name": "PermissionRequest",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push"},
+            },
+            {
+                "logged_at": (now + timedelta(seconds=306)).isoformat(),
+                "hook_event_name": "Notification",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "message": "Claude needs your permission",
+                "notification_type": "permission_prompt",
+            },
+        ]
+
+        monitor = LiveAgentMonitor(stale_after_seconds=3600)
+        for event in events:
+            record = parse_log_line("claude", json.dumps(event))
+            self.assertIsNotNone(record)
+            monitor.ingest_record(record)
+
+        statuses = collector_module.multiagent_statuses(monitor.snapshot())
+
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(slot_band(statuses[0].mode), BAND_ALERT)
+
+    def test_a_parents_unanswered_prompt_stays_red_beside_a_childs(self) -> None:
+        """The mirror is expendable; the request it mirrors is not.
+
+        A parent that dispatches a Task and makes a tool call of its own raises two
+        prompts seconds apart, and their mirrors are indistinguishable, so the
+        parent's is dropped along with the child's. The human is still waiting on
+        the parent's prompt, so the slot has to stay red -- and it does, off the
+        parent's own session-keyed ``PermissionRequest``, which the drop never
+        touches.
+        """
+        now = datetime.now(timezone.utc)
+        session_id = "claude-parent-prompt-outlives-its-mirror"
+        child_id = "a94aab97f06a0367c"
+        child_command = "pytest -q"
+        parent_command = "git push"
+        events = [
+            {
+                "logged_at": now.isoformat(),
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Task",
+                "tool_input": {"subagent_type": "general-purpose"},
+            },
+            {
+                "logged_at": (now + timedelta(seconds=2)).isoformat(),
+                "hook_event_name": "PermissionRequest",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": child_command},
+                "agent_id": child_id,
+            },
+            {
+                "logged_at": (now + timedelta(seconds=3)).isoformat(),
+                "hook_event_name": "PermissionRequest",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": parent_command},
+            },
+            {
+                "logged_at": (now + timedelta(seconds=5)).isoformat(),
+                "hook_event_name": "PostToolUse",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": child_command},
+                "tool_response": "{}",
+                "agent_id": child_id,
+            },
+            {
+                "logged_at": (now + timedelta(seconds=9)).isoformat(),
+                "hook_event_name": "Notification",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "message": "Claude needs your permission",
+                "notification_type": "permission_prompt",
+            },
+        ]
+
+        monitor = LiveAgentMonitor(stale_after_seconds=3600)
+        for event in events:
+            record = parse_log_line("claude", json.dumps(event))
+            self.assertIsNotNone(record)
+            monitor.ingest_record(record)
+
+        statuses = collector_module.multiagent_statuses(monitor.snapshot())
+
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(slot_band(statuses[0].mode), BAND_ALERT)
+
+    def test_a_session_that_stops_asking_leaves_the_permission_map(self) -> None:
+        """The map is bounded by sessions asking now, not sessions ever seen.
+
+        The status-bar app runs one ``LiveAgentMonitor`` for days. Every session
+        that ever raised a prompt would otherwise leave a permanent entry behind,
+        because the inner prune only runs on the session raising the prompt.
+        """
+        now = datetime.now(timezone.utc)
+        monitor = LiveAgentMonitor(stale_after_seconds=3600)
+        for index in range(3):
+            for event in self._subagent_permission_prompt_events(
+                now + timedelta(seconds=600 * index),
+                f"claude-old-session-{index}",
+                agent_id="a94aab97f06a0367c",
+            ):
+                record = parse_log_line("claude", json.dumps(event))
+                self.assertIsNotNone(record)
+                monitor.ingest_record(record)
+
+        self.assertEqual(len(monitor.permission_request_keys_by_session), 1)
+
+    def test_the_mirror_check_reads_the_mode_its_caller_already_computed(self) -> None:
+        """One computation of the mode, not two.
+
+        Both callers hold ``status.mode`` when they reach
+        ``notification_mirrors_another_agents_permission``. Recomputing it there
+        gives the ``Notification`` branch of ``mode_for_event`` a second reader that
+        a change to the first need not keep in step.
+        """
+        now = datetime.now(timezone.utc)
+        session_id = "claude-mirror-mode-argument"
+        request = parse_log_line(
+            "claude",
+            json.dumps(
+                {
+                    "logged_at": now.isoformat(),
+                    "hook_event_name": "PermissionRequest",
+                    "session_id": session_id,
+                    "cwd": "/tmp/project",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "pytest -q"},
+                    "agent_id": "a94aab97f06a0367c",
+                }
+            ),
+        )
+        mirror = parse_log_line(
+            "claude",
+            json.dumps(
+                {
+                    "logged_at": (now + timedelta(seconds=6)).isoformat(),
+                    "hook_event_name": "Notification",
+                    "session_id": session_id,
+                    "cwd": "/tmp/project",
+                    "message": "Claude needs your permission",
+                    "notification_type": "permission_prompt",
+                }
+            ),
+        )
+        self.assertIsNotNone(request)
+        self.assertIsNotNone(mirror)
+
+        keys: dict[str, dict[str, datetime]] = {}
+        collector_module.track_permission_request_keys(request, keys)
+
+        self.assertTrue(
+            collector_module.notification_mirrors_another_agents_permission(
+                mirror, AgentMode.WAITING_FOR_INPUT, keys
+            )
+        )
+        self.assertFalse(
+            collector_module.notification_mirrors_another_agents_permission(
+                mirror, AgentMode.COMPLETED, keys
+            )
+        )
+
     def test_an_ended_session_reaches_the_aggregate_but_not_the_strip(self) -> None:
         """One exit, two answers, on purpose.
 

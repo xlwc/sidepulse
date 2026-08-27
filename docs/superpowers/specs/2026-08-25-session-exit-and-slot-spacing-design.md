@@ -5,31 +5,43 @@ Status: implemented
 
 ## Status
 
-Three commits landed on `my-customizations`. The exit filter is `8436a02`. The
+Five commits landed on `my-customizations`. The exit filter is `8436a02`. The
 spacing rule is `8494550`. The session re-key of the feed is `fedefb4`, together
-with the review-round fixes listed under commit 3. Each commit carries its own
-tests and the doc changes its code invalidated.
+with the review-round fixes listed under commit 3. The permission-mirror drop is
+`460ed8b`. The second review round is a fifth commit, which reworks that drop
+rather than adding to it. Each commit carries its own tests and the doc changes
+its code invalidated.
 
-The suite passes at 389 tests. One failure is environmental:
-`test_hook_event_server_receives_socket_message` cannot `bind` a Unix socket in
-the sandbox, and it fails on a clean tree the same way.
+The suite passes at 398 tests. `test_hook_event_server_receives_socket_message`
+fails when the sandbox denies a Unix socket `bind`, and it fails on a clean tree
+the same way.
 
 The spacing rule is checked on hardware. A restarted app put two live sessions on
 slots 0 and 7 of a mounted SidePulse Pro, where the uniform draw had put three
 sessions on 5, 6 and 7.
 
-**Known gaps:** the exit path is unchecked on hardware. Nobody has watched a slot
-go dark on the strip within a second of leaving a session. The feed tests cover the
-filter, and `sidepulse agent-monitor leds --once --dry-run --display multiagent`
-prints what the strip would hold.
+The branch ran live against real sessions, and the strip behaved as designed. That
+is a whole-branch observation, not a check of any one change.
 
-**Known gaps:** the session re-key is unchecked on hardware too. The falsifier that
+**Known gaps:** the exit path is unchecked as its own case. Nobody has watched a
+slot go dark on the strip within a second of leaving a session. The feed tests
+cover the filter, and `sidepulse agent-monitor leds --once --dry-run --display
+multiagent` prints what the strip would hold.
+
+**Known gaps:** the session re-key is unchecked as its own case. The falsifier that
 found the movement drives `SlotAllocator` directly, and the fix is read back the
 same way.
 
+**Known gaps:** the permission-mirror drop is unchecked on hardware. The evidence
+is a replay of 3588 recorded hook events through `LiveAgentMonitor` and the suite.
+
+**Known gaps:** no test covers a mirror that arrives after
+`PERMISSION_NOTIFICATION_MIRROR_SECONDS`. The 60 second bound is checked against
+272 measured pairs, whose worst lag was 12 seconds.
+
 ## Summary
 
-Three changes to the multiagent strip.
+Four changes to the multiagent strip.
 
 A session that ends gives up its LED at once. Today it holds the done band for 20
 minutes. `mode_for_event` maps `SessionEnd` to `COMPLETED`, and
@@ -43,16 +55,26 @@ A session keeps one index while a sub-agent outranks it. Today the winner of the
 coalesce reaches the allocator under its own `agent_id`, so a Task-tool child moves
 its parent's LED.
 
-The three changes share no state and touch different functions. They land as three
-commits.
+A permission prompt raised inside a sub-agent stops holding the slot red once it is
+answered. Today Claude Code's duplicate of that prompt lands on the parent's key,
+where nothing expires it.
+
+The four changes share no state and touch different functions. They land as five
+commits: one each, and one review round on the last.
 
 ## Goals
 
 - An LED goes dark when you exit the session behind it.
 - Occupied LEDs spread across the strip while the strip has room.
 - A session that holds a slot holds one index, whichever of its statuses wins.
+- A slot shows red while a prompt waits for you, and stops when you answer it.
 - The aggregate indicator keeps the behaviour it has today.
-- Add no new timer, no new stored state, and no new `AgentMode`.
+- Add no new timer and no new `AgentMode`.
+
+The first three changes add no stored state either. The permission-mirror drop
+adds one map, `permission_request_keys_by_session`, held per monitor. It is not
+persisted, and its entries expire after
+`PERMISSION_NOTIFICATION_MIRROR_SECONDS`.
 
 ## Non-goals
 
@@ -62,6 +84,7 @@ commits.
 - Changing eviction, or which session outranks which.
 - Reading the `reason` field of a `SessionEnd` payload.
 - Enabling multiagent on the Dot.
+- Showing a sub-agent's prompt on a slot of its own. A child borrows its parent's.
 
 ## An ended session leaves the strip
 
@@ -247,6 +270,88 @@ coalesced by session. The guarantee is what is new: the exit filter's commit add
 the sentence "A session that already holds a slot never moves" to `docs/usage.md`,
 and that sentence was false for any session running a Task-tool child.
 
+## An answered sub-agent prompt stops holding the slot red
+
+`notification_mirrors_another_agents_permission` drops the duplicate that Claude
+Code fires for a permission prompt raised inside a sub-agent.
+
+Claude Code reports one prompt as two hooks. `PermissionRequest` carries the
+`agent_id` of whoever raised it, so a prompt raised inside a Task lands on the
+child's key. The `Notification` that follows it carries no `agent_id`, so it lands
+on the parent's key. Answering the prompt clears the child's copy through the
+`PostToolUse` that follows. Nothing clears the parent's, because a parent blocked
+inside the Task tool emits no hook of its own until the Task returns.
+
+That leaves the duplicate as the parent's newest status.
+`status_coalesce_sort_key` sorts on priority before recency, so a stale
+`WAITING_FOR_INPUT` beats every child's fresh `WORKING`. The slot holds the alert
+band for the rest of the sub-agent's run, which after the five-second flash reads
+as steady red.
+
+Dropping the duplicate costs the display nothing. The child's own
+`PermissionRequest` already carries the alert. `session_keyed` lends it to the
+parent's slot, and its pending-signature lifecycle expires it on the event that
+answers it.
+
+**Rejected:** teach `status_coalesce_sort_key` to prefer a newer sibling over an
+older session-keyed alert. That breaks the case the alert band exists for. A parent
+genuinely waiting on a human, while a background child works, has to stay red.
+
+**Rejected:** catch the duplicate in `track_pending_permissions`. A `Notification`
+carries no `tool_input`, so `permission_signature` returns `None`. The duplicate
+never enters the pending set that expires the alert.
+
+### The drop reads a timing window, not the `prompt_id`
+
+`track_permission_request_keys` remembers which keys raised a prompt in each
+session, and when. The drop fires when some key other than the session's own raised
+a prompt within `PERMISSION_NOTIFICATION_MIRROR_SECONDS`, which is 60.
+
+Both payloads carry a `prompt_id`, which looks like the exact pairing this reaches
+for by timing. That field identifies the turn, not the prompt. In the retained logs
+64 distinct `prompt_id` values cover 424 `PermissionRequest` events, and one value
+covers 36 requests with 31 different commands. Pairing on it folds a turn's prompts
+into one.
+
+The measured lag from request to duplicate is 6 seconds at the median and 12
+seconds at the worst, over 272 pairs. The bound has five times that headroom.
+
+**Known gaps:** a duplicate delayed past 60 seconds is not dropped, and the slot
+holds red until the parent's next hook. That is the behaviour the drop replaced, so
+the failure costs nothing new.
+
+### Every key that raised a prompt stays readable
+
+`track_permission_request_keys` holds a map of key to timestamp per session, not one
+key per session.
+
+A parent that dispatches a Task and makes a tool call of its own raises two prompts
+seconds apart. Remembering one key per session loses the child's the moment the
+parent's overwrites it. The child's duplicate then arrives with no non-session key
+to pair against, is not dropped, and pins the slot red — the same symptom, reached
+by a second route.
+
+Both duplicates are dropped when two prompts are open. They are indistinguishable,
+and the parent's own `PermissionRequest` is session-keyed, so the slot stays red
+from the request itself while the human is still waiting.
+
+**Previously:** one `(key, timestamp)` per session, last write wins. The overwrite
+does not appear in the retained logs, across 273 duplicates. Nine cross-agent
+overlapping requests do appear, across two sessions.
+
+### The window is what bounds the map
+
+Each write to `track_permission_request_keys` removes every entry older than
+`PERMISSION_NOTIFICATION_MIRROR_SECONDS`, in every session. A session left with no
+entries leaves the map.
+
+No duplicate can pair with an expired entry, so an expired entry has no reader. The
+map therefore holds the sessions raising prompts now. The status-bar app runs one
+`LiveAgentMonitor` for days, and a map keyed by every session ever seen would grow
+for that whole time.
+
+Replaying 3588 recorded hook events holds the map at 4 sessions at its widest.
+
 ## New slots spread across the strip
 
 `_free_slot` picks the free slot whose distance to the nearest occupied slot is
@@ -357,12 +462,34 @@ For the session key, in `MultiagentStatusFeedTests` in `tests/test_led_slots.py`
   the three indexes are one index rather than a seeded value: the content of the
   test is that the index does not change.
 
+For the permission-mirror drop, in `AgentMonitorTests` in `tests/test_sidepulse.py`:
+
+- A session whose sub-agent prompt is answered reads as the working band, on
+  `LiveAgentMonitor.ingest_record`. This is the push path the strip runs on.
+- The same scenario reads as the working band through `AgentMonitor`. This is the
+  scan path the CLI reads, and it reaches the ignore check by its own route.
+- A parent's own prompt reads as the alert band while a child works.
+- A child's prompt and a parent's prompt, both answered before the child's
+  duplicate arrives, read as the working band. This is the overwrite case. Assert
+  the band, not the map: the symptom is a red slot.
+- A parent's unanswered prompt reads as the alert band while a child's prompt is
+  open. This holds the guarantee that the drop costs the display nothing.
+- A parent's prompt raised 5 minutes after a child's answered one reads as the
+  alert band. This holds the per-key expiry. Without it a stale child entry makes
+  every later duplicate droppable.
+- Three sessions that raise prompts 10 minutes apart leave one entry in
+  `permission_request_keys_by_session`. This holds the bound on the map.
+- `notification_mirrors_another_agents_permission` takes the mode as an argument.
+  Call it with `WAITING_FOR_INPUT` and with `COMPLETED` for one duplicate, and
+  check that only the first drops.
+
 ## Commits
 
-Three commits, in this order. The code and the tests of each one revert without the
-others. This spec does not: `8436a02` carries the whole spec rewrite, including the
-sections that describe the spacing rule in `8494550`. Each commit carries the doc
-changes its own code invalidates.
+Five commits, in this order. The code and the tests of each one revert without the
+others, except commit 5, which reworks commit 4. This spec does not revert
+per-commit: `8436a02` carries the whole spec rewrite, including the sections that
+describe the spacing rule in `8494550`. Each commit carries the doc changes its own
+code invalidates.
 
 1. The `SessionEnd` filter in `collector.multiagent_statuses`, with its tests.
    Two doc claims go stale. The "How long a slot stays lit" section of
@@ -382,3 +509,25 @@ changes its own code invalidates.
    `docs/usage.md` and `README.md`, the strip assertion on the push-path test, the
    `getattr` default in `ended_session_keys`, and a test docstring that read a
    distance as an index.
+4. `notification_mirrors_another_agents_permission` and
+   `track_permission_request_keys`, with their tests. This commit depends on
+   commit 3: the drop is safe because `session_keyed` lends a child's alert to the
+   parent's slot.
+5. The second review round on commit 4. Three findings are taken: the per-session
+   overwrite, the unbounded map, and the recomputed mode. The map becomes a map of
+   maps, the expiry runs across every session, and the mode becomes an argument.
+   Three findings are rejected in this spec: the `prompt_id` pairing above, folding
+   the map into `StatusMetadata`, and folding the drop into
+   `should_ignore_status_transition`. One `docs/usage.md` claim goes stale: it says
+   the drop fires for a duplicate whose request was seen under a different key,
+   which after this commit reads as any other key with a live request.
+
+**Rejected:** fold the map into `StatusMetadata`. That dataclass is frozen, holds
+display metadata, and `metadata_by_status` keys it by status key rather than by
+session. Reusing it needs a different key, a different lifetime, and an unfrozen
+field.
+
+**Rejected:** fold the drop into `should_ignore_status_transition`. That function
+is a predicate over a previous status, a current status and a signature set. The
+drop asks about the record instead, so folding it in threads the record and the
+per-session map through a function that takes neither.

@@ -222,10 +222,23 @@ Task returns — so the parent's newest status stays `WAITING_FOR_INPUT`, outran
 every child's `WORKING` on the priority-first sort, and holds the slot red for the
 rest of the sub-agent's run. `collector.notification_mirrors_another_agents_permission`
 drops that duplicate. It costs nothing, because the child's own request already
-raises the alert and expires it on the right event, and it fires only for a
-duplicate whose request was seen recently under a different key — so a parent's own
-prompt, or a prompt whose `PermissionRequest` hook never arrived, still turns the
-slot red.
+raises the alert and expires it on the right event, and it fires only while some
+other key in that session has raised a prompt within the last minute — so a prompt
+raised when no child has one open, or a prompt whose `PermissionRequest` hook never
+arrived, still turns the slot red.
+
+A parent that dispatches a Task and makes a tool call of its own raises two prompts
+seconds apart, and their mirrors are indistinguishable, so both are dropped. The
+parent's own prompt still shows red: its `PermissionRequest` is session-keyed and
+carries the alert by itself. What the mirror adds is nothing the display needs.
+
+`collector.track_permission_request_keys` is what the drop reads, and it remembers
+every key that raised a prompt rather than the newest one — a parent's later prompt
+must not erase the child's before the child's mirror arrives. Entries expire after
+`collector.PERMISSION_NOTIFICATION_MIRROR_SECONDS`, which is also what keeps the map
+sized to the sessions asking now rather than to every session a days-long process
+has seen. The pairing is by timing and not by the `prompt_id` both payloads carry:
+that field identifies the turn, and one turn can raise dozens of prompts.
 
 ### The Screen Bar can disagree with the physical strip
 
