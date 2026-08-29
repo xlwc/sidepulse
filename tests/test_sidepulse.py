@@ -6843,7 +6843,7 @@ class AgentMonitorTests(unittest.TestCase):
 
         ``track_pending_permissions`` only discarded a signature on ``PostToolUse``.
         A gated command that fails logs ``PostToolUseFailure`` instead, so its
-        signature never left ``pending_permissions_by_key`` -- and since nothing
+        signature never left ``pending_permissions_by_session`` -- and since nothing
         here ever fires ``SessionEnd`` to empty that set, every later status change
         was swallowed by ``should_ignore_status_transition``, no matter how many
         other permission prompts were granted and resolved cleanly afterward.
@@ -6992,6 +6992,324 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(snapshot.statuses[0].event_name, "SessionEnd")
         self.assertEqual(snapshot.statuses[0].mode, AgentMode.COMPLETED)
         self.assertEqual(collector_module.multiagent_statuses(snapshot), ())
+
+    @staticmethod
+    def _child_prompt_events(
+        now: datetime,
+        session_id: str,
+        agent_id: str,
+        command: str,
+        *,
+        offset: int = 0,
+    ) -> list[dict]:
+        """A Task child raising a permission prompt that is never answered."""
+        return [
+            {
+                "logged_at": (now + timedelta(seconds=offset)).isoformat(),
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            },
+            {
+                "logged_at": (now + timedelta(seconds=offset + 1)).isoformat(),
+                "hook_event_name": "PermissionRequest",
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "cwd": "/tmp/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            },
+        ]
+
+    def _status_for(self, snapshot: MonitorSnapshot, key: str) -> AgentStatus:
+        """The status recorded for one key, active or demoted.
+
+        Both lists, because ``snapshot_from_statuses`` demotes every inactive
+        status into ``stale_statuses`` as soon as anything else is active -- and a
+        child that just reported ``SubagentStop`` is inactive by definition. What
+        these tests ask is whether the child's later status was *recorded* rather
+        than swallowed, which is true in either list.
+        """
+        matches = [
+            status
+            for status in (*snapshot.statuses, *snapshot.stale_statuses)
+            if status.agent_id == key
+        ]
+        self.assertEqual(len(matches), 1, f"no single status for {key}")
+        return matches[0]
+
+    def test_a_new_user_prompt_clears_a_task_childs_pending_permission(self) -> None:
+        """A turn's end has to clear the whole session's prompts, children included.
+
+        ``HookEvent.status_key`` prefers ``agent_id`` over ``session_id``, and
+        Claude Code puts no ``agent_id`` on ``Stop``, ``SessionEnd`` or
+        ``UserPromptSubmit`` -- across the four retained hook logs, none of those
+        96, 36 and 110 records carries one, while all 250 ``SubagentStop`` records
+        do. So the turn-end branch of ``track_pending_permissions`` can only ever
+        reach a *session* key, and a prompt raised inside a Task that never got a
+        matching ``PostToolUse`` stays pending on the *child's* key for the life of
+        the process, with ``should_ignore_status_transition`` swallowing every
+        later status that child reports.
+
+        Typing a new instruction instead of answering is what cancels such a
+        prompt, so ``UserPromptSubmit`` is exactly the event that must clear it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "claude.jsonl"
+            now = datetime.now(timezone.utc)
+            session_id = "claude-cancelled-child-prompt"
+            agent_id = "a94aab97f06a0367c"
+            events = self._child_prompt_events(
+                now, session_id, agent_id, "pytest -q --maxfail=1"
+            )
+            events += [
+                {
+                    "logged_at": (now + timedelta(seconds=20)).isoformat(),
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": session_id,
+                    "cwd": "/tmp/project",
+                    "prompt": "stop that, do this instead",
+                },
+                {
+                    "logged_at": (now + timedelta(seconds=25)).isoformat(),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "cwd": "/tmp/project",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git status"},
+                },
+                {
+                    "logged_at": (now + timedelta(seconds=26)).isoformat(),
+                    "hook_event_name": "PostToolUse",
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "cwd": "/tmp/project",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git status"},
+                    "tool_response": "{}",
+                },
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("claude", log),),
+                stale_after_seconds=3600,
+            )
+            snapshot = monitor.snapshot()
+
+            child = self._status_for(snapshot, f"claude:agent:{agent_id}")
+            self.assertEqual(child.event_name, "PostToolUse")
+            self.assertEqual(child.mode, AgentMode.WORKING)
+
+    def test_the_push_path_clears_a_task_childs_prompt_on_a_new_user_prompt(self) -> None:
+        """The same sweep on the socket-fed monitor the LED strip runs on.
+
+        ``LiveAgentMonitor`` keeps its own pending-permission map, so a sweep
+        wired only into the scan path leaves the strip showing Ask for a child
+        whose prompt the Captain already cancelled.
+        """
+        now = datetime.now(timezone.utc)
+        session_id = "claude-push-cancelled-child-prompt"
+        agent_id = "a94aab97f06a0367c"
+        events = self._child_prompt_events(now, session_id, agent_id, "pytest -q")
+        events += [
+            {
+                "logged_at": (now + timedelta(seconds=20)).isoformat(),
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "prompt": "stop that, do this instead",
+            },
+            {
+                "logged_at": (now + timedelta(seconds=25)).isoformat(),
+                "hook_event_name": "SubagentStop",
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "cwd": "/tmp/project",
+            },
+        ]
+        monitor = LiveAgentMonitor(stale_after_seconds=3600)
+
+        for event in events:
+            record = parse_log_line("claude", json.dumps(event))
+            self.assertIsNotNone(record)
+            monitor.ingest_record(record)
+
+        child = self._status_for(monitor.snapshot(), f"claude:agent:{agent_id}")
+        self.assertEqual(child.event_name, "SubagentStop")
+
+    def test_a_subagent_stop_clears_that_childs_pending_permission(self) -> None:
+        """``SubagentStop`` is the only turn-end event that lands on a child key.
+
+        A child that runs to completion after a prompt whose ``PostToolUse`` went
+        missing gets no other chance to clear: the session-keyed turn-end events
+        never carry its ``agent_id``.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "claude.jsonl"
+            now = datetime.now(timezone.utc)
+            session_id = "claude-child-ran-to-completion"
+            agent_id = "b17cc0d2e5f14a8b9"
+            events = self._child_prompt_events(now, session_id, agent_id, "pytest -q")
+            events.append(
+                {
+                    "logged_at": (now + timedelta(seconds=30)).isoformat(),
+                    "hook_event_name": "SubagentStop",
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "cwd": "/tmp/project",
+                }
+            )
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("claude", log),),
+                stale_after_seconds=3600,
+            )
+            snapshot = monitor.snapshot()
+
+            child = self._status_for(snapshot, f"claude:agent:{agent_id}")
+            self.assertEqual(child.event_name, "SubagentStop")
+
+    def test_a_subagent_stop_leaves_a_sibling_childs_prompt_pending(self) -> None:
+        """The guard against sweeping too much.
+
+        One child finishing says nothing about a prompt another child of the same
+        session is still holding open. Only a session-keyed turn end -- the
+        Captain typing, or the session exiting -- cancels those.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "claude.jsonl"
+            now = datetime.now(timezone.utc)
+            session_id = "claude-two-children-one-prompt-open"
+            first = "c28dd1e3f6a25b9c0"
+            second = "d39ee2f407b36cad1"
+            events = self._child_prompt_events(now, session_id, first, "pytest -q")
+            events += self._child_prompt_events(
+                now, session_id, second, "rm -rf /tmp/scratch", offset=3
+            )
+            events.append(
+                {
+                    "logged_at": (now + timedelta(seconds=30)).isoformat(),
+                    "hook_event_name": "SubagentStop",
+                    "session_id": session_id,
+                    "agent_id": first,
+                    "cwd": "/tmp/project",
+                }
+            )
+            events.append(
+                {
+                    "logged_at": (now + timedelta(seconds=35)).isoformat(),
+                    "hook_event_name": "PostToolUse",
+                    "session_id": session_id,
+                    "agent_id": second,
+                    "cwd": "/tmp/project",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git status"},
+                    "tool_response": "{}",
+                }
+            )
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("claude", log),),
+                stale_after_seconds=3600,
+            )
+            snapshot = monitor.snapshot()
+
+            self.assertEqual(
+                self._status_for(snapshot, f"claude:agent:{first}").event_name,
+                "SubagentStop",
+            )
+            still_asking = self._status_for(snapshot, f"claude:agent:{second}")
+            self.assertEqual(still_asking.event_name, "PermissionRequest")
+            self.assertEqual(still_asking.mode, AgentMode.WAITING_FOR_INPUT)
+
+    def _pending_after(self, provider: str, events: list[dict]) -> dict:
+        pending: dict[str, dict[str, set[str]]] = {}
+        for event in events:
+            record = parse_log_line(provider, json.dumps(event))
+            self.assertIsNotNone(record)
+            collector_module.track_pending_permissions(record, pending)
+        return pending
+
+    def test_a_stop_failure_clears_pending_permissions(self) -> None:
+        """A turn that ends badly ends the turn.
+
+        ``mode_for_event`` buckets ``StopFailure`` with ``PostToolUseFailure`` and
+        ``PermissionDenied`` at ``BLOCKED_ERROR``, and ``GROK_EVENTS`` installs a
+        hook for it, but the turn-end set in ``track_pending_permissions`` names
+        only ``Stop``. A signature left pending across it would swallow the
+        failure itself, so the LED would never show the error.
+
+        No installed hook config can produce this today -- ``PermissionRequest``
+        is absent from ``GROK_EVENTS`` and ``StopFailure`` from ``CLAUDE_EVENTS``,
+        so the two events cannot reach one status key -- which is why this is a
+        unit test on the tracker rather than a monitor snapshot.
+        """
+        now = datetime.now(timezone.utc)
+        session_id = "grok-turn-ended-in-failure"
+        events = [
+            {
+                "logged_at": now.isoformat(),
+                "hook_event_name": "PermissionRequest",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "run_terminal_command",
+                "tool_input": {"command": "date"},
+            },
+            {
+                "logged_at": (now + timedelta(seconds=2)).isoformat(),
+                "hook_event_name": "StopFailure",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+            },
+        ]
+
+        self.assertEqual(self._pending_after("grok", events), {})
+
+    def test_a_permission_denied_clears_its_permission_signature(self) -> None:
+        """The discard this branch was added for, pinned by a test.
+
+        ``PermissionDenied`` reached the discard set with nothing under ``tests/``
+        naming it. ``permission_signature`` returns ``None`` unless the record
+        carries ``tool_input`` as a dict with a ``command``, so the discard is
+        silently a no-op for any other payload shape. That shape is assumed here,
+        not observed: grok has never run on this machine, and the repo holds no
+        captured ``PermissionDenied`` payload. If a real one turns out to differ,
+        this test is the thing to correct.
+        """
+        now = datetime.now(timezone.utc)
+        session_id = "grok-permission-denied"
+        command = "rm -rf /tmp/scratch"
+        events = [
+            {
+                "logged_at": now.isoformat(),
+                "hook_event_name": "PermissionRequest",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "run_terminal_command",
+                "tool_input": {"command": command},
+            },
+            {
+                "logged_at": (now + timedelta(seconds=2)).isoformat(),
+                "hook_event_name": "PermissionDenied",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "tool_name": "run_terminal_command",
+                "tool_input": {"command": command},
+            },
+        ]
+
+        pending = self._pending_after("grok", events)
+        self.assertEqual(
+            [signatures for keys in pending.values() for signatures in keys.values()],
+            [],
+        )
 
     @staticmethod
     def _subagent_permission_prompt_events(

@@ -194,7 +194,7 @@ class AgentMonitor:
         statuses_by_key: dict[str, AgentStatus] = {}
         metadata_by_session: dict[str, StatusMetadata] = {}
         metadata_by_status: dict[str, StatusMetadata] = {}
-        pending_permissions_by_key: dict[str, set[str]] = {}
+        pending_permissions_by_session: dict[str, dict[str, set[str]]] = {}
         permission_request_keys_by_session: dict[str, dict[str, datetime]] = {}
 
         records = sorted(
@@ -210,7 +210,7 @@ class AgentMonitor:
             )
             status = status_from_event(record, metadata)
             if status is not None:
-                track_pending_permissions(record, pending_permissions_by_key)
+                track_pending_permissions(record, pending_permissions_by_session)
                 track_permission_request_keys(
                     record, permission_request_keys_by_session
                 )
@@ -222,7 +222,9 @@ class AgentMonitor:
                 if should_ignore_status_transition(
                     previous,
                     status,
-                    pending_permissions_by_key.get(status.agent_id, set()),
+                    pending_permission_signatures(
+                        record, pending_permissions_by_session
+                    ),
                 ):
                     continue
                 statuses_by_key[status.agent_id] = status
@@ -408,8 +410,8 @@ class LiveAgentMonitor:
         self.statuses_by_key: dict[str, AgentStatus] = {}
         self.metadata_by_session: dict[str, StatusMetadata] = {}
         self.metadata_by_status: dict[str, StatusMetadata] = {}
-        self.pending_permissions_by_key: dict[str, set[str]] = {}
-        # Not persisted with `latest.json`, like `pending_permissions_by_key`: a
+        self.pending_permissions_by_session: dict[str, dict[str, set[str]]] = {}
+        # Not persisted with `latest.json`, like `pending_permissions_by_session`: a
         # restart loses the pairing and a mirror arriving in that gap is recorded
         # session-keyed again. It expires on the parent's next hook either way.
         self.permission_request_keys_by_session: dict[str, dict[str, datetime]] = {}
@@ -426,7 +428,7 @@ class LiveAgentMonitor:
             if status is None:
                 return
 
-            track_pending_permissions(record, self.pending_permissions_by_key)
+            track_pending_permissions(record, self.pending_permissions_by_session)
             track_permission_request_keys(
                 record, self.permission_request_keys_by_session
             )
@@ -438,7 +440,9 @@ class LiveAgentMonitor:
             if should_ignore_status_transition(
                 previous,
                 status,
-                self.pending_permissions_by_key.get(status.agent_id, set()),
+                pending_permission_signatures(
+                    record, self.pending_permissions_by_session
+                ),
             ):
                 return
             self.statuses_by_key[status.agent_id] = status
@@ -1481,25 +1485,88 @@ def status_counts_active(status: AgentStatus) -> bool:
     return status.mode not in {AgentMode.COMPLETED, AgentMode.IDLE_READY}
 
 
+# Events that end a turn for a whole session rather than for one agent within it.
+# ``StopFailure`` is grok's failed counterpart to ``Stop``; leaving it out would let
+# a failed turn keep an open prompt, and the failure's own status would be swallowed
+# so the LED never showed the error.
+SESSION_TURN_END_EVENTS = frozenset(
+    {"Stop", "StopFailure", "SessionEnd", "UserPromptSubmit"}
+)
+
+
 def track_pending_permissions(
     record: HookEvent,
-    pending_permissions_by_key: dict[str, set[str]],
+    pending_permissions_by_session: dict[str, dict[str, set[str]]],
 ) -> None:
+    """Remember which permission prompts on this session are still open.
+
+    Keyed by session first and status key second, because the two ways a prompt
+    stops being open are scoped differently. A ``Post*`` or ``PermissionDenied``
+    answers one prompt on one key. A turn ending -- the human typing again, the
+    session exiting -- cancels every prompt in the session, including the ones a
+    Task child raised: ``HookEvent.status_key`` prefers ``agent_id``, and no
+    turn-end event carries one, so a per-key pop can never reach a child and its
+    prompt would pin that child's status for the life of the process.
+
+    ``SubagentStop`` is the exception that stays per-key. It is the only turn-end
+    event that lands on a child's key, and one child finishing says nothing about
+    a prompt a sibling still holds open.
+    """
+    scope = permission_scope_key(record)
     signature = permission_signature(record)
     if record.event_name == "PermissionRequest" and signature:
-        pending_permissions_by_key.setdefault(record.status_key, set()).add(signature)
+        pending_permissions_by_session.setdefault(scope, {}).setdefault(
+            record.status_key, set()
+        ).add(signature)
         return
 
     if record.event_name in {"PostToolUse", "PostToolUseFailure", "PermissionDenied"} and signature:
-        pending = pending_permissions_by_key.get(record.status_key)
+        pending = pending_permissions_by_session.get(scope, {}).get(record.status_key)
         if pending is not None:
             pending.discard(signature)
             if not pending:
-                pending_permissions_by_key.pop(record.status_key, None)
+                _drop_pending_permission_key(
+                    pending_permissions_by_session, scope, record.status_key
+                )
         return
 
-    if record.event_name in {"Stop", "SessionEnd", "UserPromptSubmit"}:
-        pending_permissions_by_key.pop(record.status_key, None)
+    if record.event_name in SESSION_TURN_END_EVENTS:
+        pending_permissions_by_session.pop(scope, None)
+        return
+
+    if record.event_name == "SubagentStop":
+        _drop_pending_permission_key(
+            pending_permissions_by_session, scope, record.status_key
+        )
+
+
+def pending_permission_signatures(
+    record: HookEvent,
+    pending_permissions_by_session: dict[str, dict[str, set[str]]],
+) -> set[str]:
+    return pending_permissions_by_session.get(permission_scope_key(record), {}).get(
+        record.status_key, set()
+    )
+
+
+def permission_scope_key(record: HookEvent) -> str:
+    """The session a prompt belongs to, or its own key when there is no session."""
+    if record.session_id:
+        return f"{record.provider}:session:{record.session_id}"
+    return record.status_key
+
+
+def _drop_pending_permission_key(
+    pending_permissions_by_session: dict[str, dict[str, set[str]]],
+    scope: str,
+    status_key: str,
+) -> None:
+    keys = pending_permissions_by_session.get(scope)
+    if keys is None:
+        return
+    keys.pop(status_key, None)
+    if not keys:
+        pending_permissions_by_session.pop(scope, None)
 
 
 def permission_signature(record: HookEvent) -> str | None:
@@ -1546,7 +1613,7 @@ def track_permission_request_keys(
     """
     if record.event_name != "PermissionRequest" or not record.session_id:
         return
-    session_key = f"{record.provider}:session:{record.session_id}"
+    session_key = permission_scope_key(record)
     permission_request_keys_by_session.setdefault(session_key, {})[
         record.status_key
     ] = record.logged_at
