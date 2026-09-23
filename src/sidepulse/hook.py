@@ -129,8 +129,9 @@ def normalize_junie_payload(
 
     Junie's Stop, StopFailure, and SessionEnd wire payloads do not include the
     session fields sent with SessionStart/UserPromptSubmit. The Junie process id
-    lets separate CLI instances correlate independently; the most recent Junie
-    context is a fallback for launchers where ancestry cannot be identified.
+    lets separate CLI instances correlate independently. Where ancestry cannot
+    be identified, the context comes from the only session in the recent log,
+    and from none when there are several.
     """
     normalized = dict(payload)
     if process_id is None:
@@ -145,10 +146,15 @@ def normalize_junie_payload(
     if normalized.get("session_id") and normalized.get("cwd"):
         return normalized
 
-    context = latest_junie_hook_context(log_path, active_process_id)
+    context = latest_junie_hook_context(
+        log_path,
+        active_process_id,
+        normalized.get("session_id"),
+    )
     if context is None:
         return normalized
-    for key in ("session_id", "cwd", "project_path"):
+    normalized.setdefault("session_id", context["session_id"])
+    for key in ("cwd", "project_path"):
         if context.get(key) is not None:
             normalized.setdefault(key, context[key])
     return normalized
@@ -183,25 +189,38 @@ def junie_process_context() -> tuple[int | None, dict[str, str] | None]:
 def latest_junie_hook_context(
     log_path: Path,
     process_id: int | None,
+    session_id: str | None = None,
 ) -> dict[str, Any] | None:
+    """The newest logged row that belongs to this event's session, if one is sure.
+
+    A known session matches only its own rows. Without one, the Junie process id
+    decides; when that is unknown or unmatched, a row is borrowed only if the
+    recent log names a single session, so one session's Stop never lands on
+    another.
+    """
     try:
         lines = read_recent_lines(log_path.expanduser(), 200)
     except OSError:
         return None
 
-    fallback = None
+    rows = []
     for line in reversed(lines):
         try:
             row = json.loads(line)
         except (json.JSONDecodeError, TypeError):
             continue
-        if not isinstance(row, dict) or not row.get("session_id"):
-            continue
-        if fallback is None:
-            fallback = row
-        if process_id is not None and row.get("sidepulse_junie_process_id") == process_id:
-            return row
-    return fallback
+        if isinstance(row, dict) and row.get("session_id"):
+            rows.append(row)
+
+    if session_id:
+        return next((row for row in rows if row["session_id"] == session_id), None)
+    if process_id is not None:
+        for row in rows:
+            if row.get("sidepulse_junie_process_id") == process_id:
+                return row
+    if len({row["session_id"] for row in rows}) == 1:
+        return rows[0]
+    return None
 
 
 def hook_log_main(provider: str, log_path: Path, event: str | None = None) -> int:

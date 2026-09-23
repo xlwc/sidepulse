@@ -152,6 +152,70 @@ class JunieProviderTests(unittest.TestCase):
                 "project: fix the test (junie-se)",
             )
 
+    def test_stop_from_an_unknown_process_is_not_credited_to_another_session(self) -> None:
+        normalized = self._normalize_stop(
+            {"hook_event_name": "Stop"},
+            rows=[self._row("a", 111, "/a"), self._row("b", 222, "/b")],
+            process_id=999,
+        )
+
+        self.assertNotIn("session_id", normalized)
+        self.assertNotIn("cwd", normalized)
+
+    def test_stop_from_its_own_process_takes_that_sessions_context(self) -> None:
+        normalized = self._normalize_stop(
+            {"hook_event_name": "Stop"},
+            rows=[self._row("a", 111, "/a"), self._row("b", 222, "/b")],
+            process_id=111,
+        )
+
+        self.assertEqual(normalized["session_id"], "a")
+        self.assertEqual(normalized["cwd"], "/a")
+
+    def test_stop_takes_cwd_only_from_its_own_session(self) -> None:
+        normalized = self._normalize_stop(
+            {"hook_event_name": "Stop", "session_id": "a"},
+            rows=[self._row("a", 111, "/a"), self._row("b", 111, "/b")],
+            process_id=111,
+        )
+
+        self.assertEqual(normalized["session_id"], "a")
+        self.assertEqual(normalized["cwd"], "/a")
+
+    def test_stop_with_a_session_that_never_logged_borrows_no_cwd(self) -> None:
+        normalized = self._normalize_stop(
+            {"hook_event_name": "Stop", "session_id": "a"},
+            rows=[self._row("b", 111, "/b")],
+            process_id=111,
+        )
+
+        self.assertEqual(normalized["session_id"], "a")
+        self.assertNotIn("cwd", normalized)
+
+    def test_stop_from_an_unknown_process_takes_the_only_recent_session(self) -> None:
+        normalized = self._normalize_stop(
+            {"hook_event_name": "Stop"},
+            rows=[self._row("a", 111, "/a"), self._row("a", 111, "/a")],
+            process_id=999,
+        )
+
+        self.assertEqual(normalized["session_id"], "a")
+        self.assertEqual(normalized["cwd"], "/a")
+
+    def _row(self, session_id: str, process_id: int, cwd: str) -> dict:
+        return {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": session_id,
+            "cwd": cwd,
+            "sidepulse_junie_process_id": process_id,
+        }
+
+    def _normalize_stop(self, payload: dict, *, rows: list[dict], process_id: int) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "junie.jsonl"
+            log.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            return normalize_junie_payload(payload, log, process_id=process_id)
+
     def test_cli_accepts_junie_and_custom_log_path(self) -> None:
         args = build_parser().parse_args(
             ["install", "junie", "--junie-log", "/tmp/custom-junie.jsonl"]
