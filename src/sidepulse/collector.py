@@ -1608,9 +1608,8 @@ def _drop_pending_permission_key(
 
 
 def permission_signature(record: HookEvent) -> str | None:
-    raw = record.raw
-    tool_name = _string_or_none(raw.get("tool_name")) or record.tool_name
-    tool_input = raw.get("tool_input")
+    tool_name = _permission_tool_name(record)
+    tool_input = record.raw.get("tool_input")
     if not isinstance(tool_input, dict):
         return None
 
@@ -1645,6 +1644,8 @@ class PermissionRequestMark:
 
     requested_at: datetime
     answered_at: datetime | None = None
+    tool_name: str | None = None
+    signature: str | None = None
 
 
 def track_permission_request_keys(
@@ -1682,16 +1683,24 @@ def track_permission_request_keys(
     if record.event_name == "PermissionRequest":
         permission_request_keys_by_session.setdefault(session_key, {})[
             record.status_key
-        ] = PermissionRequestMark(requested_at=record.logged_at)
+        ] = PermissionRequestMark(
+            requested_at=record.logged_at,
+            tool_name=_permission_tool_name(record),
+            signature=permission_signature(record),
+        )
         _expire_permission_request_keys(
             permission_request_keys_by_session, record.logged_at
         )
         return
 
     if record.event_name in {"PostToolUse", "PostToolUseFailure", "PermissionDenied"}:
-        _mark_permission_request_answered(
-            permission_request_keys_by_session, session_key, record
+        mark = permission_request_keys_by_session.get(session_key, {}).get(
+            record.status_key
         )
+        if mark is not None and _call_answers_request(mark, record):
+            _mark_permission_request_answered(
+                permission_request_keys_by_session, session_key, record
+            )
         return
 
     if record.event_name in SESSION_TURN_END_EVENTS:
@@ -1723,9 +1732,26 @@ def _mark_permission_request_answered(
     mark = keys.get(key)
     if mark is None or mark.answered_at is not None:
         return
-    keys[key] = PermissionRequestMark(
-        requested_at=mark.requested_at, answered_at=record.logged_at
-    )
+    keys[key] = replace(mark, answered_at=record.logged_at)
+
+
+def _permission_tool_name(record: HookEvent) -> str | None:
+    return _string_or_none(record.raw.get("tool_name")) or record.tool_name
+
+
+def _call_answers_request(mark: PermissionRequestMark, record: HookEvent) -> bool:
+    """Whether this finished call can be the one that raised the prompt.
+
+    ``PermissionRequest`` carries no ``tool_use_id``, so this compares what both
+    records do carry. A side that lacks a field matches anything on it: Edit and
+    Write prompts have no ``permission_signature``, and requiring one would leave
+    them open for the full mirror window.
+    """
+    tool_name = _permission_tool_name(record)
+    if mark.tool_name and tool_name and mark.tool_name != tool_name:
+        return False
+    signature = permission_signature(record)
+    return not (mark.signature and signature and mark.signature != signature)
 
 
 def _expire_permission_request_keys(

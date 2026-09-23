@@ -8036,6 +8036,65 @@ class AgentMonitorTests(unittest.TestCase):
                     )
                 )
 
+    def test_a_different_call_finishing_does_not_answer_an_open_child_prompt(
+        self,
+    ) -> None:
+        """Only the call that raised the prompt answers it.
+
+        A child blocked on a Bash prompt can finish a parallel call that needed
+        no prompt, on the same ``agent_id``. Marking the key answered on that
+        cuts the prompt's mirror window from the full minute to the in-flight
+        window while the prompt is still open.
+        """
+        child_id = "a94aab97f06a0367c"
+        other_calls = {
+            "a different tool": {"tool_name": "Read", "tool_input": {"file_path": "/tmp/x"}},
+            "a different command": {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+        }
+        now = datetime.now(timezone.utc)
+        for name, other_call in other_calls.items():
+            with self.subTest(finished=name):
+                event = self._mirror_fixture(now, f"claude-parallel-{name}")
+                keys: dict[str, dict[str, object]] = {}
+                collector_module.track_permission_request_keys(
+                    event(
+                        0,
+                        {
+                            "hook_event_name": "PermissionRequest",
+                            "agent_id": child_id,
+                            "tool_name": "Bash",
+                            "tool_input": {"command": "pytest -q"},
+                        },
+                    ),
+                    keys,
+                )
+                collector_module.track_permission_request_keys(
+                    event(
+                        1,
+                        {
+                            "hook_event_name": "PostToolUse",
+                            "agent_id": child_id,
+                            "tool_response": {"stdout": "ok"},
+                            **other_call,
+                        },
+                    ),
+                    keys,
+                )
+                late_mirror = event(
+                    20,
+                    {
+                        "hook_event_name": "Notification",
+                        "message": "Claude needs your permission",
+                        "notification_type": "permission_prompt",
+                    },
+                )
+
+                self.assertTrue(
+                    collector_module.notification_mirrors_another_agents_permission(
+                        late_mirror, AgentMode.WAITING_FOR_INPUT, keys
+                    )
+                )
+
     def test_the_live_monitor_shows_a_parent_prompt_after_a_child_prompt_is_answered(
         self,
     ) -> None:
