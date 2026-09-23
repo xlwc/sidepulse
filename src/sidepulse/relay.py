@@ -5,6 +5,7 @@ import hashlib
 import os
 import secrets
 import socket
+import stat
 import threading
 import urllib.error
 import urllib.parse
@@ -29,6 +30,7 @@ from .settings import default_config_dir
 RELAY_CONFIG_VERSION = 1
 RELAY_MESSAGE_VERSION = 1
 RELAY_CHANNEL_BYTES = 16
+SHORT_SOCKET_BASE = Path("/tmp")
 
 
 @dataclass(frozen=True)
@@ -52,19 +54,58 @@ def default_relay_config_path() -> Path:
 
 
 def default_relay_event_socket_path() -> Path:
-    return relay_socket_path_for_state_dir(default_state_dir())
+    path = relay_socket_path_for_state_dir(default_state_dir())
+    if path is None:
+        raise LinkError(
+            f"{SHORT_SOCKET_BASE / f'sidepulse-{os.getuid()}'} must be a directory "
+            "that only this user owns and can open; remove it and restart the service."
+        )
+    return path
 
 
 def candidate_relay_event_socket_paths() -> tuple[Path, ...]:
-    return tuple(relay_socket_path_for_state_dir(path) for path in candidate_state_dirs())
+    paths = (relay_socket_path_for_state_dir(path) for path in candidate_state_dirs())
+    return tuple(path for path in paths if path is not None)
 
 
-def relay_socket_path_for_state_dir(state_dir: Path) -> Path:
+def relay_socket_path_for_state_dir(state_dir: Path) -> Path | None:
+    """The relay socket for a state dir, or None when no private place exists.
+
+    AF_UNIX paths stop working past about 100 bytes, so a long state dir moves the
+    socket to a short per-user directory. That directory sits in the shared
+    ``SHORT_SOCKET_BASE``, where another user can create the name first and would
+    then receive every hook payload; it is used only when this user owns it and
+    nobody else can open it.
+    """
     path = state_dir / "relay-events.sock"
     if len(str(path).encode("utf-8")) <= 96:
         return path
+    directory = private_short_socket_dir()
+    if directory is None:
+        return None
     digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
-    return Path("/tmp") / f"sidepulse-relay-{os.getuid()}-{digest}.sock"
+    return directory / f"relay-{digest}.sock"
+
+
+def private_short_socket_dir() -> Path | None:
+    directory = SHORT_SOCKET_BASE / f"sidepulse-{os.getuid()}"
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return None
+    try:
+        info = directory.lstat()
+    except OSError:
+        return None
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o077
+    ):
+        return None
+    return directory
 
 
 def new_relay_channel() -> str:

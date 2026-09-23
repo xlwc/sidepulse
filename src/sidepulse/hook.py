@@ -241,16 +241,19 @@ def hook_log_main(provider: str, log_path: Path, event: str | None = None) -> in
             pass
         try:
             if not hook_event_socket_disabled():
-                send_hook_event(actual_provider, line)
-                from .relay import candidate_relay_event_socket_paths
+                ui_took_event = send_hook_event(actual_provider, line)
+                from .relay import candidate_relay_event_socket_paths, load_relay_config
 
-                for relay_socket in candidate_relay_event_socket_paths():
-                    if send_hook_event(
-                        actual_provider,
-                        line,
-                        socket_path=relay_socket,
-                    ):
-                        break
+                # The background service needs the event only to publish it, or to
+                # drive the LEDs itself when no menu-bar app is listening.
+                if not ui_took_event or load_relay_config().publishes_events:
+                    for relay_socket in candidate_relay_event_socket_paths():
+                        if send_hook_event(
+                            actual_provider,
+                            line,
+                            socket_path=relay_socket,
+                        ):
+                            break
         except Exception:
             pass
     except Exception:

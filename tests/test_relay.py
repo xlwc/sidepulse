@@ -137,10 +137,35 @@ class RelayConfigTests(unittest.TestCase):
             {"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")},
         )
 
-    def test_long_state_paths_use_a_short_socket_path(self) -> None:
-        path = relay_socket_path_for_state_dir(Path("/tmp") / ("very-long/" * 20))
-        self.assertEqual(path.parent, Path("/tmp"))
-        self.assertLessEqual(len(str(path).encode("utf-8")), 96)
+    def test_long_state_paths_use_a_private_short_socket_dir(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as base:
+            with patch("sidepulse.relay.SHORT_SOCKET_BASE", Path(base)):
+                path = relay_socket_path_for_state_dir(Path(base) / ("very-long/" * 20))
+
+            self.assertIsNotNone(path)
+            self.assertEqual(path.parent, Path(base) / f"sidepulse-{os.getuid()}")
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+            self.assertLessEqual(len(str(path).encode("utf-8")), 96)
+
+    def test_a_short_socket_dir_others_can_write_is_never_used(self) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            shared = Path(base) / f"sidepulse-{os.getuid()}"
+            shared.mkdir()
+            shared.chmod(0o777)
+            with patch("sidepulse.relay.SHORT_SOCKET_BASE", Path(base)):
+                path = relay_socket_path_for_state_dir(Path(base) / ("very-long/" * 20))
+
+        self.assertIsNone(path)
+
+    def test_a_symlinked_short_socket_dir_is_never_used(self) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            target = Path(base) / "elsewhere"
+            target.mkdir(mode=0o700)
+            (Path(base) / f"sidepulse-{os.getuid()}").symlink_to(target)
+            with patch("sidepulse.relay.SHORT_SOCKET_BASE", Path(base)):
+                path = relay_socket_path_for_state_dir(Path(base) / ("very-long/" * 20))
+
+        self.assertIsNone(path)
 
 
 class RelayTransportTests(unittest.TestCase):
@@ -266,24 +291,51 @@ class RelayTransportTests(unittest.TestCase):
         received_provider, received_line, _event_id = parsed
         return parse_log_line(received_provider, json.dumps(received_line))
 
-    def test_hook_notifies_ui_and_background_service_sockets(self) -> None:
+    def test_hook_hands_events_to_the_service_when_this_computer_publishes(self) -> None:
+        sends = self._hook_socket_sends(ui_accepts=True, publishes=True)
+
+        self.assertEqual(sends, [None, self.relay_socket])
+
+    def test_hook_hands_events_to_the_service_when_no_ui_took_them(self) -> None:
+        sends = self._hook_socket_sends(ui_accepts=False, publishes=False)
+
+        self.assertEqual(sends, [None, self.relay_socket])
+
+    def test_hook_keeps_events_from_the_service_when_the_ui_took_them_and_nothing_publishes(
+        self,
+    ) -> None:
+        sends = self._hook_socket_sends(ui_accepts=True, publishes=False)
+
+        self.assertEqual(sends, [None])
+
+    relay_socket = Path("/nonexistent/relay.sock")
+
+    def _hook_socket_sends(self, *, ui_accepts: bool, publishes: bool) -> list[Path | None]:
+        sends: list[Path | None] = []
+
+        def send(_provider, _line, *, socket_path=None):
+            sends.append(socket_path)
+            return ui_accepts if socket_path is None else True
+
+        config = RelayConfig(
+            server="https://bridge.sidepulse.io",
+            outbound_channel="a" * 22 if publishes else "",
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            relay_socket = Path(tmp) / "relay.sock"
-            log = Path(tmp) / "claude.jsonl"
             with (
                 patch("sys.stdin", io.StringIO('{"hook_event_name":"Stop"}')),
                 patch("sidepulse.hook.hook_event_socket_disabled", return_value=False),
-                patch("sidepulse.hook.send_hook_event", return_value=True) as send,
+                patch("sidepulse.hook.send_hook_event", side_effect=send),
+                patch("sidepulse.relay.load_relay_config", return_value=config),
                 patch(
                     "sidepulse.relay.candidate_relay_event_socket_paths",
-                    return_value=(relay_socket,),
+                    return_value=(self.relay_socket,),
                 ),
             ):
-                result = hook_log_main("claude", log)
+                result = hook_log_main("claude", Path(tmp) / "claude.jsonl")
 
         self.assertEqual(result, 0)
-        self.assertEqual(send.call_count, 2)
-        self.assertEqual(send.call_args_list[1].kwargs["socket_path"], relay_socket)
+        return sends
 
 
 class SidePulseServiceTests(unittest.TestCase):
