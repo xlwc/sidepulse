@@ -16,6 +16,7 @@ call. The contract is therefore narrow and absolute:
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -327,6 +328,69 @@ class LogHygieneTests(HookIsolationMixin, unittest.TestCase):
         self.assertGreater(len(chunks), 2, "os.write was not exercised short")
         lines = path.read_text(encoding="utf-8").splitlines()
         self.assertEqual([{"index": 0}, {"index": 1}], [json.loads(x) for x in lines])
+
+    def test_a_failed_write_damages_only_the_record_it_was_writing(self):
+        """ENOSPC part-way through must not take the next record with it.
+
+        Without a trailing newline the next append shares that physical line and
+        ``parse_log_line`` drops both records. The hook still exits 0, so the
+        loss is silent. Bounding it to the truncated record is what keeps the
+        rest of the log parseable.
+        """
+        path = self.home / "enospc.jsonl"
+        jsonl_log.append_jsonl_line(path, {"index": 0})
+
+        real_write = os.write
+        state = {"calls": 0}
+
+        def fail_after_a_partial_write(fd: int, data: bytes) -> int:
+            state["calls"] += 1
+            if state["calls"] == 1:
+                return real_write(fd, data[:8])
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with patch.object(jsonl_log.os, "write", side_effect=fail_after_a_partial_write):
+            with self.assertRaises(OSError):
+                jsonl_log.append_jsonl_line(path, {"index": 1})
+
+        jsonl_log.append_jsonl_line(path, {"index": 2})
+
+        parsed = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                parsed.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        self.assertIn({"index": 0}, parsed)
+        self.assertIn({"index": 2}, parsed)
+
+    def test_a_zero_return_write_damages_only_the_record_it_was_writing(self):
+        """The ``count <= 0`` exit leaves the same partial record as a raise."""
+        path = self.home / "zero-write.jsonl"
+        jsonl_log.append_jsonl_line(path, {"index": 0})
+
+        real_write = os.write
+        state = {"calls": 0}
+
+        def stall_after_a_partial_write(fd: int, data: bytes) -> int:
+            state["calls"] += 1
+            if state["calls"] == 1:
+                return real_write(fd, data[:8])
+            return 0
+
+        with patch.object(jsonl_log.os, "write", side_effect=stall_after_a_partial_write):
+            jsonl_log.append_jsonl_line(path, {"index": 1})
+
+        jsonl_log.append_jsonl_line(path, {"index": 2})
+
+        parsed = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                parsed.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        self.assertIn({"index": 0}, parsed)
+        self.assertIn({"index": 2}, parsed)
 
     def test_zero_backups_discards_instead_of_growing_unbounded(self):
         """A log whose reader ignores backups asks for no backups.

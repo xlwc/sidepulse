@@ -132,17 +132,26 @@ def append_jsonl_line(
     # O_APPEND puts the file offset at EOF for each write(2), so two appenders
     # never overwrite each other. It does not make a record atomic: the loop
     # below can take several write(2) calls, and another process can append
-    # between two of them. The mode argument applies only when this call creates
+    # between two of them. O_RDWR rather than O_WRONLY so the repair below can
+    # pread the last byte. The mode argument applies only when this call creates
     # the file, hence the chmod.
     data = payload.encode("utf-8")
-    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, FILE_MODE)
+    handle = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, FILE_MODE)
     try:
+        # Repair before appending, not after failing. A write that dies part-way
+        # through -- ENOSPC, EDQUOT, EIO, a return of 0, or the process being
+        # killed -- leaves a record with no trailing newline, and the next append
+        # would share that physical line so `parse_log_line` drops both records.
+        # Terminating the partial record at failure time cannot work for the
+        # commonest cause: on a full volume the terminating write fails too.
+        # Closing the line here does, because this append is the next write that
+        # can succeed, and a record written after it lands on its own line. Two
+        # appenders racing here write two newlines, which costs one blank line
+        # and no record.
+        _close_dangling_line(handle)
         # os.write is one write(2) and may return short, so keep writing until
         # the payload is out. This covers a short write followed by a successful
-        # one. It does not cover a write that fails part-way through -- ENOSPC,
-        # EDQUOT, EIO, or a return of 0 -- which leaves a partial record with no
-        # trailing newline, so the next append shares that physical line and both
-        # records become unparseable.
+        # one; the record being written when the volume fills is still lost.
         written = 0
         while written < len(data):
             count = os.write(handle, data[written:])
@@ -152,3 +161,19 @@ def append_jsonl_line(
     finally:
         os.close(handle)
     secure_path_mode(path, FILE_MODE)
+
+
+def _close_dangling_line(handle: int) -> None:
+    """Terminate a truncated record left by an earlier append, if there is one.
+
+    Silent on every error: this is hygiene on a path whose caller is a hook that
+    must exit 0, and a log that cannot be read is not worth failing an agent
+    session over.
+    """
+    try:
+        size = os.fstat(handle).st_size
+        if size <= 0 or os.pread(handle, 1, size - 1) == b"\n":
+            return
+        os.write(handle, b"\n")
+    except OSError:
+        pass
