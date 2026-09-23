@@ -4360,7 +4360,7 @@ def menu_statuses(snapshot, settings=None) -> tuple[AgentStatus, ...]:
     )
     statuses.extend(
         status
-        for status in getattr(snapshot, "stale_statuses", ())
+        for status in snapshot.stale_statuses
         if status.mode == AgentMode.COMPLETED
         and status.age_seconds(now) <= retention_seconds
     )

@@ -1857,6 +1857,7 @@ class AgentMonitorTests(unittest.TestCase):
         )
         snapshot = SimpleNamespace(
             statuses=[],
+            stale_statuses=(),
             collected_at=datetime.now(timezone.utc),
         )
         target = SimpleNamespace(
@@ -2199,6 +2200,7 @@ class AgentMonitorTests(unittest.TestCase):
 
         snapshot = SimpleNamespace(
             statuses=[],
+            stale_statuses=(),
             collected_at=datetime.now(timezone.utc),
         )
         target = SimpleNamespace(
