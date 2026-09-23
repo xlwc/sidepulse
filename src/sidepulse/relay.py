@@ -21,7 +21,8 @@ from .links import (
     iter_sse_messages,
     normalize_server,
 )
-from .providers import HOOK_PROVIDERS, candidate_state_dirs, default_state_dir
+from .collector import mode_for_event
+from .providers import HOOK_PROVIDERS, candidate_state_dirs, default_state_dir, parse_log_line
 from .settings import default_config_dir
 
 
@@ -155,6 +156,43 @@ def clean_channel(value: object, *, required: bool = False) -> str:
     return channel
 
 
+def relay_event_line(provider: str, line: dict) -> tuple[str, dict] | None:
+    """Reduce a hook line to identity and status, so no content leaves this machine.
+
+    The bridge operator, and anyone holding the channel, can read what is posted.
+    The status comes from this side's own ``mode_for_event`` and travels as the
+    explicit ``sidepulse_status`` the receiver already honours, because the prompt,
+    tool and assistant text that decide it never leave. Commands go as a digest:
+    the receiver only compares them to pair a permission prompt with its answer.
+    """
+    record = parse_log_line(provider, json.dumps(line, ensure_ascii=False))
+    if record is None:
+        return None
+    reduced: dict[str, object] = {
+        "hook_event_name": record.event_name,
+        "logged_at": record.logged_at.isoformat(),
+    }
+    for key, value in (
+        ("session_id", record.session_id),
+        ("turn_id", record.turn_id),
+        ("agent_id", record.agent_id),
+        ("cwd", record.cwd),
+        ("tool_name", record.tool_name),
+        ("agent_origin", record.origin),
+    ):
+        if value:
+            reduced[key] = value
+    mode = mode_for_event(record)
+    if mode is not None:
+        reduced["sidepulse_status"] = mode.value
+    tool_input = record.raw.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if isinstance(command, str) and command:
+        digest = hashlib.sha256(command.encode("utf-8")).hexdigest()
+        reduced["tool_input"] = {"command": f"sha256:{digest}"}
+    return record.provider, reduced
+
+
 def relay_event_message(provider: str, line: dict) -> dict[str, object]:
     return {
         "v": RELAY_MESSAGE_VERSION,
@@ -215,8 +253,11 @@ def annotate_remote_line(provider: str, line: dict, source_name: str) -> dict:
 def publish_relay_event(config: RelayConfig, provider: str, line: dict) -> None:
     if not config.outbound_channel:
         return
+    reduced = relay_event_line(provider, line)
+    if reduced is None:
+        return
     body = json.dumps(
-        relay_event_message(provider, line),
+        relay_event_message(*reduced),
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")

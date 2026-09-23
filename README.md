@@ -174,6 +174,12 @@ the remote events alongside its local agent history and updates its connected
 SidePulse hardware or linked iPhone. The VM is an event source, so it does not
 appear in the Devices menu.
 
+The VM sends status, not content. Each relayed event carries the event name,
+time, session and agent identity, working directory, tool name, origin label,
+and the status the VM derived. Prompts, tool input and output, and assistant
+messages stay on the VM. A shell command goes only as its SHA-256 digest, so the
+Mac can pair a permission prompt with its answer.
+
 The channel is a 128-bit capability token: possession grants access, so treat
 the command like a password. There is no separate one-time code. Check the
 service on either computer with:

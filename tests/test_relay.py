@@ -11,9 +11,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sidepulse.cli import sidepulse_main
+from sidepulse.collector import mode_for_event, permission_signature
 from sidepulse.device_writer import DeviceCandidate
 from sidepulse.hook import hook_log_main
 from sidepulse.models import AgentMode
+from sidepulse.providers import parse_log_line
 from sidepulse.relay import (
     RelayConfig,
     configure_outbound_channel,
@@ -111,7 +113,11 @@ class RelayTransportTests(unittest.TestCase):
             outbound_channel="a" * 22,
         )
         with patch("sidepulse.relay.urllib.request.urlopen", return_value=response) as open_url:
-            publish_relay_event(config, "codex", {"event": {"type": "task_complete"}})
+            publish_relay_event(
+                config,
+                "codex",
+                {"logged_at": "2026-09-23T12:00:00Z", "event": {"hook_event_name": "Stop"}},
+            )
 
         request = open_url.call_args.args[0]
         self.assertEqual(
@@ -119,6 +125,89 @@ class RelayTransportTests(unittest.TestCase):
             f"https://bridge.sidepulse.io/api/leds/{'a' * 22}",
         )
         self.assertEqual(json.loads(request.data)["type"], "agent_event")
+
+    def test_publish_sends_no_prompt_tool_or_assistant_text(self) -> None:
+        lines = [
+            {"hook_event_name": "UserPromptSubmit", "session_id": "s", "prompt": "SECRET prompt"},
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "s",
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/SECRET/path", "content": "SECRET body"},
+            },
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "s",
+                "tool_name": "Bash",
+                "tool_input": {"command": "cat SECRET"},
+                "tool_response": {"stdout": "SECRET output"},
+            },
+            {
+                "hook_event_name": "Stop",
+                "session_id": "s",
+                "last_assistant_message": "The SECRET is ready. Should I deploy it?",
+            },
+        ]
+        for line in lines:
+            with self.subTest(event=line["hook_event_name"]):
+                body = self._published_body("claude", line)
+                self.assertNotIn("SECRET", body)
+
+    def test_relayed_event_keeps_the_status_the_sender_derived(self) -> None:
+        line = {
+            "hook_event_name": "Stop",
+            "session_id": "s",
+            "last_assistant_message": "Which region should I deploy to?",
+        }
+
+        record = self._received_record("claude", line)
+
+        self.assertEqual(mode_for_event(record), AgentMode.WAITING_FOR_INPUT)
+        self.assertEqual(record.session_id, "s")
+
+    def test_relayed_commands_still_pair_a_prompt_with_its_answer(self) -> None:
+        request = {
+            "hook_event_name": "PermissionRequest",
+            "session_id": "s",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf build"},
+        }
+        answer = dict(request, hook_event_name="PostToolUse")
+        other = dict(answer, tool_input={"command": "rm -rf dist"})
+
+        request_signature = permission_signature(self._received_record("claude", request))
+
+        self.assertIsNotNone(request_signature)
+        self.assertNotIn("rm -rf", request_signature)
+        self.assertEqual(
+            request_signature,
+            permission_signature(self._received_record("claude", answer)),
+        )
+        self.assertNotEqual(
+            request_signature,
+            permission_signature(self._received_record("claude", other)),
+        )
+
+    def test_line_without_an_event_name_is_not_published(self) -> None:
+        config = RelayConfig(server="https://bridge.sidepulse.io", outbound_channel="a" * 22)
+        with patch("sidepulse.relay.urllib.request.urlopen") as open_url:
+            publish_relay_event(config, "claude", {"prompt": "SECRET"})
+
+        open_url.assert_not_called()
+
+    def _published_body(self, provider: str, line: dict) -> str:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        config = RelayConfig(server="https://bridge.sidepulse.io", outbound_channel="a" * 22)
+        with patch("sidepulse.relay.urllib.request.urlopen", return_value=response) as open_url:
+            publish_relay_event(config, provider, dict(line, logged_at="2026-09-23T12:00:00Z"))
+        return open_url.call_args.args[0].data.decode("utf-8")
+
+    def _received_record(self, provider: str, line: dict):
+        parsed = parse_relay_event(self._published_body(provider, line))
+        self.assertIsNotNone(parsed)
+        received_provider, received_line, _event_id = parsed
+        return parse_log_line(received_provider, json.dumps(received_line))
 
     def test_hook_notifies_ui_and_background_service_sockets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
