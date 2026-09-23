@@ -11,7 +11,8 @@ but ``pyproject.toml``, and then exercise the result. A dependency that is not
 declared is simply absent, so the failure is real rather than theoretical.
 
 The same tests double as a post-publish smoke test. Set
-``SIDEPULSE_INSTALL_SPEC`` to a requirement string (``sidepulse==0.1.0``) and
+``SIDEPULSE_INSTALL_SPEC`` to a requirement string
+(``sidepulse==1.20260901.67530``) and
 they install that from PyPI instead of the local tree, which checks the
 artifact users actually download rather than the one built here.
 
@@ -24,7 +25,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -64,15 +64,13 @@ def is_local_install() -> bool:
 def expected_version() -> str:
     """The version the install is expected to report.
 
-    Taken from the requirement pin when smoke-testing a release, otherwise
-    from the source tree being installed.
+    Taken from the requirement pin when smoke-testing a release. Local builds
+    use a tag-derived development version, so only internal agreement matters.
     """
     spec = os.environ.get("SIDEPULSE_INSTALL_SPEC")
     if spec and "==" in spec:
         return spec.split("==", 1)[1].strip()
-    text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
-    return match.group(1) if match else ""
+    return ""
 
 
 @unittest.skipIf(
@@ -202,11 +200,13 @@ class CleanInstallTests(unittest.TestCase):
         )
         self.assertEqual(0, result.returncode, result.stderr)
         metadata_version, dunder_version = result.stdout.split()
-        self.assertEqual(
-            expected_version(),
-            metadata_version,
-            f"installed {self.install_spec} reports version {metadata_version}",
-        )
+        expected = expected_version()
+        if expected:
+            self.assertEqual(
+                expected,
+                metadata_version,
+                f"installed {self.install_spec} reports version {metadata_version}",
+            )
         self.assertEqual(
             metadata_version,
             dunder_version,
@@ -281,6 +281,13 @@ class CleanInstallTests(unittest.TestCase):
                 self.assertIn(result.returncode, (0, 2), result.stderr)
                 self.assertNotIn(DEPENDENCY_ERROR_MARKER, result.stderr)
 
+    @unittest.skipIf(sys.platform == "darwin", "Linux CLI-only setup check")
+    def test_setup_completes_without_macos_services(self):
+        result = self.run_script("sidepulse", ["setup", "--dry-run"])
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("CLI-only setup", result.stdout)
+        self.assertIn("linked phones and mounted SidePulse devices", result.stdout)
+
     def test_packaged_resources_are_installed(self):
         """Package data declared in pyproject must survive the wheel build."""
         result = self.run_python(
@@ -298,6 +305,7 @@ class CleanInstallTests(unittest.TestCase):
             for p in (REPO_ROOT / "src/sidepulse/resources").rglob("*")
             if p.is_file()
             and p.suffix != ".py"
+            and not p.name.startswith(".")
             and "__pycache__" not in p.parts
         }
         self.assertTrue(source_resources, "expected packaged resource files")

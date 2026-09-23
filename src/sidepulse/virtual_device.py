@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 import time
 
 import objc
@@ -24,7 +25,7 @@ from .led_wasm import LedWasmUnavailableError, SdLedWasmController
 
 
 VIRTUAL_DEVICE_ID = "virtual:status-bar"
-VIRTUAL_DEVICE_NAME = "Screen Bar"
+VIRTUAL_DEVICE_NAME = "SidePulse Notch"
 LED_COUNT = 8
 WINDOW_WIDTH = 220.0
 FALLBACK_NOTCH_DEPTH = 32.0
@@ -32,13 +33,15 @@ LED_BAND_HEIGHT = 5.0
 WINDOW_HEIGHT = FALLBACK_NOTCH_DEPTH + LED_BAND_HEIGHT
 NOTCH_BOTTOM_RADIUS = 8.0
 LED_BLEND_RADIUS_LEDS = 1.5
-BLEND_COLUMN_WIDTH = 2.0
+BLEND_COLUMN_WIDTH = 4.0
 LED_GLOW_HEIGHT = 11.0
 LED_CORE_BOOST = 1.22
 LED_HOTLINE_BOOST = 1.46
 LED_GAMMA = 0.86
 FRAME_RATE = 60.0
 FRAME_INTERVAL = 1.0 / FRAME_RATE
+IDLE_FRAME_RATE = 12.0
+IDLE_FRAME_INTERVAL = 1.0 / IDLE_FRAME_RATE
 
 
 def monotonic_ms() -> int:
@@ -221,6 +224,21 @@ def current_cg_context():
             return None
 
 
+def compact_preview_program(program: str) -> str:
+    """Loop one-shot programs in compact previews without changing the source."""
+    source = str(program)
+    if any(line.strip().casefold() == "repeat" for line in source.splitlines()):
+        return source
+    colors = re.findall(r"#[0-9a-fA-F]{6}", source)
+    if len(colors) >= 2 and all(color.casefold() == "#000000" for color in colors):
+        # A shutdown transition depends on the physical LEDs' current pixels.
+        # Seed compact previews with the working cyan so the outside-in fade is
+        # visible without adding a color command to the real device program.
+        source = f"#00E5FF\n{source}"
+    stripped = source.rstrip()
+    return f"{stripped}\nrepeat" if stripped else "repeat"
+
+
 class VirtualLedView(NSView):
     def initWithFrame_(self, frame):
         self = objc.super(VirtualLedView, self).initWithFrame_(frame)
@@ -230,13 +248,26 @@ class VirtualLedView(NSView):
             self.started_at = time.monotonic()
             self.fixed_colors = None
             self.current_program = None
+            self.rendered_program = None
             self.wasm_controller = None
             self.wasm_error = None
             self.has_notch = True
+            self.compact_preview = False
         return self
 
     def setHasNotch_(self, has_notch):
         self.has_notch = bool(has_notch)
+        self.setNeedsDisplay_(True)
+
+    def setCompactPreview_(self, compact_preview):
+        compact_preview = bool(compact_preview)
+        if compact_preview != self.compact_preview and self.current_program is not None:
+            current_program = self.current_program
+            self.current_program = None
+            self.compact_preview = compact_preview
+            self.setProgram_(current_program)
+            return
+        self.compact_preview = compact_preview
         self.setNeedsDisplay_(True)
 
     def setState_brightness_(self, state, brightness):
@@ -254,21 +285,33 @@ class VirtualLedView(NSView):
         )
 
     def setProgram_(self, program):
-        if program == self.current_program:
+        source_program = str(program)
+        rendered_program = (
+            compact_preview_program(source_program)
+            if self.compact_preview
+            else source_program
+        )
+        if (
+            source_program == self.current_program
+            and rendered_program == self.rendered_program
+        ):
             self.setNeedsDisplay_(True)
             return
-        self.current_program = str(program)
+        self.current_program = source_program
+        self.rendered_program = rendered_program
         self.fixed_colors = None
         self.started_at = time.monotonic()
         if self._ensure_wasm_controller():
             try:
-                self.wasm_controller.parse(self.current_program, monotonic_ms())
+                self.wasm_controller.parse(self.rendered_program, monotonic_ms())
+                self.wasm_error = None
             except Exception as exc:
                 self.wasm_error = str(exc)
         self.setNeedsDisplay_(True)
 
     def setBatteryPercent_brightness_(self, percent, brightness):
         self.current_program = None
+        self.rendered_program = None
         scale = normalize_brightness(brightness) / 255.0
         filled = max(0.0, min(8.0, float(percent) * 8.0 / 100.0))
         colors = []
@@ -321,6 +364,65 @@ class VirtualLedView(NSView):
         colors = self._colors_for_draw()
         width = self.bounds().size.width
         height = self.bounds().size.height
+
+        if self.compact_preview:
+            pill_height = min(12.0, max(4.0, height - 4.0))
+            pill_y = (height - pill_height) / 2.0
+            pill_rect = ((0.0, pill_y), (width, pill_height))
+            pill = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                pill_rect,
+                pill_height / 2.0,
+                pill_height / 2.0,
+            )
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                0.006, 0.007, 0.010, 0.94
+            ).set()
+            pill.fill()
+
+            NSGraphicsContext.saveGraphicsState()
+            pill.addClip()
+            cg_context = current_cg_context()
+            led_width = width / LED_COUNT
+            column_x = 0.0
+            while column_x < width:
+                column_width = min(BLEND_COLUMN_WIDTH, width - column_x)
+                sample_x = column_x + column_width / 2.0
+                red, green, blue, alpha = blended_led_color_at_x(
+                    colors,
+                    sample_x,
+                    led_width,
+                )
+                fill_rect_with_cg(
+                    cg_context,
+                    ((column_x, pill_y), (column_width, pill_height)),
+                    tone_mapped_led_color(
+                        red,
+                        green,
+                        blue,
+                        alpha,
+                        boost=LED_CORE_BOOST,
+                        alpha_scale=0.88,
+                    ),
+                )
+                fill_rect_with_cg(
+                    cg_context,
+                    (
+                        (column_x, pill_y + pill_height * 0.38),
+                        (column_width, pill_height * 0.24),
+                    ),
+                    tone_mapped_led_color(
+                        red,
+                        green,
+                        blue,
+                        alpha,
+                        boost=LED_HOTLINE_BOOST,
+                        alpha_scale=0.54,
+                    ),
+                )
+                column_x += column_width
+            NSGraphicsContext.restoreGraphicsState()
+            return
+
         body = notch_bar_path(((0.0, 0.0), (width, height)))
 
         # A MacBook gets the black camera-housing continuation. On a notchless
@@ -402,6 +504,7 @@ class VirtualStatusDevice(NSObject):
             self.window = None
             self.view = None
             self.timer = None
+            self.frame_interval = None
         return self
 
     def show(self):
@@ -409,29 +512,46 @@ class VirtualStatusDevice(NSObject):
             self._build_window()
         self.reposition()
         self.window.orderFrontRegardless()
-        if self.timer is None:
-            self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                FRAME_INTERVAL, self, "redraw:", None, True
-            )
 
     def hide(self):
-        if self.timer is not None:
-            self.timer.invalidate()
-            self.timer = None
+        self._stop_timer()
         if self.window is not None:
             self.window.orderOut_(None)
 
     def set_state(self, state: LedDisplayState, brightness: int | float):
         self.show()
         self.view.setState_brightness_(state, brightness)
+        if state in {LedDisplayState.WORKING, LedDisplayState.ASK}:
+            self._ensure_timer(FRAME_INTERVAL)
+        elif state == LedDisplayState.IDLE:
+            self._ensure_timer(IDLE_FRAME_INTERVAL)
+        else:
+            self._stop_timer()
 
     def set_battery(self, percent: int, brightness: int | float):
         self.show()
         self.view.setBatteryPercent_brightness_(percent, brightness)
+        self._stop_timer()
 
     def set_program(self, program: str):
         self.show()
         self.view.setProgram_(program)
+        self._ensure_timer(FRAME_INTERVAL)
+
+    def _ensure_timer(self, interval: float):
+        if self.timer is not None and self.frame_interval == interval:
+            return
+        self._stop_timer()
+        self.frame_interval = interval
+        self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            interval, self, "redraw:", None, True
+        )
+
+    def _stop_timer(self):
+        if self.timer is not None:
+            self.timer.invalidate()
+            self.timer = None
+        self.frame_interval = None
 
     def reposition(self):
         screen = NSScreen.mainScreen()

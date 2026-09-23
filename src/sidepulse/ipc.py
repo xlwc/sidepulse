@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-from .providers import default_state_dir
+from .providers import candidate_state_dirs, default_state_dir
 
 
 MAX_EVENT_BYTES = 1024 * 1024
@@ -17,8 +17,30 @@ def default_event_socket_path() -> Path:
     return default_state_dir() / "events.sock"
 
 
+def candidate_event_socket_paths() -> tuple[Path, ...]:
+    """Socket paths a listening app may have bound, most likely first."""
+    return tuple(directory / "events.sock" for directory in candidate_state_dirs())
+
+
 def default_latest_state_path() -> Path:
     return default_state_dir() / "latest.json"
+
+
+def request_settings_window(*, socket_path: Path | None = None) -> bool:
+    """Ask a running UI to open settings, requiring an acknowledgement."""
+    targets = (socket_path,) if socket_path is not None else candidate_event_socket_paths()
+    for target in targets:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(0.5)
+            try:
+                client.connect(str(target.expanduser()))
+                client.sendall(b'{"command":"open-settings"}')
+                client.shutdown(socket.SHUT_WR)
+                if client.recv(2) == b"ok":
+                    return True
+            except OSError:
+                continue
+    return False
 
 
 def send_hook_event(
@@ -28,7 +50,6 @@ def send_hook_event(
     socket_path: Path | None = None,
     timeout: float = HOOK_EVENT_SEND_TIMEOUT_SECONDS,
 ) -> bool:
-    target = (socket_path or default_event_socket_path()).expanduser()
     payload = json.dumps(
         {"provider": provider, "line": line},
         separators=(",", ":"),
@@ -37,6 +58,17 @@ def send_hook_event(
     if len(payload) > MAX_EVENT_BYTES:
         return False
 
+    if socket_path is not None:
+        return _send_payload(socket_path.expanduser(), payload, timeout)
+
+    # The caller and the app can resolve different state dirs, so try each candidate.
+    for target in candidate_event_socket_paths():
+        if _send_payload(target.expanduser(), payload, timeout):
+            return True
+    return False
+
+
+def _send_payload(target: Path, payload: bytes, timeout: float) -> bool:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(timeout)
     try:
@@ -55,8 +87,10 @@ class HookEventServer:
         on_event: Callable[[str, dict], None],
         *,
         socket_path: Path | None = None,
+        on_open_settings: Callable[[], None] | None = None,
     ) -> None:
         self.on_event = on_event
+        self.on_open_settings = on_open_settings
         self.socket_path = (socket_path or default_event_socket_path()).expanduser()
         self.socket: socket.socket | None = None
         self.thread: threading.Thread | None = None
@@ -131,6 +165,14 @@ class HookEventServer:
             return
 
         if not isinstance(message, dict):
+            return
+        if message.get("command") == "open-settings":
+            if self.on_open_settings is not None:
+                self.on_open_settings()
+                try:
+                    connection.sendall(b"ok")
+                except OSError:
+                    pass
             return
         provider = message.get("provider")
         line = message.get("line")

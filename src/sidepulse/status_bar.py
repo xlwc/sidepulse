@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import math
 import shlex
+import socket
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 try:
@@ -15,6 +18,11 @@ try:
         NSApp,
         NSApplication,
         NSApplicationActivationPolicyAccessory,
+        NSAppearanceNameAqua,
+        NSAppearanceNameDarkAqua,
+        NSAlert,
+        NSAlertFirstButtonReturn,
+        NSAffineTransform,
         NSBackingStoreBuffered,
         NSBezierPath,
         NSBezelStyleRounded,
@@ -22,16 +30,22 @@ try:
         NSButtonTypeSwitch,
         NSColor,
         NSCompositingOperationSourceOver,
+        NSCompositingOperationSourceIn,
+        NSEventTrackingRunLoopMode,
         NSFont,
         NSFontAttributeName,
+        NSFontWeightBold,
         NSForegroundColorAttributeName,
+        NSGraphicsContext,
         NSImage,
         NSMenu,
         NSMenuItem,
+        NSEventModifierFlagCommand,
         NSOffState,
         NSOnState,
         NSOpenPanel,
         NSPopUpButton,
+        NSRectFillUsingOperation,
         NSScrollView,
         NSSavePanel,
         NSSlider,
@@ -41,14 +55,16 @@ try:
         NSTextField,
         NSTextView,
         NSView,
+        NSViewHeightSizable,
+        NSViewWidthSizable,
         NSWorkspace,
         NSWindow,
         NSWindowStyleMaskClosable,
         NSWindowStyleMaskMiniaturizable,
         NSWindowStyleMaskTitled,
-        NSVariableStatusItemLength,
+        NSSquareStatusItemLength,
     )
-    from Foundation import NSObject, NSString, NSTimer, NSURL
+    from Foundation import NSMutableAttributedString, NSRunLoop, NSRunLoopCommonModes, NSObject, NSString, NSTimer, NSURL
 except ImportError as exc:  # pragma: no cover - only exercised on non-macOS setups.
     raise SystemExit(
         f"The status-bar app requires PyObjC/AppKit ({exc}):\n"
@@ -67,6 +83,7 @@ from .battery import (
     program_for_battery,
     read_battery_snapshot,
 )
+from .power_source_notifications import PowerSourceNotifier
 from .audit import (
     append_status_history_record,
     default_status_audit_log_path,
@@ -80,8 +97,8 @@ from .collector import (
     LiveAgentMonitor,
     SourceSpec,
     coalesce_statuses_by_key,
+    default_sources,
     multiagent_statuses,
-    read_recent_lines_across_rotations,
     session_coalesce_key,
 )
 from .device_writer import (
@@ -101,10 +118,14 @@ from .ipc import HookEventServer, default_event_socket_path, default_latest_stat
 from .install import (
     install_claude_hooks,
     install_codex_hooks,
+    install_cursor_hooks,
     install_grok_hooks,
+    install_junie_hooks,
     uninstall_claude_hooks,
     uninstall_codex_hooks,
+    uninstall_cursor_hooks,
     uninstall_grok_hooks,
+    uninstall_junie_hooks,
 )
 from .led_slots import SLOT_EMPTY, SlotAllocator
 from .led_status import (
@@ -116,26 +137,36 @@ from .led_status import (
     normalized_device_name,
     program_for_display_state,
     program_for_slots,
+    program_for_agent_mode,
     write_mode_to_leds,
-    display_state_for_mode,
 )
-from .virtual_device import VIRTUAL_DEVICE_ID, VIRTUAL_DEVICE_NAME, VirtualStatusDevice
+from .links import IOSLink, load_ios_links, remove_ios_link, send_ios_program
+from .virtual_device import (
+    FRAME_INTERVAL,
+    VIRTUAL_DEVICE_ID,
+    VIRTUAL_DEVICE_NAME,
+    VirtualLedView,
+    VirtualStatusDevice,
+)
 from .lid_sleep import (
     LID_POLL_SECONDS,
     ClosedLidAwakeController,
     MacSleepSnapshot,
+    external_display_is_active,
     read_lid_closed,
     read_mac_sleep_snapshot,
+    run_pmset_displaysleepnow,
     sleep_helper_install_command,
     sleep_helper_installed,
 )
-from .models import AgentMode, AgentStatus, provider_label
+from .models import AgentMode, AgentStatus, MODE_LABELS, provider_label
 from .providers import (
     ProviderConfig,
     detect_claude_config,
     detect_codex_config,
+    detect_cursor_config,
     detect_grok_config,
-    detect_log_path,
+    detect_junie_config,
     default_state_dir,
     parse_log_line,
 )
@@ -155,6 +186,34 @@ from .session_actions import (
     session_open_target,
 )
 from .settings import (
+    ANIMATION_STATE_LID_CLOSED,
+    ANIMATION_STATE_LID_OPEN,
+    ANIMATION_STATES,
+    AGENT_ANIMATION_ADD_CUSTOM,
+    AGENT_ANIMATION_AMBER_PULSE,
+    AGENT_ANIMATION_CYAN_COMPLETE,
+    AGENT_ANIMATION_CYAN_ROLL,
+    AGENT_ANIMATION_EMBER_ATTENTION,
+    AGENT_ANIMATION_EMBER_COMPLETE,
+    AGENT_ANIMATION_EMBER_IDLE,
+    AGENT_ANIMATION_EMBER_LID_OPEN,
+    AGENT_ANIMATION_EMBER_TIDE,
+    AGENT_ANIMATION_IDLE_PULSE,
+    AGENT_ANIMATION_KITT,
+    AGENT_ANIMATION_KITT_RED,
+    AGENT_ANIMATION_LID_CLOSED,
+    AGENT_ANIMATION_LID_OPEN,
+    AGENT_ANIMATION_MODES,
+    AGENT_ANIMATION_NIGHT_RIDER,
+    AGENT_ANIMATION_IMMEDIATE_OFF,
+    AGENT_ANIMATION_SLOW_OFF,
+    AGENT_ANIMATION_PURPLE_ATTENTION,
+    AGENT_ANIMATION_PURPLE_COMPLETE,
+    AGENT_ANIMATION_PURPLE_IDLE,
+    AGENT_ANIMATION_PURPLE_LID_OPEN,
+    AGENT_ANIMATION_PURPLE_TIDE,
+    AGENT_ANIMATION_SOLID_GREEN,
+    AGENT_ANIMATION_BUILT_IN_PROFILE_IDS,
     DEFAULT_IDLE_TIMEOUT_SECONDS,
     DEFAULT_HISTORY_TIMEFRAME_SECONDS,
     DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
@@ -184,13 +243,18 @@ from .settings import (
     TERMINAL_APP_CHOICES,
     TERMINAL_APP_WARP,
     TERMINAL_APP_WEZTERM,
+    AgentMonitorSettings,
     LedAnimationSetting,
+    agent_animation_profile_document,
+    agent_animation_profile_id,
+    custom_agent_animation_id,
     default_settings_path,
     default_lid_animation,
     load_settings,
     normalize_terminal_app,
     normalize_animation_duration,
     save_settings,
+    with_imported_agent_animation_profile,
 )
 from .status_bar_launch import install_launch_agent, launch_agent_installed
 
@@ -200,6 +264,9 @@ class StatusBarState:
     label: str
     symbol: str
     priority: int
+
+
+LINKED_PHONE_DEVICE_PREFIX = "ios/"
 
 
 @dataclass(frozen=True)
@@ -212,6 +279,76 @@ class StatusBarDevice:
     display: str
     brightness: int = 255
     reason: str = ""
+    remote_link: IOSLink | None = None
+
+
+class AnimationProgramTextView(NSTextView):
+    """NSTextView with reliable edit shortcuts in an accessory application."""
+
+    def performKeyEquivalent_(self, event):
+        if int(event.modifierFlags()) & int(NSEventModifierFlagCommand):
+            key = str(event.charactersIgnoringModifiers() or "").casefold()
+            action = {
+                "x": self.cut_,
+                "c": self.copy_,
+                "v": self.paste_,
+                "a": self.selectAll_,
+            }.get(key)
+            if action is not None:
+                action(None)
+                return True
+        return objc.super(AnimationProgramTextView, self).performKeyEquivalent_(event)
+
+
+class AgentAnimationMenuItemView(NSView):
+    """Interactive menu row with a SidePulse Notch-rendered animation preview."""
+
+    def initWithFrame_(self, frame):
+        self = objc.super(AgentAnimationMenuItemView, self).initWithFrame_(frame)
+        if self is not None:
+            self.popup = None
+            self.mode = None
+            self.animation_id = None
+            self.label = add_label(self, "", 10, 7, 106, 20)
+            self.animation_preview = VirtualLedView.alloc().initWithFrame_(
+                ((122, 2), (72, 28))
+            )
+            self.animation_preview.setCompactPreview_(True)
+            self.addSubview_(self.animation_preview)
+        return self
+
+    def configurePopup_mode_animation_label_program_(
+        self,
+        popup,
+        mode,
+        animation_id,
+        label,
+        program,
+    ):
+        self.popup = popup
+        self.mode = str(mode)
+        self.animation_id = str(animation_id)
+        self.label.setStringValue_(str(label))
+        self.animation_preview.setProgram_(str(program))
+
+    def mouseDown_(self, _event):
+        popup = self.popup
+        if popup is None:
+            return
+        for index in range(popup.numberOfItems()):
+            item = popup.itemAtIndex_(index)
+            payload = item.representedObject()
+            if (
+                isinstance(payload, dict)
+                and payload.get("mode") == self.mode
+                and payload.get("animation_id") == self.animation_id
+            ):
+                popup.selectItemAtIndex_(index)
+                break
+        target = popup.target()
+        if target is not None:
+            target.setAgentAnimationStyle_(popup)
+        popup.menu().cancelTracking()
 
 
 @dataclass(frozen=True)
@@ -235,24 +372,57 @@ STATE_IDLE = StatusBarState("Idle", "circle", 4)
 STATE_WORKING = StatusBarState("Working", "arrow.triangle.2.circlepath", 2)
 STATE_DONE = StatusBarState("Done", "checkmark.circle", 3)
 STATE_ASK = StatusBarState("Ask", "questionmark.circle", 1)
-STATUS_BAR_DEVICE_PRIORITY = ("sidepulsepro", "sidepulsedot")
+STATUS_ICON_FRAME_SECONDS = 1.0 / 30.0
+STATUS_ICON_FRAME_COUNT = 48
+STATUS_BAR_DEVICE_PRIORITY = ("sidepulsepro", "sidepulsedot", "pulsedot")
 STATUS_BAR_KEEPALIVE_VOLUME_NAMES = (
     "SidePulsePro",
     "SidePulseDot",
+    "PulseDot",
 )
 STATUS_BAR_REFRESH_SECONDS = 15.0
+STATUS_BAR_BATTERY_FALLBACK_POLL_SECONDS = 30.0
 STATUS_BAR_DEVICE_POLL_SECONDS = 2.0
 STATUS_BAR_SESSION_HISTORY_LIMIT = 10
-SCREEN_BAR_FEATURE_ENABLED = True
+SIDEPULSE_NOTCH_FEATURE_ENABLED = True
 STATUS_BAR_MAX_LINES_PER_SOURCE = 500
-STATUS_BAR_STARTUP_REPLAY_LINES = 200
+SETTINGS_WINDOW_WIDTH = 680
+SETTINGS_WINDOW_HEIGHT = 560
+SETTINGS_ANIMATIONS_WINDOW_WIDTH = 720
+SETTINGS_ANIMATIONS_WINDOW_HEIGHT = 500
+SETTINGS_TAB_Y = 44
+SETTINGS_TAB_TOP_MARGIN = 20
 STATUS_BAR_HISTORY_CHART_RECORD_LIMIT = 2400
 STATUS_BAR_HISTORY_CHART_RECORD_LIMIT_PADDING = 300
 STATUS_BAR_HISTORY_CHART_RECORD_LIMIT_MULTIPLIER = 3.0
+MAC_SLEEP_POLL_SECONDS = 60.0
+SYSTEM_POLL_ERROR_BACKOFF_SECONDS = 30.0
 LID_ANIMATION_RESTORE_FUDGE_SECONDS = 0.15
+AGENT_ANIMATION_DEVICE_PREVIEW_SECONDS = 3.0
+AGENT_ANIMATION_EDITOR_DEVICE_PREVIEW_SECONDS = 10.0
+AGENT_ANIMATION_PROFILE_CUSTOM = ""
 LID_ANIMATION_LABELS = {
     LID_ANIMATION_CLOSED: "Lid Closed",
     LID_ANIMATION_OPEN: "Lid Open",
+}
+ANIMATION_STATE_LABELS = {
+    **{mode.value: MODE_LABELS[mode] for mode in AgentMode},
+    ANIMATION_STATE_LID_OPEN: "Lid Open",
+    ANIMATION_STATE_LID_CLOSED: "Lid Closed",
+}
+ANIMATION_UI_STATES = tuple(
+    state
+    for state in ANIMATION_STATES
+    if state
+    not in {
+        AgentMode.TOOL_RUNNING.value,
+        AgentMode.LONG_TASK_PROGRESS.value,
+    }
+)
+ANIMATION_STATE_LABELS[AgentMode.WORKING.value] = "Working / Tool / Long Task"
+LID_KIND_BY_ANIMATION_STATE = {
+    ANIMATION_STATE_LID_OPEN: LID_ANIMATION_OPEN,
+    ANIMATION_STATE_LID_CLOSED: LID_ANIMATION_CLOSED,
 }
 SLEEP_PREVENTION_LABELS = {
     SLEEP_PREVENTION_NEVER: "Never",
@@ -322,6 +492,50 @@ def awake_policy_should_hold(policy: str, *, agents_active: bool) -> bool:
     return False
 
 
+def lid_closed_led_state_should_hold(
+    *,
+    lid_closed: bool | None,
+    sleep_prevention_policy: str,
+    agents_active: bool | None,
+    battery_safeguard_active: bool = False,
+) -> bool:
+    """Keep the shutdown frame while the closed Mac is allowed to sleep."""
+    if lid_closed is not True or agents_active is None:
+        return False
+    sleep_prevention_requested = awake_policy_should_hold(
+        sleep_prevention_policy,
+        agents_active=agents_active,
+    ) and not battery_safeguard_active
+    return not sleep_prevention_requested
+
+
+def lid_close_animation_should_run(
+    *,
+    sleep_prevention_policy: str,
+    agents_active: bool | None,
+) -> bool:
+    """Run the physical close animation only when the Mac may go to sleep."""
+    if sleep_prevention_policy == SLEEP_PREVENTION_ALWAYS:
+        return False
+    if sleep_prevention_policy == SLEEP_PREVENTION_AGENTS:
+        return agents_active is False
+    return True
+
+
+def closed_lid_display_sleep_should_request(
+    *,
+    lid_closed: bool | None,
+    external_display_active: bool | None,
+    system_sleep_disabled: bool,
+) -> bool:
+    """Only sleep displays when it cannot affect an external monitor."""
+    return (
+        lid_closed is True
+        and external_display_active is False
+        and system_sleep_disabled
+    )
+
+
 def sleep_prevention_battery_safeguard(
     snapshot: BatterySnapshot | None,
     threshold_percent: float,
@@ -349,32 +563,15 @@ def format_percent_value(value: float | int) -> str:
     return f"{number:.1f}%"
 
 
-def replay_recent_debug_logs(
-    monitor: LiveAgentMonitor,
-    *,
-    providers: tuple[str, ...] = ("codex", "claude", "grok"),
-    max_lines: int = STATUS_BAR_STARTUP_REPLAY_LINES,
-) -> int:
-    replayed = 0
-    for provider in providers:
-        try:
-            path = detect_log_path(provider)
-            lines = (
-                read_recent_lines_across_rotations(path, max_lines)
-                if path.exists()
-                else []
-            )
-        except Exception as exc:
-            log_status_bar(f"startup_replay {provider} error: {exc}")
-            continue
-
-        for line in lines:
-            record = parse_log_line(provider, line)
-            if record is None:
-                continue
-            monitor.ingest_record(record)
-            replayed += 1
-    return replayed
+def schedule_status_bar_timer(interval: float, target, selector: str):
+    """Schedule periodic work while menus and other tracking UI are active."""
+    timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        interval, target, selector, None, True,
+    )
+    run_loop = NSRunLoop.mainRunLoop()
+    for mode in (NSRunLoopCommonModes, NSEventTrackingRunLoopMode):
+        run_loop.addTimer_forMode_(timer, mode)
+    return timer
 
 
 class StatusBarController(NSObject):
@@ -384,13 +581,32 @@ class StatusBarController(NSObject):
             return None
 
         self.settings = load_settings()
+        self.open_settings_on_launch = False
         self.monitor = self.build_monitor()
         self.event_server = None
         self.status_item = None
+        self.status_icon_timer = None
+        self.tracking_status_menu = None
         self.timer = None
+        self.battery_timer = None
+        self.power_source_notifier = PowerSourceNotifier(self.power_source_did_change)
         self.lid_timer = None
         self.device_timer = None
+        self.agent_animation_preview_timer = None
         self.settings_window = None
+        self.agent_animation_editor_window = None
+        self.agent_animation_editor_mode = None
+        self.agent_animation_editor_existing_id = None
+        self.agent_animation_editor_name = None
+        self.agent_animation_editor_program = None
+        self.agent_animation_editor_preview = None
+        self.agent_animation_editor_preview_status = None
+        self.agent_animation_profile_editor_window = None
+        self.agent_animation_profile_editor_name = None
+        self.selected_agent_animation_profile_id = (
+            self.settings.matching_agent_animation_profile_id()
+            or AGENT_ANIMATION_PROFILE_CUSTOM
+        )
         self.setup_window = None
         self.settings_fields = {}
         self.settings_buttons = {}
@@ -399,6 +615,10 @@ class StatusBarController(NSObject):
         self.last_snapshot = None
         self.last_battery_snapshot = None
         self.last_battery_error = None
+        self.battery_poll_in_flight = False
+        self.battery_poll_pending = False
+        self.pending_battery_snapshot = None
+        self.pending_battery_error = None
         self.last_power_connected = None
         self.battery_preview_until = 0.0
         self.current_state = STATE_IDLE
@@ -411,6 +631,7 @@ class StatusBarController(NSObject):
         # needs its own allocator. Slot positions can therefore differ between
         # the Screen Bar and a physical Pro showing the same sessions.
         self.virtual_slot_allocator = SlotAllocator(slot_count=8)
+        self.remote_led_program_by_device = {}
         self.last_led_display_kind_by_device = {}
         self.device_errors = {}
         self.leds_enabled = True
@@ -421,11 +642,16 @@ class StatusBarController(NSObject):
         self.keep_awake = KeepAwakeController()
         self.closed_lid_awake = ClosedLidAwakeController(
             use_system_disable=sleep_helper_installed(),
+            use_caffeinate=False,
         )
         self.last_keep_awake_error = None
         self.last_closed_lid_awake_error = None
         self.last_mac_sleep_error = None
         self.last_mac_sleep_snapshot = None
+        self.mac_sleep_poll_in_flight = False
+        self.last_mac_sleep_poll_monotonic = 0.0
+        self.mac_sleep_poll_backoff_until_monotonic = 0.0
+        self.pending_mac_sleep_snapshot = None
         self.last_status_history_error = None
         self.last_status_read_error = None
         self.event_refresh_pending = False
@@ -436,6 +662,12 @@ class StatusBarController(NSObject):
         self.battery_sleep_safeguard_reason = ""
         self.last_lid_closed = None
         self.last_lid_error = None
+        self.lid_poll_in_flight = False
+        self.lid_poll_backoff_until_monotonic = 0.0
+        self.pending_lid_closed = None
+        self.pending_lid_error = None
+        self.lid_closed_led_hold_active = False
+        self.closed_lid_display_sleep_requested = False
         self.led_animation_until_monotonic = 0.0
         self.led_animation_token = 0
         self.virtual_status_device = VirtualStatusDevice.alloc().init()
@@ -443,46 +675,59 @@ class StatusBarController(NSObject):
 
     def applicationDidFinishLaunching_(self, _notification):
         NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        install_standard_edit_menu()
         log_status_bar("launching status item")
         self.start_event_server()
-        self.replay_debug_logs()
 
         self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
-            NSVariableStatusItemLength
+            NSSquareStatusItemLength
         )
         button = self.status_item.button()
-        button.setTitle_(" Idle")
+        button.setTitle_("")
         button.setImage_(image_for_symbol(STATE_IDLE.symbol, STATE_IDLE.label))
         button.setToolTip_("SidePulse Agent Monitor: Idle")
+        button.setAccessibilityLabel_("SidePulse Agent Monitor: Idle")
+        self.status_item.setVisible_(self.settings.show_menu_bar_icon)
         log_status_bar("status item created")
 
         self.refresh_(None)
-        self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        self.timer = schedule_status_bar_timer(
             STATUS_BAR_REFRESH_SECONDS,
             self,
             "refresh:",
-            None,
-            True,
         )
-        self.lid_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        if not self.power_source_notifier.start():
+            log_status_bar(
+                "power notification unavailable: "
+                f"{self.power_source_notifier.last_error or 'unknown error'}"
+            )
+        self.battery_timer = schedule_status_bar_timer(
+            STATUS_BAR_BATTERY_FALLBACK_POLL_SECONDS,
+            self,
+            "pollBattery:",
+        )
+        self.lid_timer = schedule_status_bar_timer(
             LID_POLL_SECONDS,
             self,
             "pollLid:",
-            None,
-            True,
         )
-        self.device_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        self.device_timer = schedule_status_bar_timer(
             STATUS_BAR_DEVICE_POLL_SECONDS,
             self,
             "pollDevices:",
-            None,
-            True,
         )
         self.show_setup_window_if_needed()
-        if SCREEN_BAR_FEATURE_ENABLED and self.settings.virtual_status_device_enabled:
+        if SIDEPULSE_NOTCH_FEATURE_ENABLED and self.settings.virtual_status_device_enabled:
             self.virtual_status_device.show()
         else:
             self.virtual_status_device.hide()
+
+        if self.open_settings_on_launch:
+            self.show_settings_window()
+
+    def applicationShouldHandleReopen_hasVisibleWindows_(self, _application, _visible):
+        self.show_settings_window()
+        return True
 
     @objc.IBAction
     def refresh_(self, _sender):
@@ -689,6 +934,16 @@ class StatusBarController(NSObject):
         self.show_settings_window()
 
     @objc.IBAction
+    def setMenuBarIconFromCheckbox_(self, sender):
+        settings = self.settings.with_menu_bar_icon(sender.state() == NSOnState)
+        save_settings(settings)
+        self.settings = settings
+        if self.status_item is not None:
+            self.status_item.setVisible_(settings.show_menu_bar_icon)
+        self.update_status_icon_animation()
+        self.refresh_settings_window()
+
+    @objc.IBAction
     def openSetup_(self, _sender):
         self.show_setup_window()
 
@@ -729,6 +984,22 @@ class StatusBarController(NSObject):
         self.update_hooks("grok", install=False)
 
     @objc.IBAction
+    def installCursorHooks_(self, _sender):
+        self.update_hooks("cursor", install=True)
+
+    @objc.IBAction
+    def uninstallCursorHooks_(self, _sender):
+        self.update_hooks("cursor", install=False)
+
+    @objc.IBAction
+    def installJunieHooks_(self, _sender):
+        self.update_hooks("junie", install=True)
+
+    @objc.IBAction
+    def uninstallJunieHooks_(self, _sender):
+        self.update_hooks("junie", install=False)
+
+    @objc.IBAction
     def toggleCodexTranscripts_(self, sender):
         self.set_transcript_monitoring("codex", sender.state() == NSOnState)
 
@@ -741,10 +1012,6 @@ class StatusBarController(NSObject):
         self.set_battery_led_display(self.settings.led_display != LED_DISPLAY_BATTERY)
 
     @objc.IBAction
-    def setBatteryLedDisplayFromCheckbox_(self, sender):
-        self.set_battery_led_display(sender.state() == NSOnState)
-
-    @objc.IBAction
     def toggleBatteryPowerPreview_(self, _sender):
         self.set_battery_power_preview(not self.settings.battery_show_on_power_change)
 
@@ -753,8 +1020,93 @@ class StatusBarController(NSObject):
         self.set_battery_power_preview(sender.state() == NSOnState)
 
     @objc.IBAction
+    def setAgentAnimationStyle_(self, sender):
+        item = sender.selectedItem()
+        payload = item.representedObject() if item is not None else None
+        if not isinstance(payload, dict):
+            return
+        mode = payload.get("mode")
+        animation_id = payload.get("animation_id")
+        if animation_id == AGENT_ANIMATION_ADD_CUSTOM:
+            self.show_agent_animation_editor(mode)
+            return
+        self.set_agent_animation_style(mode, animation_id)
+
+    @objc.IBAction
+    def addCustomAgentAnimation_(self, _sender):
+        self.show_agent_animation_editor(None)
+
+    @objc.IBAction
+    def editAgentAnimation_(self, sender):
+        self.show_agent_animation_editor(
+            sender.representedObject(),
+            edit_selected=True,
+        )
+
+    @objc.IBAction
+    def applyAgentAnimationProfile_(self, sender):
+        item = sender.selectedItem()
+        profile_id = item.representedObject() if item is not None else None
+        self.apply_agent_animation_profile(
+            str(profile_id) if profile_id is not None else None
+        )
+
+    @objc.IBAction
+    def showAgentAnimationProfileEditor_(self, _sender):
+        self.show_agent_animation_profile_editor()
+
+    @objc.IBAction
+    def saveAgentAnimationProfile_(self, _sender):
+        self.save_agent_animation_profile()
+
+    @objc.IBAction
+    def cancelAgentAnimationProfile_(self, _sender):
+        if self.agent_animation_profile_editor_window is not None:
+            self.agent_animation_profile_editor_window.orderOut_(None)
+
+    @objc.IBAction
+    def deleteAgentAnimationProfile_(self, _sender):
+        self.delete_matching_agent_animation_profile()
+
+    @objc.IBAction
+    def exportAgentAnimationProfile_(self, _sender):
+        self.export_agent_animation_profile()
+
+    @objc.IBAction
+    def importAgentAnimationProfile_(self, _sender):
+        self.import_agent_animation_profile()
+
+    @objc.IBAction
+    def showAgentAnimationOnDevice_(self, sender):
+        self.show_agent_animation_on_device(sender.representedObject())
+
+    @objc.IBAction
+    def showAgentAnimationEditorOnDevice_(self, _sender):
+        self.show_agent_animation_editor_on_device()
+
+    @objc.IBAction
+    def saveAgentAnimationCustom_(self, _sender):
+        self.save_custom_agent_animation()
+
+    @objc.IBAction
+    def cancelAgentAnimationCustom_(self, _sender):
+        if self.agent_animation_editor_window is not None:
+            self.agent_animation_editor_window.orderOut_(None)
+        self.refresh_settings_window()
+
+    @objc.IBAction
     def saveAgentListTiming_(self, _sender):
         self.save_agent_list_timing_from_fields()
+
+    def windowShouldClose_(self, window):
+        if window == self.settings_window:
+            window.makeFirstResponder_(None)
+        return True
+
+    def tabView_shouldSelectTabViewItem_(self, _tab_view, _tab_item):
+        if self.settings_window is not None:
+            self.settings_window.makeFirstResponder_(None)
+        return True
 
     @objc.IBAction
     def setDeviceDisplayAgent_(self, sender):
@@ -781,7 +1133,7 @@ class StatusBarController(NSObject):
 
     @objc.IBAction
     def toggleVirtualStatusDevice_(self, _sender):
-        if not SCREEN_BAR_FEATURE_ENABLED:
+        if not SIDEPULSE_NOTCH_FEATURE_ENABLED:
             self.set_virtual_status_device(False)
             return
         self.set_virtual_status_device(not self.settings.virtual_status_device_enabled)
@@ -815,12 +1167,22 @@ class StatusBarController(NSObject):
         self.remove_remembered_device(sender.representedObject())
 
     @objc.IBAction
+    def removeLinkedPhone_(self, sender):
+        self.remove_linked_phone(sender.representedObject())
+
+    @objc.IBAction
     def quit_(self, _sender):
         self.closed_lid_awake.release()
         self.keep_awake.release()
         NSApp.terminate_(self)
 
     def applicationWillTerminate_(self, _notification):
+        self.stop_status_icon_animation()
+        self.power_source_notifier.stop()
+        if self.battery_timer is not None:
+            self.battery_timer.invalidate()
+            self.battery_timer = None
+        self.stop_agent_animation_preview_timer()
         self.stop_event_server()
         self.closed_lid_awake.release()
         self.keep_awake.release()
@@ -833,16 +1195,77 @@ class StatusBarController(NSObject):
         button = self.status_item.button()
         if button is None:
             return
-        button.setTitle_(f" {state.label}")
+        button.setTitle_("")
         button.setImage_(image_for_symbol(state.symbol, state.label))
         button.setToolTip_(f"SidePulse Agent Monitor: {state.label}")
+        button.setAccessibilityLabel_(f"SidePulse Agent Monitor: {state.label}")
+        self.update_status_icon_animation()
         if previous != state:
             log_status_bar(f"state={state.label}")
+
+    def menuWillOpen_(self, menu):
+        self.tracking_status_menu = menu
+        self.update_status_icon_animation()
+
+    def menuDidClose_(self, menu):
+        if self.tracking_status_menu == menu:
+            self.tracking_status_menu = None
+        self.update_status_icon_animation()
+
+    def stop_status_icon_animation(self) -> None:
+        if self.status_icon_timer is not None:
+            self.status_icon_timer.invalidate()
+            self.status_icon_timer = None
+
+    @objc.IBAction
+    def animateStatusIcons_(self, _timer):
+        self.update_status_icon_animation()
+
+    def update_status_icon_animation(self) -> None:
+        visible = self.status_item is not None and self.status_item.isVisible()
+        rows = []
+        if self.tracking_status_menu is not None:
+            for item in self.tracking_status_menu.itemArray():
+                status = item.representedObject()
+                if isinstance(status, AgentStatus):
+                    rows.append((item, status))
+        motion = not NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+        animated = motion and (
+            (visible and self.current_state in (STATE_WORKING, STATE_ASK))
+            or any(state_for_mode(status.mode) in (STATE_WORKING, STATE_ASK) for _, status in rows)
+        )
+        if animated and self.status_icon_timer is None:
+            self.status_icon_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+                STATUS_ICON_FRAME_SECONDS, self, "animateStatusIcons:", None, True,
+            )
+            self.status_icon_timer.setTolerance_(0.005)
+            run_loop = NSRunLoop.mainRunLoop()
+            run_loop.addTimer_forMode_(self.status_icon_timer, NSRunLoopCommonModes)
+            run_loop.addTimer_forMode_(self.status_icon_timer, NSEventTrackingRunLoopMode)
+        elif not animated:
+            self.stop_status_icon_animation()
+
+        frame = int(time.monotonic() / STATUS_ICON_FRAME_SECONDS) % STATUS_ICON_FRAME_COUNT
+        if visible:
+            state = self.current_state
+            icon = (
+                animated_status_icon(state, frame)
+                if animated and state in (STATE_WORKING, STATE_ASK)
+                else image_for_symbol(state.symbol, state.label)
+            )
+            self.status_item.button().setImage_(icon)
+        if rows:
+            dark_mode = is_dark_appearance(self.tracking_status_menu.effectiveAppearance())
+            for item, status in rows:
+                item.setImage_(session_row_icon_for_status(
+                    status, frame if animated else None, dark_mode=dark_mode,
+                ))
 
     def build_monitor(self) -> LiveAgentMonitor:
         socket_path = default_event_socket_path()
         return LiveAgentMonitor(
             sources=(SourceSpec("event-bus", socket_path),),
+            recovery_sources=default_sources(self.settings),
             stale_after_seconds=self.settings.idle_timeout_seconds,
             latest_state_path=default_latest_state_path(),
         )
@@ -852,7 +1275,10 @@ class StatusBarController(NSObject):
 
     def start_event_server(self) -> None:
         self.stop_event_server()
-        self.event_server = HookEventServer(self.handle_hook_event_message)
+        self.event_server = HookEventServer(
+            self.handle_hook_event_message,
+            on_open_settings=self.schedule_open_settings,
+        )
         try:
             socket_path = self.event_server.start()
             log_status_bar(f"event_server listening={socket_path}")
@@ -864,6 +1290,11 @@ class StatusBarController(NSObject):
         if self.event_server is not None:
             self.event_server.stop()
             self.event_server = None
+
+    def schedule_open_settings(self) -> None:
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "openSettings:", None, False,
+        )
 
     def handle_hook_event_message(self, provider: str, line: dict) -> None:
         try:
@@ -892,17 +1323,100 @@ class StatusBarController(NSObject):
         self.event_refresh_pending = False
         self.refresh_(None)
 
-    def replay_debug_logs(self) -> None:
-        replayed = replay_recent_debug_logs(self.monitor)
-        if replayed:
-            log_status_bar(f"startup_replay events={replayed}")
-
     def show_settings_window(self) -> None:
         if self.settings_window is None:
             self.settings_window = build_settings_window(self)
         self.refresh_settings_window()
         self.settings_window.makeKeyAndOrderFront_(None)
+        self.start_agent_animation_preview_timer()
         NSApp.activateIgnoringOtherApps_(True)
+
+    def tabView_didSelectTabViewItem_(self, tab_view, tab_item) -> None:
+        window = self.settings_window or tab_view.window()
+        if window is None:
+            return
+        identifier = str(tab_item.identifier())
+        height = (
+            SETTINGS_ANIMATIONS_WINDOW_HEIGHT
+            if identifier == "animations"
+            else SETTINGS_WINDOW_HEIGHT
+        )
+        width = (
+            SETTINGS_ANIMATIONS_WINDOW_WIDTH
+            if identifier == "animations"
+            else SETTINGS_WINDOW_WIDTH
+        )
+        current_width = float(window.contentView().frame().size.width)
+        current_height = float(window.contentView().frame().size.height)
+        if abs(current_width - width) < 0.5 and abs(current_height - height) < 0.5:
+            return
+        window.setContentSize_((width, height))
+        tab_view.setFrame_(
+            (
+                (20, SETTINGS_TAB_Y),
+                (
+                    width - 40,
+                    height - SETTINGS_TAB_Y - SETTINGS_TAB_TOP_MARGIN,
+                ),
+            )
+        )
+        message = self.settings_fields.get("message")
+        if message is not None:
+            message.setFrameSize_((width - 48, 22))
+        window.center()
+    def start_agent_animation_preview_timer(self) -> None:
+        if self.agent_animation_preview_timer is not None:
+            return
+        self.agent_animation_preview_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            FRAME_INTERVAL,
+            self,
+            "redrawAgentAnimationPreviews:",
+            None,
+            True,
+        )
+        run_loop = NSRunLoop.mainRunLoop()
+        run_loop.addTimer_forMode_(
+            self.agent_animation_preview_timer,
+            NSRunLoopCommonModes,
+        )
+        run_loop.addTimer_forMode_(
+            self.agent_animation_preview_timer,
+            NSEventTrackingRunLoopMode,
+        )
+
+    def stop_agent_animation_preview_timer(self) -> None:
+        if self.agent_animation_preview_timer is not None:
+            self.agent_animation_preview_timer.invalidate()
+            self.agent_animation_preview_timer = None
+
+    @objc.IBAction
+    def redrawAgentAnimationPreviews_(self, _sender):
+        settings_visible = (
+            self.settings_window is not None and self.settings_window.isVisible()
+        )
+        editor_visible = (
+            self.agent_animation_editor_window is not None
+            and self.agent_animation_editor_window.isVisible()
+        )
+        if not settings_visible and not editor_visible:
+            self.stop_agent_animation_preview_timer()
+            return
+        if settings_visible:
+            for mode_value in ANIMATION_UI_STATES:
+                preview = self.settings_fields.get(
+                    f"agent_animation_preview_{mode_value}"
+                )
+                if preview is not None:
+                    preview.setNeedsDisplay_(True)
+                popup = self.settings_fields.get(f"agent_animation_{mode_value}")
+                if popup is not None:
+                    for index in range(popup.numberOfItems()):
+                        menu_view = popup.itemAtIndex_(index).view()
+                        menu_preview = getattr(menu_view, "animation_preview", None)
+                        if menu_preview is not None:
+                            menu_preview.setNeedsDisplay_(True)
+        if editor_visible and self.agent_animation_editor_preview is not None:
+            self.agent_animation_editor_preview.setNeedsDisplay_(True)
 
     def show_setup_window_if_needed(self) -> None:
         if should_show_setup_window(self.settings):
@@ -1035,9 +1549,16 @@ class StatusBarController(NSObject):
         if self.settings_window is None:
             return
 
+        set_checkbox_state(
+            self.settings_buttons.get("show_menu_bar_icon"),
+            self.settings.show_menu_bar_icon,
+        )
+
         codex = detect_codex_config()
         claude = detect_claude_config()
         grok = detect_grok_config()
+        cursor = detect_cursor_config()
+        junie = detect_junie_config()
         set_field_value(
             self.settings_fields.get("codex_hook_status"),
             hook_status_text(codex),
@@ -1049,6 +1570,14 @@ class StatusBarController(NSObject):
         set_field_value(
             self.settings_fields.get("grok_hook_status"),
             hook_status_text(grok),
+        )
+        set_field_value(
+            self.settings_fields.get("cursor_hook_status"),
+            hook_status_text(cursor),
+        )
+        set_field_value(
+            self.settings_fields.get("junie_hook_status"),
+            hook_status_text(junie),
         )
         set_field_value(
             self.settings_fields.get("settings_path"),
@@ -1067,13 +1596,38 @@ class StatusBarController(NSObject):
             self.settings.claude_transcripts_enabled,
         )
         set_checkbox_state(
-            self.settings_buttons.get("battery_leds"),
-            self.settings.led_display == LED_DISPLAY_BATTERY,
-        )
-        set_checkbox_state(
             self.settings_buttons.get("battery_power_preview"),
             self.settings.battery_show_on_power_change,
         )
+        for mode_value in ANIMATION_UI_STATES:
+            popup = self.settings_fields.get(f"agent_animation_{mode_value}")
+            if popup is not None:
+                refresh_agent_animation_popup(
+                    popup,
+                    mode_value,
+                    self.settings,
+                    self.settings.agent_animation_id(mode_value),
+                )
+            preview = self.settings_fields.get(
+                f"agent_animation_preview_{mode_value}"
+            )
+            if preview is not None:
+                preview.setProgram_(animation_state_program(self.settings, mode_value))
+        profile_popup = self.settings_fields.get("agent_animation_profile")
+        if profile_popup is not None:
+            refresh_agent_animation_profile_popup(
+                profile_popup,
+                self.settings,
+                self.selected_agent_animation_profile_id,
+            )
+        delete_profile = self.settings_buttons.get("delete_agent_animation_profile")
+        if delete_profile is not None:
+            delete_profile.setEnabled_(
+                self.selected_agent_animation_profile_id
+                in self.settings.agent_animation_profiles
+                and self.selected_agent_animation_profile_id
+                not in AGENT_ANIMATION_BUILT_IN_PROFILE_IDS
+            )
         for provider in ("codex", "claude", "grok"):
             popup = self.settings_fields.get(f"{provider}_session_opener")
             if popup is not None:
@@ -1225,10 +1779,20 @@ class StatusBarController(NSObject):
                 result = install_claude_hooks()
             elif provider == "claude":
                 result = uninstall_claude_hooks()
-            elif install:
+            elif provider == "grok" and install:
                 result = install_grok_hooks()
-            else:
+            elif provider == "grok":
                 result = uninstall_grok_hooks()
+            elif provider == "cursor" and install:
+                result = install_cursor_hooks()
+            elif provider == "cursor":
+                result = uninstall_cursor_hooks()
+            elif provider == "junie" and install:
+                result = install_junie_hooks()
+            elif provider == "junie":
+                result = uninstall_junie_hooks()
+            else:
+                raise ValueError(f"Unsupported hook provider: {provider}")
         except Exception as exc:
             self.set_settings_message(f"{provider.title()} hooks failed: {exc}")
             self.refresh_settings_window()
@@ -1278,26 +1842,33 @@ class StatusBarController(NSObject):
                 DEFAULT_SLEEP_PREVENTION_MIN_BATTERY_PERCENT
             )
         except ValueError:
-            self.set_settings_message("Behavior settings must be numeric.")
+            self.set_settings_message("Advanced settings must be numeric.")
+            return
+
+        if not all(math.isfinite(value) for value in (retention_hours * 3600, idle_minutes * 60, min_battery_percent)):
+            self.set_settings_message("Advanced settings must be finite numbers.")
             return
 
         try:
-            self.settings = self.settings.with_agent_list_timing(
+            settings = self.settings.with_agent_list_timing(
                 recent_session_retention_seconds=retention_hours * 3600,
                 idle_timeout_seconds=idle_minutes * 60,
             )
-            self.settings = self.settings.with_sleep_prevention_battery_safeguard(
+            settings = settings.with_sleep_prevention_battery_safeguard(
                 min_battery_percent
             )
-            save_settings(self.settings)
+            if settings == self.settings:
+                return
+            save_settings(settings)
+            self.settings = settings
         except Exception as exc:
-            self.set_settings_message(f"Could not save behavior settings: {exc}")
+            self.set_settings_message(f"Could not save advanced settings: {exc}")
             self.settings = load_settings()
             self.refresh_settings_window()
             return
 
         self.reload_monitor()
-        self.set_settings_message("Behavior settings saved.")
+        self.set_settings_message("Advanced settings saved.")
         self.refresh_settings_window()
         self.refresh_(None)
 
@@ -1363,7 +1934,15 @@ class StatusBarController(NSObject):
             self.virtual_status_device.hide()
             return None
         try:
-            target = write_led_program("off", device_path=device.target)
+            if device.remote_link is not None:
+                send_ios_program(
+                    device.remote_link,
+                    "off",
+                    data=remote_event_data(getattr(self, "last_battery_snapshot", None)),
+                )
+                target = f"linked phone {device.remote_link.link_id}"
+            else:
+                target = write_led_program("off", device_path=device.target)
         except Exception as exc:
             error = str(exc)
             self.device_errors[device.device_id] = error
@@ -1415,15 +1994,15 @@ class StatusBarController(NSObject):
             )
 
     def set_virtual_status_device(self, enabled: bool) -> None:
-        if not SCREEN_BAR_FEATURE_ENABLED:
+        if not SIDEPULSE_NOTCH_FEATURE_ENABLED:
             try:
                 self.settings = self.settings.with_virtual_status_device(False)
                 save_settings(self.settings)
             except Exception as exc:
-                self.set_settings_message(f"Could not disable Screen Bar: {exc}")
+                self.set_settings_message(f"Could not disable SidePulse Notch: {exc}")
                 return
             self.virtual_status_device.hide()
-            self.set_settings_message("Screen Bar is disabled for now.")
+            self.set_settings_message("SidePulse Notch is disabled for now.")
             self.refresh_(None)
             return
 
@@ -1437,7 +2016,7 @@ class StatusBarController(NSObject):
                 )
             save_settings(self.settings)
         except Exception as exc:
-            self.set_settings_message(f"Could not save Screen Bar: {exc}")
+            self.set_settings_message(f"Could not save SidePulse Notch: {exc}")
             return
         if enabled:
             self.virtual_status_device.show()
@@ -1561,6 +2140,38 @@ class StatusBarController(NSObject):
         self.refresh_settings_window()
         self.refresh_(None)
 
+    def remove_linked_phone(self, token: str | None) -> None:
+        if not token:
+            return
+        link = next(
+            (entry for entry in self.linked_phone_links() if entry.token == str(token)),
+            None,
+        )
+        if link is None:
+            self.set_settings_message("That iPhone is no longer linked.")
+            self.refresh_(None)
+            return
+        if not confirm_linked_phone_removal(link.name):
+            return
+
+        device_id = linked_phone_device_id(link)
+        try:
+            removed = remove_ios_link(link.token)
+            if removed is None:
+                self.set_settings_message("That iPhone is no longer linked.")
+            else:
+                self.settings = self.settings.without_device(device_id)
+                save_settings(self.settings)
+                self.set_settings_message(f"{link.name}: unlinked.")
+        except Exception as exc:
+            self.set_settings_message(f"Could not remove {link.name}: {exc}")
+            self.settings = load_settings()
+            return
+
+        self.reset_led_controllers_for_device(device_id)
+        self.refresh_settings_window()
+        self.refresh_(None)
+
     def open_session(self, status: AgentStatus | object, action: str | None, *, remember: bool) -> None:
         if not isinstance(status, AgentStatus):
             return
@@ -1628,6 +2239,426 @@ class StatusBarController(NSObject):
         self.refresh_settings_window()
         self.refresh_(None)
 
+    def set_agent_animation_style(
+        self,
+        mode_value: str | None,
+        animation_id: str | None,
+    ) -> None:
+        try:
+            state = str(mode_value)
+            if state not in ANIMATION_STATES:
+                raise ValueError(f"Unknown animation state: {state}")
+            if animation_id is None:
+                return
+            self.settings = self.settings.with_agent_animation(
+                state,
+                str(animation_id),
+            )
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not save animation: {exc}")
+            self.settings = load_settings()
+            self.refresh_settings_window()
+            return
+
+        self.reset_led_controllers_for_display_change()
+        self.selected_agent_animation_profile_id = AGENT_ANIMATION_PROFILE_CUSTOM
+        self.set_settings_message(
+            f"{ANIMATION_STATE_LABELS[state]} animation: "
+            f"{agent_animation_label(self.settings, str(animation_id))}."
+        )
+        self.refresh_settings_window()
+        self.refresh_(None)
+
+    def apply_agent_animation_profile(self, profile_id: str | None) -> None:
+        if not profile_id or profile_id == AGENT_ANIMATION_PROFILE_CUSTOM:
+            self.selected_agent_animation_profile_id = AGENT_ANIMATION_PROFILE_CUSTOM
+            self.refresh_settings_window()
+            return
+        try:
+            profile = self.settings.agent_animation_profiles.get(profile_id)
+            if profile is None:
+                raise ValueError(f"Unknown animation profile: {profile_id}")
+            self.settings = self.settings.with_applied_agent_animation_profile(
+                profile_id
+            )
+            label = profile.name
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not apply animation profile: {exc}")
+            self.settings = load_settings()
+            self.refresh_settings_window()
+            return
+
+        self.reset_led_controllers_for_display_change()
+        self.selected_agent_animation_profile_id = profile_id
+        self.set_settings_message(f"Animation profile applied: {label}.")
+        self.refresh_settings_window()
+        self.refresh_(None)
+
+    def show_agent_animation_profile_editor(self) -> None:
+        if self.agent_animation_profile_editor_window is None:
+            self.agent_animation_profile_editor_window = (
+                build_agent_animation_profile_editor_window(self)
+            )
+        set_field_value(self.agent_animation_profile_editor_name, "")
+        self.agent_animation_profile_editor_window.makeKeyAndOrderFront_(None)
+        NSApp.activateIgnoringOtherApps_(True)
+
+    def save_agent_animation_profile(self) -> None:
+        name = text_control_value(self.agent_animation_profile_editor_name).strip()
+        if not name:
+            self.set_settings_message("Enter a profile name.")
+            return
+        try:
+            profile_id = agent_animation_profile_id(
+                name,
+                self.settings.agent_animation_profiles,
+            )
+            self.settings = self.settings.with_agent_animation_profile(
+                profile_id,
+                name=name,
+            )
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not save animation profile: {exc}")
+            return
+
+        self.agent_animation_profile_editor_window.orderOut_(None)
+        self.selected_agent_animation_profile_id = profile_id
+        self.set_settings_message(f"Animation profile saved: {name}.")
+        self.refresh_settings_window()
+
+    def delete_matching_agent_animation_profile(self) -> None:
+        profile_id = self.selected_agent_animation_profile_id
+        if profile_id not in self.settings.agent_animation_profiles:
+            self.set_settings_message("Choose a saved profile before deleting it.")
+            return
+        if profile_id in AGENT_ANIMATION_BUILT_IN_PROFILE_IDS:
+            self.set_settings_message("Built-in animation profiles cannot be deleted.")
+            return
+        name = self.settings.agent_animation_profiles[profile_id].name
+        try:
+            self.settings = self.settings.without_agent_animation_profile(profile_id)
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not delete animation profile: {exc}")
+            return
+        self.selected_agent_animation_profile_id = AGENT_ANIMATION_PROFILE_CUSTOM
+        self.set_settings_message(f"Animation profile deleted: {name}.")
+        self.refresh_settings_window()
+
+    def export_agent_animation_profile(self) -> None:
+        profile_id = self.selected_agent_animation_profile_id or None
+        if profile_id is not None and profile_id not in self.settings.agent_animation_profiles:
+            profile_id = None
+        try:
+            document = agent_animation_profile_document(self.settings, profile_id)
+        except Exception as exc:
+            self.set_settings_message(f"Could not prepare animation profile: {exc}")
+            return
+        path = choose_animation_profile_export_path(str(document["name"]))
+        if path is None:
+            return
+        try:
+            path.write_text(
+                json.dumps(document, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self.set_settings_message(f"Could not export animation profile: {exc}")
+            return
+        self.set_settings_message(f"Animation profile exported: {path.name}.")
+
+    def import_agent_animation_profile(self) -> None:
+        path = choose_animation_profile_import_path()
+        if path is None:
+            return
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            raw_custom = document.get("custom_animations", {})
+            if isinstance(raw_custom, dict):
+                for raw in raw_custom.values():
+                    if isinstance(raw, dict) and isinstance(raw.get("program"), str):
+                        validate_agent_animation_program(raw["program"])
+            self.settings, profile_id = with_imported_agent_animation_profile(
+                self.settings,
+                document,
+            )
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not import animation profile: {exc}")
+            return
+
+        self.selected_agent_animation_profile_id = profile_id
+        self.reset_led_controllers_for_display_change()
+        profile = self.settings.agent_animation_profiles[profile_id]
+        self.set_settings_message(f"Animation profile imported: {profile.name}.")
+        self.refresh_settings_window()
+        self.refresh_(None)
+
+    def show_agent_animation_on_device(self, mode_value: str | None) -> None:
+        if not self.leds_enabled:
+            self.set_settings_message("Connect LEDs before showing an animation.")
+            return
+        try:
+            state = str(mode_value)
+            if state not in ANIMATION_STATES:
+                raise ValueError(f"Unknown animation state: {state}")
+            animation = self.settings.agent_animation(state)
+        except Exception as exc:
+            self.set_settings_message(f"Could not show animation: {exc}")
+            return
+
+        lid_kind = LID_KIND_BY_ANIMATION_STATE.get(state)
+        if lid_kind is not None:
+            self.play_lid_animation(lid_kind)
+            self.set_settings_message(
+                f"Showing {ANIMATION_STATE_LABELS[state]} on device."
+            )
+            return
+
+        mode = AgentMode(state)
+
+        devices = [
+            device
+            for device in self.status_bar_devices()
+            if (
+                device.connected
+                and device.device_id != VIRTUAL_DEVICE_ID
+                and device.remote_link is None
+                and device.display != LED_DISPLAY_CUSTOM
+            )
+        ]
+        if not devices:
+            self.set_settings_message("No connected agent-display device to show it on.")
+            return
+
+        self.led_animation_token += 1
+        token = self.led_animation_token
+        self.led_animation_until_monotonic = (
+            time.monotonic() + AGENT_ANIMATION_DEVICE_PREVIEW_SECONDS
+        )
+        self.set_settings_message(
+            f"Showing {MODE_LABELS[mode]} on device for "
+            f"{AGENT_ANIMATION_DEVICE_PREVIEW_SECONDS:g} seconds."
+        )
+        thread = threading.Thread(
+            target=self.show_agent_animation_on_device_worker,
+            args=(mode, animation.style, animation.custom_program, devices, token),
+            daemon=True,
+        )
+        thread.start()
+
+    def show_agent_animation_on_device_worker(
+        self,
+        mode: AgentMode,
+        animation_style: str,
+        custom_program: str,
+        devices: list[StatusBarDevice],
+        token: int,
+    ) -> None:
+        for device in devices:
+            try:
+                result = write_mode_to_leds(
+                    mode,
+                    device_path=device.target,
+                    brightness=device.brightness,
+                    animation_style=animation_style,
+                    custom_program=custom_program,
+                )
+                log_status_bar(
+                    f"animation device preview={MODE_LABELS[mode]} "
+                    f"device={device.name} target={result.target}"
+                )
+            except Exception as exc:
+                log_status_bar(
+                    f"animation device preview error {MODE_LABELS[mode]} "
+                    f"device={device.name}: {exc}"
+                )
+        time.sleep(AGENT_ANIMATION_DEVICE_PREVIEW_SECONDS)
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "restoreLedDisplay:",
+            str(token),
+            False,
+        )
+
+    def show_agent_animation_editor(
+        self,
+        mode_value: str | None,
+        *,
+        edit_selected: bool = False,
+    ) -> None:
+        state = None
+        if mode_value is not None:
+            state = str(mode_value)
+            if state not in ANIMATION_STATES:
+                self.set_settings_message(f"Unknown animation state: {mode_value}")
+                self.refresh_settings_window()
+                return
+        if self.agent_animation_editor_window is None:
+            self.agent_animation_editor_window = build_agent_animation_editor_window(self)
+        self.agent_animation_editor_mode = state
+        self.agent_animation_editor_existing_id = None
+        program = (
+            animation_state_program(self.settings, state)
+            if state is not None
+            else program_for_agent_mode(AgentMode.WORKING, led_count=8)
+        )
+        title = "Add Custom Animation"
+        name = ""
+        if edit_selected and state is not None:
+            animation_id = self.settings.agent_animation_id(state)
+            custom = self.settings.custom_agent_animations.get(animation_id)
+            if custom is not None:
+                self.agent_animation_editor_existing_id = animation_id
+                title = "Edit Custom Animation"
+                name = custom.name
+                program = custom.program
+            else:
+                title = "Clone Built-in Animation"
+                name = f"{agent_animation_label(self.settings, animation_id)} Copy"
+        self.agent_animation_editor_window.setTitle_(title)
+        set_field_value(self.agent_animation_editor_name, name)
+        set_text_control_value(self.agent_animation_editor_program, program)
+        self.refresh_agent_animation_editor_preview()
+        self.agent_animation_editor_window.makeKeyAndOrderFront_(None)
+        self.start_agent_animation_preview_timer()
+        NSApp.activateIgnoringOtherApps_(True)
+
+    def textDidChange_(self, notification) -> None:
+        if notification.object() is self.agent_animation_editor_program:
+            self.refresh_agent_animation_editor_preview()
+
+    def refresh_agent_animation_editor_preview(self) -> None:
+        preview = self.agent_animation_editor_preview
+        status = self.agent_animation_editor_preview_status
+        if preview is None:
+            return
+        program = normalize_led_text(
+            text_control_value(self.agent_animation_editor_program)
+        )
+        try:
+            validate_agent_animation_program(program)
+            preview.setProgram_(program)
+            if preview.wasm_error:
+                raise ValueError(preview.wasm_error)
+        except Exception as exc:
+            preview.setProgram_("off")
+            if status is not None:
+                status.setStringValue_(str(exc))
+                status.setTextColor_(NSColor.systemRedColor())
+            return
+        if status is not None:
+            status.setStringValue_("Updates as you type")
+            status.setTextColor_(NSColor.secondaryLabelColor())
+
+    def show_agent_animation_editor_on_device(self) -> None:
+        status = self.agent_animation_editor_preview_status
+        try:
+            if not self.leds_enabled:
+                raise ValueError("Connect LEDs before showing this animation.")
+            program = normalize_led_text(
+                text_control_value(self.agent_animation_editor_program)
+            )
+            validate_agent_animation_program(program)
+            devices = [
+                device
+                for device in self.status_bar_devices()
+                if (
+                    device.connected
+                    and device.device_id != VIRTUAL_DEVICE_ID
+                    and device.remote_link is None
+                    and device.display != LED_DISPLAY_CUSTOM
+                )
+            ]
+            if not devices:
+                raise ValueError("No connected physical LED device found.")
+        except Exception as exc:
+            if status is not None:
+                status.setStringValue_(str(exc))
+                status.setTextColor_(NSColor.systemRedColor())
+            return
+
+        self.led_animation_token += 1
+        token = self.led_animation_token
+        self.led_animation_until_monotonic = (
+            time.monotonic() + AGENT_ANIMATION_EDITOR_DEVICE_PREVIEW_SECONDS
+        )
+        if status is not None:
+            status.setStringValue_(
+                f"Showing for {AGENT_ANIMATION_EDITOR_DEVICE_PREVIEW_SECONDS:g} seconds"
+            )
+            status.setTextColor_(NSColor.secondaryLabelColor())
+        thread = threading.Thread(
+            target=self.show_animation_program_on_device_worker,
+            args=(program, devices, token),
+            daemon=True,
+        )
+        thread.start()
+
+    def show_animation_program_on_device_worker(
+        self,
+        program: str,
+        devices: list[StatusBarDevice],
+        token: int,
+    ) -> None:
+        for device in devices:
+            try:
+                scaled_program = apply_brightness(program, device.brightness)
+                target = write_led_program(
+                    scaled_program,
+                    device_path=device.target,
+                )
+                log_status_bar(
+                    f"custom animation preview device={device.name} target={target}"
+                )
+            except Exception as exc:
+                log_status_bar(
+                    f"custom animation preview error {device.name}: {exc}"
+                )
+        time.sleep(AGENT_ANIMATION_EDITOR_DEVICE_PREVIEW_SECONDS)
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "restoreLedDisplay:",
+            str(token),
+            False,
+        )
+
+    def save_custom_agent_animation(self) -> None:
+        mode = self.agent_animation_editor_mode
+        existing_id = self.agent_animation_editor_existing_id
+        name = text_control_value(self.agent_animation_editor_name).strip()
+        program = normalize_led_text(
+            text_control_value(self.agent_animation_editor_program)
+        )
+        try:
+            if not name:
+                raise ValueError("Animation name is required.")
+            validate_agent_animation_program(program)
+            animation_id = existing_id or custom_agent_animation_id(
+                name, self.settings.custom_agent_animations
+            )
+            self.settings = self.settings.with_custom_agent_animation(
+                animation_id,
+                name=name,
+                program=program,
+            )
+            if mode is not None:
+                self.settings = self.settings.with_agent_animation(mode, animation_id)
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not add custom animation: {exc}")
+            return
+
+        self.agent_animation_editor_window.orderOut_(None)
+        if mode is not None:
+            self.selected_agent_animation_profile_id = AGENT_ANIMATION_PROFILE_CUSTOM
+        self.reset_led_controllers_for_display_change()
+        action = "updated" if existing_id is not None else "added"
+        self.set_settings_message(f"Custom animation {action}: {name}.")
+        self.refresh_settings_window()
+        self.refresh_(None)
+
     def read_battery_snapshot(self) -> BatterySnapshot | None:
         try:
             snapshot = read_battery_snapshot(
@@ -1640,10 +2671,77 @@ class StatusBarController(NSObject):
             self.last_battery_error = error
             return None
 
+        return self.accept_battery_snapshot(snapshot)
+
+    def accept_battery_snapshot(self, snapshot: BatterySnapshot) -> BatterySnapshot:
         self.last_battery_error = None
         self.last_battery_snapshot = snapshot
         self.update_battery_power_preview(snapshot)
         return snapshot
+
+    @objc.IBAction
+    def pollBattery_(self, _sender):
+        self.poll_battery_once()
+
+    def poll_battery_once(self) -> None:
+        if self.battery_poll_in_flight:
+            self.battery_poll_pending = True
+            return
+        self.battery_poll_in_flight = True
+        threading.Thread(target=self._read_battery_snapshot_async, daemon=True).start()
+
+    def power_source_did_change(self) -> None:
+        self.poll_battery_once()
+
+    def _read_battery_snapshot_async(self) -> None:
+        try:
+            self.pending_battery_snapshot = read_battery_snapshot(
+                full_charge_watts=self.settings.battery_full_charge_watts,
+            )
+            self.pending_battery_error = None
+        except Exception as exc:
+            self.pending_battery_snapshot = None
+            self.pending_battery_error = str(exc)
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "handleBatterySnapshot:",
+            None,
+            False,
+        )
+
+    def handleBatterySnapshot_(self, _payload) -> None:
+        self.handle_battery_snapshot()
+
+    def handle_battery_snapshot(self) -> None:
+        snapshot = self.pending_battery_snapshot
+        error = self.pending_battery_error
+        self.pending_battery_snapshot = None
+        self.pending_battery_error = None
+        poll_again = self.battery_poll_pending
+        self.battery_poll_pending = False
+        self.battery_poll_in_flight = False
+
+        if snapshot is None:
+            if error and error != self.last_battery_error:
+                log_status_bar(f"battery error: {error}")
+            self.last_battery_error = error
+            if poll_again:
+                self.poll_battery_once()
+            return
+
+        battery_snapshot = self.accept_battery_snapshot(snapshot)
+        mode = (
+            self.last_snapshot.aggregate.mode
+            if self.last_snapshot is not None
+            else AgentMode.IDLE_READY
+        )
+        self.sync_keep_awake(mode, battery_snapshot)
+        self.sync_leds(
+            mode,
+            battery_snapshot,
+            self.active_led_display_kind(battery_snapshot),
+        )
+        if poll_again:
+            self.poll_battery_once()
 
     def update_battery_power_preview(self, snapshot: BatterySnapshot) -> None:
         plugged = snapshot.is_plugged
@@ -1659,14 +2757,40 @@ class StatusBarController(NSObject):
         self.last_power_connected = plugged
 
     def read_mac_sleep_snapshot(self) -> MacSleepSnapshot | None:
-        snapshot = read_mac_sleep_snapshot()
+        now = time.monotonic()
+        if (
+            not self.mac_sleep_poll_in_flight
+            and now >= self.mac_sleep_poll_backoff_until_monotonic
+            and now - self.last_mac_sleep_poll_monotonic >= MAC_SLEEP_POLL_SECONDS
+        ):
+            self.mac_sleep_poll_in_flight = True
+            self.last_mac_sleep_poll_monotonic = now
+            threading.Thread(target=self._read_mac_sleep_snapshot_async, daemon=True).start()
+        return self.last_mac_sleep_snapshot
+
+    def _read_mac_sleep_snapshot_async(self) -> None:
+        self.pending_mac_sleep_snapshot = read_mac_sleep_snapshot()
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "handleMacSleepSnapshot:",
+            None,
+            False,
+        )
+
+    def handleMacSleepSnapshot_(self, _sender):
+        self.mac_sleep_poll_in_flight = False
+        snapshot = self.pending_mac_sleep_snapshot
+        self.pending_mac_sleep_snapshot = None
+        if not isinstance(snapshot, MacSleepSnapshot):
+            return
         error = snapshot.error or None
         if error != self.last_mac_sleep_error:
             self.last_mac_sleep_error = error
             if error:
                 log_status_bar(f"mac_sleep error: {error}")
+        self.mac_sleep_poll_backoff_until_monotonic = (
+            time.monotonic() + SYSTEM_POLL_ERROR_BACKOFF_SECONDS if error else 0.0
+        )
         self.last_mac_sleep_snapshot = snapshot
-        return snapshot
 
     def record_status_history(
         self,
@@ -1731,6 +2855,7 @@ class StatusBarController(NSObject):
             controller.reset()
         for controller in self.multiagent_led_controllers_by_device.values():
             controller.reset()
+        self.remote_led_program_by_device.clear()
         self.last_led_display_kind_by_device.clear()
         self.last_led_error = None
 
@@ -1744,6 +2869,7 @@ class StatusBarController(NSObject):
         multiagent_controller = self.multiagent_led_controllers_by_device.get(device_id)
         if multiagent_controller is not None:
             multiagent_controller.reset()
+        self.remote_led_program_by_device.pop(device_id, None)
         self.last_led_display_kind_by_device.pop(device_id, None)
         self.device_errors.pop(device_id, None)
         self.last_led_error = None
@@ -1799,10 +2925,28 @@ class StatusBarController(NSObject):
                 reason=candidate.reason,
             )
 
+        for link in self.linked_phone_links():
+            device_id = linked_phone_device_id(link)
+            saved_display = self.settings.display_for_device(device_id)
+            entries_by_id[device_id] = StatusBarDevice(
+                device_id=device_id,
+                name=link.name,
+                root=Path(device_id),
+                target=Path(device_id),
+                connected=True,
+                display=(
+                    LED_DISPLAY_CUSTOM
+                    if saved_display == LED_DISPLAY_CUSTOM
+                    else LED_DISPLAY_AGENT
+                ),
+                reason=f"linked through {link.server}",
+                remote_link=link,
+            )
+
         for device in self.settings.devices:
             if device.device_id == VIRTUAL_DEVICE_ID:
                 if (
-                    SCREEN_BAR_FEATURE_ENABLED
+                    SIDEPULSE_NOTCH_FEATURE_ENABLED
                     and self.settings.virtual_status_device_enabled
                 ):
                     entries_by_id[device.device_id] = StatusBarDevice(
@@ -1815,6 +2959,8 @@ class StatusBarController(NSObject):
                         brightness=device.brightness,
                         reason="on-screen device",
                     )
+                continue
+            if device.device_id.startswith(LINKED_PHONE_DEVICE_PREFIX):
                 continue
             if device.device_id in entries_by_id:
                 continue
@@ -1838,6 +2984,13 @@ class StatusBarController(NSObject):
         if remember:
             self.remember_connected_devices(entries)
         return entries
+
+    def linked_phone_links(self) -> tuple[IOSLink, ...]:
+        try:
+            return load_ios_links()
+        except Exception as exc:
+            log_status_bar(f"linked phone discovery error: {exc}")
+            return ()
 
     def observe_connected_devices(self) -> bool:
         devices = self.status_bar_devices()
@@ -1873,7 +3026,7 @@ class StatusBarController(NSObject):
     def remember_connected_devices(self, devices: list[StatusBarDevice]) -> None:
         settings = self.settings
         for device in devices:
-            if not device.connected:
+            if not device.connected or device.remote_link is not None:
                 continue
             settings = settings.with_remembered_device(
                 device_id=device.device_id,
@@ -1915,6 +3068,12 @@ class StatusBarController(NSObject):
 
         self.sync_virtual_status_device(mode, battery_snapshot, slot_statuses=slot_statuses)
 
+        if self.lid_closed_led_hold_active:
+            if self.should_hold_lid_closed_led_state():
+                return
+            self.lid_closed_led_hold_active = False
+            log_status_bar("lid_led_state=restoring reason=sleep_conditions_changed")
+
         if time.monotonic() < self.led_animation_until_monotonic:
             return
 
@@ -1935,7 +3094,7 @@ class StatusBarController(NSObject):
         *,
         slot_statuses: tuple[AgentStatus, ...] = (),
     ) -> None:
-        if not SCREEN_BAR_FEATURE_ENABLED:
+        if not SIDEPULSE_NOTCH_FEATURE_ENABLED:
             self.virtual_status_device.hide()
             return
         if not self.settings.virtual_status_device_enabled:
@@ -1969,13 +3128,19 @@ class StatusBarController(NSObject):
                 program_for_slots(slots, brightness=device.brightness)
             )
         else:
-            self.virtual_status_device.set_program(
-                program_for_display_state(
-                    display_state_for_mode(mode),
+            animation = self.settings.agent_animation(mode)
+            try:
+                program = program_for_agent_mode(
+                    mode,
                     led_count=8,
                     brightness=device.brightness,
+                    animation_style=animation.style,
+                    custom_program=animation.custom_program,
                 )
-            )
+            except DeviceWriteError as exc:
+                log_status_bar(f"virtual animation error {MODE_LABELS[mode]}: {exc}")
+                return
+            self.virtual_status_device.set_program(program)
 
     def sync_leds_worker(
         self,
@@ -2028,6 +3193,53 @@ class StatusBarController(NSObject):
                 self.device_errors.pop(device.device_id, None)
                 continue
 
+            if device.remote_link is not None:
+                if device_display_kind == LED_DISPLAY_BATTERY and battery_snapshot is not None:
+                    program = program_for_battery(
+                        battery_snapshot,
+                        led_count=8,
+                        brightness=255,
+                    )
+                    label = f"{device.name} Battery {battery_snapshot.percent}%"
+                else:
+                    animation = self.settings.agent_animation(mode)
+                    try:
+                        program = program_for_agent_mode(
+                            mode,
+                            led_count=8,
+                            brightness=255,
+                            animation_style=animation.style,
+                            custom_program=animation.custom_program,
+                        )
+                    except DeviceWriteError as exc:
+                        active_errors[device.device_id] = str(exc)
+                        continue
+                    label = f"{device.name} {MODE_LABELS[mode]}"
+
+                if self.remote_led_program_by_device.get(device.device_id) == program:
+                    self.device_errors.pop(device.device_id, None)
+                    continue
+                try:
+                    send_ios_program(
+                        device.remote_link,
+                        program,
+                        data=remote_event_data(battery_snapshot),
+                    )
+                except Exception as exc:
+                    error = str(exc)
+                    active_errors[device.device_id] = error
+                    previous_error = self.device_errors.get(device.device_id)
+                    if error != previous_error:
+                        log_status_bar(f"linked phone error {device.name}: {error}")
+                    continue
+
+                self.remote_led_program_by_device[device.device_id] = program
+                self.device_errors.pop(device.device_id, None)
+                log_status_bar(
+                    f"leds={label} target=linked phone {device.remote_link.link_id}"
+                )
+                continue
+
             if device_display_kind == LED_DISPLAY_BATTERY and battery_snapshot is not None:
                 result = self.battery_controller_for_device(device).sync_snapshot(battery_snapshot)
                 label = (
@@ -2041,7 +3253,12 @@ class StatusBarController(NSObject):
                 occupied = sum(1 for slot in result.slots if slot.color != SLOT_EMPTY)
                 label = f"{device.name} Multiagent {occupied}/{len(result.slots)}"
             else:
-                result = self.agent_controller_for_device(device).sync_mode(mode)
+                animation = self.settings.agent_animation(mode)
+                result = self.agent_controller_for_device(device).sync_mode(
+                    mode,
+                    animation_style=animation.style,
+                    custom_program=animation.custom_program,
+                )
                 label = f"{device.name} {result.label}"
 
             if result.error:
@@ -2067,7 +3284,24 @@ class StatusBarController(NSObject):
     ) -> None:
         if not self.leds_enabled:
             return
-        animation = animation or self.settings.lid_animation(kind)
+        if animation is None:
+            state = (
+                ANIMATION_STATE_LID_CLOSED
+                if kind == LID_ANIMATION_CLOSED
+                else ANIMATION_STATE_LID_OPEN
+            )
+            current = self.settings.lid_animation(kind)
+            animation_id = self.settings.agent_animation_id(state)
+            duration_seconds = current.duration_seconds
+            if animation_id in {
+                AGENT_ANIMATION_LID_CLOSED,
+                AGENT_ANIMATION_LID_OPEN,
+            }:
+                duration_seconds = default_lid_animation(kind).duration_seconds
+            animation = LedAnimationSetting(
+                program=animation_state_program(self.settings, state),
+                duration_seconds=duration_seconds,
+            )
         try:
             validate_lid_animation(animation)
         except DeviceWriteError as exc:
@@ -2079,6 +3313,7 @@ class StatusBarController(NSObject):
             if (
                 device.connected
                 and device.device_id != VIRTUAL_DEVICE_ID
+                and device.remote_link is None
                 and device.display != LED_DISPLAY_CUSTOM
             )
         ]
@@ -2095,6 +3330,26 @@ class StatusBarController(NSObject):
             daemon=True,
         )
         thread.start()
+
+    def should_hold_lid_closed_led_state(self) -> bool:
+        agents_active = None
+        if self.last_snapshot is not None:
+            agents_active = self.last_snapshot.aggregate.active_count > 0
+        return lid_closed_led_state_should_hold(
+            lid_closed=self.last_lid_closed,
+            sleep_prevention_policy=self.settings.sleep_prevention_policy,
+            agents_active=agents_active,
+            battery_safeguard_active=self.battery_sleep_safeguard_active,
+        )
+
+    def should_run_lid_close_animation(self) -> bool:
+        agents_active = None
+        if self.last_snapshot is not None:
+            agents_active = self.last_snapshot.aggregate.active_count > 0
+        return lid_close_animation_should_run(
+            sleep_prevention_policy=self.settings.sleep_prevention_policy,
+            agents_active=agents_active,
+        )
 
     def play_lid_animation_worker(
         self,
@@ -2137,7 +3392,11 @@ class StatusBarController(NSObject):
         if not targets:
             targets = [
                 device.target for device in self.status_bar_devices()
-                if device.connected and device.device_id != VIRTUAL_DEVICE_ID
+                if (
+                    device.connected
+                    and device.device_id != VIRTUAL_DEVICE_ID
+                    and device.remote_link is None
+                )
             ]
         for target in targets:
             try:
@@ -2217,27 +3476,70 @@ class StatusBarController(NSObject):
 
     @objc.IBAction
     def pollLid_(self, _sender):
+        if self.lid_poll_in_flight:
+            return
+        if time.monotonic() < self.lid_poll_backoff_until_monotonic:
+            return
+        self.lid_poll_in_flight = True
+        threading.Thread(target=self._read_lid_closed_async, daemon=True).start()
+
+    def _read_lid_closed_async(self) -> None:
         try:
             closed = read_lid_closed()
+            self.pending_lid_closed = closed
+            self.pending_lid_error = None
         except Exception as exc:
-            error = str(exc)
+            self.pending_lid_closed = None
+            self.pending_lid_error = str(exc)
+
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "handleLidPollResult:",
+            None,
+            False,
+        )
+
+    def handleLidPollResult_(self, _sender):
+        self.lid_poll_in_flight = False
+        error = self.pending_lid_error
+        if error:
+            error = str(error)
             if error != self.last_lid_error:
                 self.last_lid_error = error
                 log_status_bar(f"lid_state error: {error}")
+            self.lid_poll_backoff_until_monotonic = (
+                time.monotonic() + SYSTEM_POLL_ERROR_BACKOFF_SECONDS
+            )
             return
 
+        closed = self.pending_lid_closed
         if closed is None:
             return
+        closed = bool(closed)
         self.last_lid_error = None
+        self.lid_poll_backoff_until_monotonic = 0.0
         if self.last_lid_closed is None:
             self.last_lid_closed = closed
+            self.sync_closed_lid_awake()
             return
         if closed == self.last_lid_closed:
             return
 
         self.last_lid_closed = closed
+        self.sync_closed_lid_awake()
         kind = LID_ANIMATION_CLOSED if closed else LID_ANIMATION_OPEN
         log_status_bar(f"lid_state={'closed' if closed else 'open'}")
+        if closed:
+            if not self.should_run_lid_close_animation():
+                self.lid_closed_led_hold_active = False
+                log_status_bar(
+                    "animation=Lid Closed skipped reason=sleep_prevention_active"
+                )
+                return
+            self.lid_closed_led_hold_active = self.should_hold_lid_closed_led_state()
+            if self.lid_closed_led_hold_active:
+                log_status_bar("lid_led_state=held reason=sleep_allowed")
+        else:
+            self.lid_closed_led_hold_active = False
         self.play_lid_animation(kind)
 
     @objc.IBAction
@@ -2332,9 +3634,18 @@ class StatusBarController(NSObject):
 
     def sync_closed_lid_awake(self, *, agents_active: bool | None = None) -> None:
         was_active = self.closed_lid_awake.active()
-        self.closed_lid_awake.set_use_system_disable(sleep_helper_installed())
+        external_display_active = external_display_is_active()
+        battery_snapshot = getattr(self, "last_battery_snapshot", None)
+        clamshell_eligible = bool(
+            external_display_active is True
+            and battery_snapshot is not None
+            and battery_snapshot.is_plugged
+        )
+        self.closed_lid_awake.set_use_system_disable(
+            sleep_helper_installed() and not clamshell_eligible
+        )
         policy = self.settings.sleep_prevention_policy
-        if self.battery_sleep_safeguard_active:
+        if self.battery_sleep_safeguard_active or clamshell_eligible:
             policy = SLEEP_PREVENTION_NEVER
         self.closed_lid_awake.update(
             policy,
@@ -2353,6 +3664,24 @@ class StatusBarController(NSObject):
                     f"closed_lid_awake error: {self.last_closed_lid_awake_error}"
                 )
 
+        should_sleep_display = closed_lid_display_sleep_should_request(
+            lid_closed=getattr(self, "last_lid_closed", None),
+            external_display_active=external_display_active,
+            system_sleep_disabled=self.closed_lid_awake.system_disable_active(),
+        )
+        if not should_sleep_display:
+            self.closed_lid_display_sleep_requested = False
+            return
+        if getattr(self, "closed_lid_display_sleep_requested", False):
+            return
+        try:
+            run_pmset_displaysleepnow()
+            self.closed_lid_display_sleep_requested = True
+            log_status_bar("lid_display_sleep=requested")
+        except Exception as exc:
+            self.closed_lid_display_sleep_requested = False
+            log_status_bar(f"lid_display_sleep error: {exc}")
+
     def status_keepalive_targets(self) -> list[Path]:
         targets = self.current_led_targets()
         if targets:
@@ -2360,7 +3689,11 @@ class StatusBarController(NSObject):
         connected_targets = [
             device.target
             for device in self.status_bar_devices(remember=False)
-            if device.connected and device.device_id != VIRTUAL_DEVICE_ID
+            if (
+                device.connected
+                and device.device_id != VIRTUAL_DEVICE_ID
+                and device.remote_link is None
+            )
         ]
         if connected_targets:
             return connected_targets
@@ -2369,6 +3702,7 @@ class StatusBarController(NSObject):
 
 def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> NSMenu:
     menu = NSMenu.alloc().init()
+    menu.setDelegate_(target)
 
     menu.addItem_(disabled_menu_item("SidePulse"))
     menu.addItem_(NSMenuItem.separatorItem())
@@ -2393,14 +3727,13 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
     menu.addItem_(NSMenuItem.separatorItem())
     menu.addItem_(disabled_menu_item("Devices"))
     devices = target.status_bar_devices()
-    if devices:
-        for device in devices:
-            menu.addItem_(build_device_menu_item(device, target))
-    else:
+    for device in devices:
+        menu.addItem_(build_device_menu_item(device, target))
+    if not devices:
         menu.addItem_(disabled_menu_item("No devices"))
-    if SCREEN_BAR_FEATURE_ENABLED and not target.settings.virtual_status_device_enabled:
+    if SIDEPULSE_NOTCH_FEATURE_ENABLED and not target.settings.virtual_status_device_enabled:
         virtual_toggle = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Add Screen Bar",
+            "Add SidePulse Notch",
             "toggleVirtualStatusDevice:",
             "",
         )
@@ -2467,25 +3800,26 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
     agent.setState_(1 if device.display == LED_DISPLAY_AGENT else 0)
     submenu.addItem_(agent)
 
-    multiagent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "One LED Per Agent",
-        "setDeviceDisplayMultiagent:",
-        "",
-    )
-    multiagent.setTarget_(target)
-    multiagent.setRepresentedObject_(device.device_id)
-    multiagent.setState_(1 if device.display == LED_DISPLAY_MULTIAGENT else 0)
-    submenu.addItem_(multiagent)
+    if device.remote_link is None:
+        multiagent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "One LED Per Agent",
+            "setDeviceDisplayMultiagent:",
+            "",
+        )
+        multiagent.setTarget_(target)
+        multiagent.setRepresentedObject_(device.device_id)
+        multiagent.setState_(1 if device.display == LED_DISPLAY_MULTIAGENT else 0)
+        submenu.addItem_(multiagent)
 
-    battery = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "Battery Level",
-        "setDeviceDisplayBattery:",
-        "",
-    )
-    battery.setTarget_(target)
-    battery.setRepresentedObject_(device.device_id)
-    battery.setState_(1 if device.display == LED_DISPLAY_BATTERY else 0)
-    submenu.addItem_(battery)
+        battery = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Battery Level",
+            "setDeviceDisplayBattery:",
+            "",
+        )
+        battery.setTarget_(target)
+        battery.setRepresentedObject_(device.device_id)
+        battery.setState_(1 if device.display == LED_DISPLAY_BATTERY else 0)
+        submenu.addItem_(battery)
 
     custom = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
         "Manual",
@@ -2497,20 +3831,34 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
     custom.setState_(1 if device.display == LED_DISPLAY_CUSTOM else 0)
     submenu.addItem_(custom)
 
-    if device.device_id != VIRTUAL_DEVICE_ID:
+    if device.device_id != VIRTUAL_DEVICE_ID and device.remote_link is None:
         submenu.addItem_(NSMenuItem.separatorItem())
         submenu.addItem_(disabled_menu_item(f"Brightness {brightness_percent(device.brightness)}%"))
         submenu.addItem_(build_brightness_slider_item(device, target))
 
+    if device.remote_link is not None:
+        submenu.addItem_(NSMenuItem.separatorItem())
+        submenu.addItem_(disabled_menu_item("Linked iPhone"))
+        submenu.addItem_(disabled_menu_item(f"ID {device.remote_link.link_id}"))
+        submenu.addItem_(disabled_menu_item(device.remote_link.server))
+        remove_phone = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Remove iPhone...",
+            "removeLinkedPhone:",
+            "",
+        )
+        remove_phone.setTarget_(target)
+        remove_phone.setRepresentedObject_(device.remote_link.token)
+        submenu.addItem_(remove_phone)
+
     if device.device_id == VIRTUAL_DEVICE_ID:
         submenu.addItem_(NSMenuItem.separatorItem())
-        remove_screen_bar = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Remove Screen Bar",
+        remove_sidepulse_notch = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Remove SidePulse Notch",
             "toggleVirtualStatusDevice:",
             "",
         )
-        remove_screen_bar.setTarget_(target)
-        submenu.addItem_(remove_screen_bar)
+        remove_sidepulse_notch.setTarget_(target)
+        submenu.addItem_(remove_sidepulse_notch)
 
     if not device.connected:
         submenu.addItem_(NSMenuItem.separatorItem())
@@ -2629,6 +3977,18 @@ def build_setup_window(target: StatusBarController) -> NSWindow:
     return window
 
 
+def confirm_linked_phone_removal(name: str) -> bool:
+    alert = NSAlert.alloc().init()
+    alert.setMessageText_(f"Remove {name}?")
+    alert.setInformativeText_(
+        "This Mac will stop sending SidePulse updates to this iPhone. "
+        "You can link it again later."
+    )
+    alert.addButtonWithTitle_("Remove")
+    alert.addButtonWithTitle_("Cancel")
+    return alert.runModal() == NSAlertFirstButtonReturn
+
+
 def choose_debug_export_path(format_name: str) -> Path | None:
     extension = "csv" if format_name == "csv" else "html"
     panel = NSSavePanel.savePanel()
@@ -2636,6 +3996,40 @@ def choose_debug_export_path(format_name: str) -> Path | None:
     panel.setNameFieldStringValue_(f"sidepulse-agent-debug.{extension}")
     if hasattr(panel, "setAllowedFileTypes_"):
         panel.setAllowedFileTypes_([extension])
+    if panel.runModal() != 1:
+        return None
+    url = panel.URL()
+    if url is None:
+        return None
+    return Path(str(url.path()))
+
+
+def choose_animation_profile_export_path(profile_name: str) -> Path | None:
+    safe_name = "-".join(str(profile_name).strip().lower().split()) or "current"
+    safe_name = "".join(
+        char for char in safe_name if char.isalnum() or char in {"-", "_"}
+    )
+    panel = NSSavePanel.savePanel()
+    panel.setTitle_("Export SidePulse Animation Profile")
+    panel.setNameFieldStringValue_(f"sidepulse-{safe_name}-profile.json")
+    if hasattr(panel, "setAllowedFileTypes_"):
+        panel.setAllowedFileTypes_(["json"])
+    if panel.runModal() != 1:
+        return None
+    url = panel.URL()
+    if url is None:
+        return None
+    return Path(str(url.path()))
+
+
+def choose_animation_profile_import_path() -> Path | None:
+    panel = NSOpenPanel.openPanel()
+    panel.setTitle_("Import SidePulse Animation Profile")
+    panel.setCanChooseFiles_(True)
+    panel.setCanChooseDirectories_(False)
+    panel.setAllowsMultipleSelection_(False)
+    if hasattr(panel, "setAllowedFileTypes_"):
+        panel.setAllowedFileTypes_(["json"])
     if panel.runModal() != 1:
         return None
     url = panel.URL()
@@ -3282,8 +4676,8 @@ def rect_parts(rect) -> tuple[float, float, float, float]:
 
 
 def build_settings_window(target: StatusBarController) -> NSWindow:
-    width = 680
-    height = 560
+    width = SETTINGS_WINDOW_WIDTH
+    height = SETTINGS_WINDOW_HEIGHT
     style = (
         NSWindowStyleMaskTitled
         | NSWindowStyleMaskClosable
@@ -3296,32 +4690,29 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         False,
     )
     window.setTitle_("SidePulse Settings")
+    window.setDelegate_(target)
     window.setReleasedWhenClosed_(False)
     window.center()
     content = window.contentView()
 
     tab_width = width - 40
-    tab_height = height - 84
-    tab_view = NSTabView.alloc().initWithFrame_(((20, 54), (tab_width, tab_height)))
-    agents_tab = add_settings_tab(tab_view, "agents", "Agents", tab_width, tab_height)
-    devices_tab = add_settings_tab(
-        tab_view,
-        "devices",
-        "Devices & LEDs",
-        tab_width,
-        tab_height,
+    tab_height = height - SETTINGS_TAB_Y - SETTINGS_TAB_TOP_MARGIN
+    tab_view = NSTabView.alloc().initWithFrame_(
+        ((20, SETTINGS_TAB_Y), (tab_width, tab_height))
     )
-    sleep_tab = add_settings_tab(
+    tab_view.setDelegate_(target)
+    agents_tab = add_settings_tab(tab_view, "agents", "Agents", tab_width, tab_height)
+    animations_tab = add_settings_tab(
         tab_view,
-        "lid",
-        "Lid & Sleep",
+        "animations",
+        "Animations",
         tab_width,
         tab_height,
     )
     behavior_tab = add_settings_tab(
         tab_view,
         "behavior",
-        "Behavior",
+        "Advanced",
         tab_width,
         tab_height,
     )
@@ -3341,43 +4732,104 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     )
     content.addSubview_(tab_view)
 
-    add_label(agents_tab, "Agent Hooks", 24, 398, 200, 24)
-    add_label(agents_tab, "Codex", 32, 360, 80, 22)
-    codex_status = add_label(agents_tab, "", 130, 360, 240, 22)
-    add_button(agents_tab, "Install", 400, 356, 90, 28, target, "installCodexHooks:")
-    add_button(agents_tab, "Uninstall", 500, 356, 100, 28, target, "uninstallCodexHooks:")
+    agent_animations_tab = animations_tab
 
-    add_label(agents_tab, "Claude", 32, 326, 80, 22)
-    claude_status = add_label(agents_tab, "", 130, 326, 240, 22)
-    add_button(agents_tab, "Install", 400, 322, 90, 28, target, "installClaudeHooks:")
-    add_button(agents_tab, "Uninstall", 500, 322, 100, 28, target, "uninstallClaudeHooks:")
+    section_x = 24
+    label_x = 32
+    value_x = 130
+    primary_action_x = 400
+    secondary_action_x = 500
+    value_width = primary_action_x - value_x - 5
 
-    add_label(agents_tab, "Grok", 32, 292, 80, 22)
-    grok_status = add_label(agents_tab, "", 130, 292, 240, 22)
-    add_button(agents_tab, "Install", 400, 288, 90, 28, target, "installGrokHooks:")
-    add_button(agents_tab, "Uninstall", 500, 288, 100, 28, target, "uninstallGrokHooks:")
+    add_label(agents_tab, "Agent Hooks", section_x, 398, 200, 24)
 
-    add_separator(agents_tab, 24, 258, tab_width - 48)
-    add_label(agents_tab, "Session Opening", 24, 224, 240, 24)
-    add_label(agents_tab, "Codex", 32, 188, 100, 22)
-    codex_opener = add_provider_opener_popup(agents_tab, "codex", 160, 186, target)
-    add_label(agents_tab, "Claude", 32, 154, 100, 22)
-    claude_opener = add_provider_opener_popup(agents_tab, "claude", 160, 152, target)
-    add_label(agents_tab, "Grok Sessions", 32, 120, 120, 22)
-    grok_opener = add_provider_opener_popup(agents_tab, "grok", 160, 118, target)
+    def add_hook_row(
+        title: str,
+        y: int,
+        install_selector: str,
+        uninstall_selector: str,
+    ):
+        add_label(agents_tab, title, label_x, y, 80, 22)
+        status = add_label(agents_tab, "", value_x, y, value_width, 22)
+        add_button(
+            agents_tab,
+            "Install",
+            primary_action_x,
+            y - 4,
+            90,
+            28,
+            target,
+            install_selector,
+        )
+        add_button(
+            agents_tab,
+            "Uninstall",
+            secondary_action_x,
+            y - 4,
+            100,
+            28,
+            target,
+            uninstall_selector,
+        )
+        return status
 
-    add_label(agents_tab, "Terminal App", 376, 188, 120, 22)
-    terminal_popup = add_terminal_popup(agents_tab, 376, 156, target)
-    custom_terminal_path = add_label(agents_tab, "", 376, 128, 170, 22)
-    add_button(agents_tab, "Choose...", 500, 92, 100, 28, target, "chooseSessionTerminal:")
+    codex_status = add_hook_row(
+        "Codex", 364, "installCodexHooks:", "uninstallCodexHooks:"
+    )
+    claude_status = add_hook_row(
+        "Claude", 338, "installClaudeHooks:", "uninstallClaudeHooks:"
+    )
+    grok_status = add_hook_row(
+        "Grok", 312, "installGrokHooks:", "uninstallGrokHooks:"
+    )
+    cursor_status = add_hook_row(
+        "Cursor", 286, "installCursorHooks:", "uninstallCursorHooks:"
+    )
+    junie_status = add_hook_row(
+        "Junie", 260, "installJunieHooks:", "uninstallJunieHooks:"
+    )
 
-    add_separator(agents_tab, 24, 80, tab_width - 48)
-    add_label(agents_tab, "Transcript Monitoring", 24, 46, 240, 24)
+    add_separator(agents_tab, section_x, 246, tab_width - 48)
+    add_label(agents_tab, "Session Opening", section_x, 220, 240, 24)
+    add_label(agents_tab, "Terminal App", primary_action_x, 220, 200, 24)
+
+    add_label(agents_tab, "Codex", label_x, 184, 90, 22)
+    codex_opener = add_provider_opener_popup(
+        agents_tab, "codex", value_x, 182, target, width=value_width
+    )
+    add_label(agents_tab, "Claude", label_x, 150, 90, 22)
+    claude_opener = add_provider_opener_popup(
+        agents_tab, "claude", value_x, 148, target, width=value_width
+    )
+    add_label(agents_tab, "Grok", label_x, 116, 90, 22)
+    grok_opener = add_provider_opener_popup(
+        agents_tab, "grok", value_x, 114, target, width=value_width
+    )
+
+    terminal_popup = add_terminal_popup(
+        agents_tab, primary_action_x, 182, target, width=200
+    )
+    custom_terminal_path = add_label(
+        agents_tab, "", primary_action_x, 150, 200, 22
+    )
+    add_button(
+        agents_tab,
+        "Choose...",
+        secondary_action_x,
+        114,
+        100,
+        28,
+        target,
+        "chooseSessionTerminal:",
+    )
+
+    add_separator(agents_tab, section_x, 78, tab_width - 48)
+    add_label(agents_tab, "Transcript Monitoring", section_x, 50, 240, 24)
     codex_transcripts = add_checkbox(
         agents_tab,
         "CLI fallback: Codex transcripts",
         32,
-        14,
+        18,
         260,
         24,
         target,
@@ -3387,50 +4839,131 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         agents_tab,
         "CLI fallback: Claude transcripts",
         312,
-        14,
+        18,
         260,
         24,
         target,
         "toggleClaudeTranscripts:",
     )
 
-    add_label(devices_tab, "LED Display", 24, 398, 240, 24)
-    battery_leds = add_checkbox(
-        devices_tab,
-        "Show battery on LEDs",
-        32,
-        356,
-        260,
-        24,
+    add_label(agent_animations_tab, "Profile", 32, 360, 56, 24)
+    animation_profile = add_agent_animation_profile_popup(
+        agent_animations_tab,
+        88,
+        360,
         target,
-        "setBatteryLedDisplayFromCheckbox:",
     )
-    battery_power_preview = add_checkbox(
-        devices_tab,
-        "Show battery for 7s on plug/unplug",
-        32,
-        318,
-        320,
-        24,
+    add_button(
+        agent_animations_tab,
+        "Save Profile…",
+        288,
+        359,
+        112,
+        28,
         target,
-        "setBatteryPowerPreviewFromCheckbox:",
+        "showAgentAnimationProfileEditor:",
     )
-
-    add_label(sleep_tab, "Lid Closed", 24, 398, 120, 22)
-    add_label(sleep_tab, "Duration", 516, 398, 70, 22)
-    closed_duration = add_editable_field(sleep_tab, "", 588, 396, 48, 24)
-    closed_program = add_text_view(sleep_tab, "", 24, 276, 612, 110)
-    add_button(sleep_tab, "Preview", 24, 236, 90, 28, target, "previewLidClosedAnimation:")
-    add_button(sleep_tab, "Reset", 124, 236, 90, 28, target, "resetLidClosedAnimation:")
-
-    add_separator(sleep_tab, 24, 210, tab_width - 48)
-    add_label(sleep_tab, "Lid Open", 24, 176, 120, 22)
-    add_label(sleep_tab, "Duration", 516, 176, 70, 22)
-    open_duration = add_editable_field(sleep_tab, "", 588, 174, 48, 24)
-    open_program = add_text_view(sleep_tab, "", 24, 54, 612, 110)
-    add_button(sleep_tab, "Preview", 24, 14, 90, 28, target, "previewLidOpenAnimation:")
-    add_button(sleep_tab, "Reset", 124, 14, 90, 28, target, "resetLidOpenAnimation:")
-    add_button(sleep_tab, "Save Animations", 490, 14, 146, 28, target, "saveLidAnimations:")
+    delete_animation_profile = add_button(
+        agent_animations_tab,
+        "Delete",
+        408,
+        359,
+        82,
+        28,
+        target,
+        "deleteAgentAnimationProfile:",
+    )
+    selected_profile_id = getattr(
+        target,
+        "selected_agent_animation_profile_id",
+        AGENT_ANIMATION_PROFILE_CUSTOM,
+    )
+    target_settings = getattr(target, "settings", AgentMonitorSettings())
+    delete_animation_profile.setEnabled_(
+        selected_profile_id in target_settings.agent_animation_profiles
+        and selected_profile_id not in AGENT_ANIMATION_BUILT_IN_PROFILE_IDS
+    )
+    add_button(
+        agent_animations_tab,
+        "Export JSON",
+        32,
+        321,
+        110,
+        28,
+        target,
+        "exportAgentAnimationProfile:",
+    )
+    add_button(
+        agent_animations_tab,
+        "Import JSON",
+        150,
+        321,
+        110,
+        28,
+        target,
+        "importAgentAnimationProfile:",
+    )
+    add_button(
+        agent_animations_tab,
+        "Add Custom…",
+        492,
+        321,
+        138,
+        28,
+        target,
+        "addCustomAgentAnimation:",
+    )
+    add_label(agent_animations_tab, "State", 24, 287, 178, 24)
+    add_label(agent_animations_tab, "Animation", 210, 287, 190, 24)
+    add_label(agent_animations_tab, "Live Preview", 410, 287, 90, 24)
+    add_label(agent_animations_tab, "Actions", 510, 287, 126, 24)
+    animation_popups = {}
+    animation_previews = {}
+    for index, mode_value in enumerate(ANIMATION_UI_STATES):
+        row_y = 253 - index * 28
+        add_label(
+            agent_animations_tab,
+            ANIMATION_STATE_LABELS[mode_value],
+            24,
+            row_y + 2,
+            178,
+            22,
+        )
+        animation_popups[mode_value] = add_agent_animation_popup(
+            agent_animations_tab,
+            mode_value,
+            210,
+            row_y,
+            target,
+        )
+        preview = VirtualLedView.alloc().initWithFrame_(
+            ((410, row_y - 1), (90, 28))
+        )
+        preview.setCompactPreview_(True)
+        agent_animations_tab.addSubview_(preview)
+        animation_previews[mode_value] = preview
+        show_button = add_button(
+            agent_animations_tab,
+            "Show",
+            510,
+            row_y - 1,
+            58,
+            28,
+            target,
+            "showAgentAnimationOnDevice:",
+        )
+        show_button.setRepresentedObject_(mode_value)
+        edit_button = add_button(
+            agent_animations_tab,
+            "Edit",
+            574,
+            row_y - 1,
+            62,
+            28,
+            target,
+            "editAgentAnimation:",
+        )
+        edit_button.setRepresentedObject_(mode_value)
 
     add_label(behavior_tab, "Agent List", 24, 398, 240, 24)
     add_label(behavior_tab, "Keep last 10 sessions for", 32, 356, 180, 22)
@@ -3444,7 +4977,47 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     add_label(behavior_tab, "Let Mac sleep on battery below", 32, 196, 210, 22)
     min_battery_percent = add_editable_field(behavior_tab, "", 260, 194, 58, 24)
     add_label(behavior_tab, "%", 328, 196, 24, 22)
-    add_button(behavior_tab, "Save", 32, 112, 90, 28, target, "saveAgentListTiming:")
+    for field in (retention_hours, idle_minutes, min_battery_percent):
+        field.setTarget_(target)
+        field.setAction_("saveAgentListTiming:")
+        field.cell().setSendsActionOnEndEditing_(True)
+    add_separator(behavior_tab, 24, 140, tab_width - 48)
+    battery_power_preview = add_checkbox(
+        behavior_tab,
+        "Show battery for 7s on plug/unplug",
+        32,
+        106,
+        320,
+        24,
+        target,
+        "setBatteryPowerPreviewFromCheckbox:",
+    )
+    add_separator(behavior_tab, 24, 96, tab_width - 48)
+    show_menu_bar_icon = add_checkbox(
+        behavior_tab, "Show menu bar icon", 32, 60, 280, 24,
+        target, "setMenuBarIconFromCheckbox:",
+    )
+    settings_hint = add_label(
+        behavior_tab, "Reopen settings anytime: run sidepulse settings in Terminal.",
+        32, 28, 588, 22,
+    )
+    hint_text = str(settings_hint.stringValue())
+    hint = NSMutableAttributedString.alloc().initWithString_attributes_(
+        hint_text,
+        {
+            NSFontAttributeName: settings_hint.font(),
+            NSForegroundColorAttributeName: NSColor.labelColor(),
+        },
+    )
+    hint.addAttribute_value_range_(
+        NSFontAttributeName,
+        NSFont.monospacedSystemFontOfSize_weight_(
+            settings_hint.font().pointSize(), NSFontWeightBold,
+        ),
+        (hint_text.index("sidepulse settings"), len("sidepulse settings")),
+    )
+    settings_hint.setAttributedStringValue_(hint)
+    settings_hint.setSelectable_(True)
 
     add_label(history_tab, "Status History", 24, 398, 240, 24)
     add_label(history_tab, "Timeframe", 430, 398, 76, 22)
@@ -3470,37 +5043,225 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     add_label(diagnostics_tab, "Settings File", 24, 246, 240, 24)
     settings_path = add_label(diagnostics_tab, "", 32, 208, 588, 22)
 
-    message = add_label(content, "", 24, 22, width - 48, 22)
+    message = add_label(content, "", 24, 12, width - 48, 22)
 
     target.settings_fields = {
         "codex_hook_status": codex_status,
         "claude_hook_status": claude_status,
         "grok_hook_status": grok_status,
+        "cursor_hook_status": cursor_status,
+        "junie_hook_status": junie_status,
         "debug_log_status": debug_log_status,
         "codex_session_opener": codex_opener,
         "claude_session_opener": claude_opener,
         "grok_session_opener": grok_opener,
         "session_terminal": terminal_popup,
         "custom_terminal_path": custom_terminal_path,
-        "closed_animation_program": closed_program,
-        "closed_animation_duration": closed_duration,
-        "open_animation_program": open_program,
-        "open_animation_duration": open_duration,
         "recent_session_retention_hours": retention_hours,
         "idle_timeout_minutes": idle_minutes,
         "sleep_prevention_min_battery_percent": min_battery_percent,
         "status_history_timeframe": history_timeframe,
         "status_history_status": history_status,
         "status_history_chart": history_chart,
+        "agent_animation_profile": animation_profile,
         "message": message,
         "settings_path": settings_path,
+        **{
+            f"agent_animation_{mode}": popup
+            for mode, popup in animation_popups.items()
+        },
+        **{
+            f"agent_animation_preview_{mode}": preview
+            for mode, preview in animation_previews.items()
+        },
     }
     target.settings_buttons = {
+        "show_menu_bar_icon": show_menu_bar_icon,
         "codex_transcripts": codex_transcripts,
         "claude_transcripts": claude_transcripts,
-        "battery_leds": battery_leds,
         "battery_power_preview": battery_power_preview,
+        "delete_agent_animation_profile": delete_animation_profile,
     }
+    return window
+
+
+def build_agent_animation_editor_window(target: StatusBarController) -> NSWindow:
+    install_standard_edit_menu()
+    width = 640
+    height = 400
+    style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+    window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        ((0, 0), (width, height)),
+        style,
+        NSBackingStoreBuffered,
+        False,
+    )
+    window.setTitle_("Custom Agent Animation")
+    window.setReleasedWhenClosed_(False)
+    window.center()
+    content = window.contentView()
+    add_label(content, "Name", 20, 354, 70, 24)
+    target.agent_animation_editor_name = add_editable_field(
+        content,
+        "",
+        90,
+        352,
+        530,
+        24,
+    )
+    add_label(
+        content,
+        "Enter a LEDS.LED program (maximum 512 bytes and 20 lines).",
+        20,
+        316,
+        600,
+        24,
+    )
+    add_label(content, "Live Preview", 20, 274, 90, 24)
+    target.agent_animation_editor_preview = VirtualLedView.alloc().initWithFrame_(
+        ((116, 272), (220, 28))
+    )
+    target.agent_animation_editor_preview.setCompactPreview_(True)
+    content.addSubview_(target.agent_animation_editor_preview)
+    target.agent_animation_editor_preview_status = add_label(
+        content,
+        "Updates as you type",
+        350,
+        274,
+        270,
+        24,
+    )
+    target.agent_animation_editor_preview_status.setTextColor_(
+        NSColor.secondaryLabelColor()
+    )
+    target.agent_animation_editor_program = add_text_view(
+        content,
+        "",
+        20,
+        70,
+        600,
+        190,
+    )
+    target.agent_animation_editor_program.setDelegate_(target)
+    add_button(
+        content,
+        "Show on Device",
+        20,
+        22,
+        150,
+        30,
+        target,
+        "showAgentAnimationEditorOnDevice:",
+    )
+    add_button(
+        content,
+        "Cancel",
+        420,
+        22,
+        90,
+        30,
+        target,
+        "cancelAgentAnimationCustom:",
+    )
+    add_button(
+        content,
+        "Save",
+        520,
+        22,
+        100,
+        30,
+        target,
+        "saveAgentAnimationCustom:",
+    )
+    return window
+
+
+STANDARD_EDIT_MENU_ITEMS = (
+    ("Cut", "cut:", "x"),
+    ("Copy", "copy:", "c"),
+    ("Paste", "paste:", "v"),
+    ("Select All", "selectAll:", "a"),
+)
+
+
+def install_standard_edit_menu(app=None) -> NSMenu | None:
+    """Install first-responder text shortcuts for the accessory application."""
+    application = app or NSApp
+    if application is None:
+        return None
+    main_menu = application.mainMenu()
+    if main_menu is None:
+        main_menu = NSMenu.alloc().initWithTitle_("Main Menu")
+        application.setMainMenu_(main_menu)
+
+    for index in range(main_menu.numberOfItems()):
+        existing = main_menu.itemAtIndex_(index).submenu()
+        if existing is not None and str(existing.title()) == "Edit":
+            return existing
+
+    edit_menu = NSMenu.alloc().initWithTitle_("Edit")
+    edit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Edit",
+        None,
+        "",
+    )
+    edit_item.setSubmenu_(edit_menu)
+    main_menu.addItem_(edit_item)
+    for title, action, key in STANDARD_EDIT_MENU_ITEMS:
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            title,
+            action,
+            key,
+        )
+        edit_menu.addItem_(item)
+    return edit_menu
+
+
+def build_agent_animation_profile_editor_window(
+    target: StatusBarController,
+) -> NSWindow:
+    width = 420
+    height = 150
+    style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+    window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        ((0, 0), (width, height)),
+        style,
+        NSBackingStoreBuffered,
+        False,
+    )
+    window.setTitle_("Save Animation Profile")
+    window.setReleasedWhenClosed_(False)
+    window.center()
+    content = window.contentView()
+    add_label(content, "Profile Name", 20, 98, 100, 24)
+    target.agent_animation_profile_editor_name = add_editable_field(
+        content,
+        "",
+        122,
+        96,
+        278,
+        24,
+    )
+    add_button(
+        content,
+        "Cancel",
+        220,
+        30,
+        82,
+        30,
+        target,
+        "cancelAgentAnimationProfile:",
+    )
+    add_button(
+        content,
+        "Save",
+        312,
+        30,
+        88,
+        30,
+        target,
+        "saveAgentAnimationProfile:",
+    )
     return window
 
 
@@ -3564,9 +5325,178 @@ def add_checkbox(
     return checkbox
 
 
-def add_provider_opener_popup(parent, provider: str, x: int, y: int, target):
+def add_agent_animation_popup(parent, state: str, x: int, y: int, target):
     popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-        ((x, y), (180, 26)), False
+        ((x, y), (190, 26)), False
+    )
+    popup.setTarget_(target)
+    popup.setAction_("setAgentAnimationStyle:")
+    refresh_agent_animation_popup(
+        popup,
+        state,
+        getattr(target, "settings", AgentMonitorSettings()),
+        getattr(target, "settings", AgentMonitorSettings()).agent_animation_id(state),
+    )
+    parent.addSubview_(popup)
+    return popup
+
+
+def agent_animation_label(settings: AgentMonitorSettings, animation_id: str) -> str:
+    built_in = {
+        AGENT_ANIMATION_SLOW_OFF: "Slow Off",
+        AGENT_ANIMATION_IMMEDIATE_OFF: "Immediate Off",
+        AGENT_ANIMATION_IDLE_PULSE: "Idle Pulse",
+        AGENT_ANIMATION_CYAN_ROLL: "Cyan Roll",
+        AGENT_ANIMATION_CYAN_COMPLETE: "Cyan Complete",
+        AGENT_ANIMATION_AMBER_PULSE: "Amber Pulse",
+        AGENT_ANIMATION_SOLID_GREEN: "Solid Green",
+        AGENT_ANIMATION_KITT: "KITT Scanner",
+        AGENT_ANIMATION_KITT_RED: "KITT Scanner Red",
+        AGENT_ANIMATION_EMBER_IDLE: "Ember Idle",
+        AGENT_ANIMATION_EMBER_TIDE: "Ember Tide",
+        AGENT_ANIMATION_EMBER_ATTENTION: "Ember Attention",
+        AGENT_ANIMATION_EMBER_COMPLETE: "Ember Complete",
+        AGENT_ANIMATION_EMBER_LID_OPEN: "Ember Lid Open",
+        AGENT_ANIMATION_PURPLE_IDLE: "Purple Idle",
+        AGENT_ANIMATION_PURPLE_TIDE: "Purple Tide",
+        AGENT_ANIMATION_PURPLE_ATTENTION: "Purple Attention",
+        AGENT_ANIMATION_PURPLE_COMPLETE: "Purple Complete",
+        AGENT_ANIMATION_PURPLE_LID_OPEN: "Purple Lid Open",
+        AGENT_ANIMATION_NIGHT_RIDER: "Night Rider",
+        AGENT_ANIMATION_LID_OPEN: "Lid Open Sweep",
+        AGENT_ANIMATION_LID_CLOSED: "Lid Closed Sweep",
+    }.get(animation_id)
+    if built_in is not None:
+        return built_in
+    custom = settings.custom_agent_animations.get(animation_id)
+    return custom.name if custom is not None else "Default"
+
+
+def refresh_agent_animation_popup(
+    popup,
+    state: str,
+    settings: AgentMonitorSettings,
+    selected_animation_id: str,
+) -> None:
+    popup.removeAllItems()
+    for animation_id in settings.agent_animation_choices():
+        label = agent_animation_label(settings, animation_id)
+        popup.addItemWithTitle_(label)
+        item = popup.lastItem()
+        item.setRepresentedObject_(
+            {"mode": state, "animation_id": animation_id}
+        )
+        menu_view = AgentAnimationMenuItemView.alloc().initWithFrame_(
+            ((0, 0), (204, 32))
+        )
+        menu_view.configurePopup_mode_animation_label_program_(
+            popup,
+            state,
+            animation_id,
+            label,
+            agent_animation_catalog_program(settings, state, animation_id),
+        )
+        item.setView_(menu_view)
+    popup.menu().addItem_(NSMenuItem.separatorItem())
+    popup.addItemWithTitle_("Add Custom…")
+    popup.lastItem().setRepresentedObject_(
+        {"mode": state, "animation_id": AGENT_ANIMATION_ADD_CUSTOM}
+    )
+    for index in range(popup.numberOfItems()):
+        payload = popup.itemAtIndex_(index).representedObject()
+        if (
+            isinstance(payload, dict)
+            and payload.get("animation_id") == selected_animation_id
+        ):
+            popup.selectItemAtIndex_(index)
+            return
+    popup.selectItemAtIndex_(0)
+
+
+def agent_animation_catalog_program(
+    settings: AgentMonitorSettings,
+    state: str,
+    animation_id: str,
+) -> str:
+    selected = settings.with_agent_animation(state, animation_id)
+    animation = selected.agent_animation(state)
+    mode = AgentMode(state) if state in AGENT_ANIMATION_MODES else AgentMode.IDLE_READY
+    return program_for_agent_mode(
+        mode,
+        led_count=8,
+        animation_style=animation.style,
+        custom_program=animation.custom_program,
+    )
+
+
+def animation_state_program(
+    settings: AgentMonitorSettings,
+    state: str,
+    *,
+    led_count: int = 8,
+) -> str:
+    animation = settings.agent_animation(state)
+    mode = AgentMode(state) if state in AGENT_ANIMATION_MODES else AgentMode.IDLE_READY
+    return program_for_agent_mode(
+        mode,
+        led_count=led_count,
+        animation_style=animation.style,
+        custom_program=animation.custom_program,
+    )
+
+
+def add_agent_animation_profile_popup(parent, x: int, y: int, target):
+    popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+        ((x, y), (190, 26)), False
+    )
+    popup.setTarget_(target)
+    popup.setAction_("applyAgentAnimationProfile:")
+    refresh_agent_animation_profile_popup(
+        popup,
+        getattr(target, "settings", AgentMonitorSettings()),
+        getattr(target, "selected_agent_animation_profile_id", ""),
+    )
+    parent.addSubview_(popup)
+    return popup
+
+
+def refresh_agent_animation_profile_popup(
+    popup,
+    settings: AgentMonitorSettings,
+    selected_profile_id: str = AGENT_ANIMATION_PROFILE_CUSTOM,
+) -> None:
+    popup.removeAllItems()
+    popup.addItemWithTitle_("Current")
+    popup.lastItem().setRepresentedObject_(AGENT_ANIMATION_PROFILE_CUSTOM)
+    for profile_id, profile in sorted(
+        settings.agent_animation_profiles.items(),
+        key=lambda item: (item[1].name.casefold(), item[0]),
+    ):
+        popup.addItemWithTitle_(profile.name)
+        popup.lastItem().setRepresentedObject_(profile_id)
+
+    selected = (
+        selected_profile_id
+        if selected_profile_id in settings.agent_animation_profiles
+        else AGENT_ANIMATION_PROFILE_CUSTOM
+    )
+    for index in range(popup.numberOfItems()):
+        if str(popup.itemAtIndex_(index).representedObject()) == selected:
+            popup.selectItemAtIndex_(index)
+            return
+
+
+def add_provider_opener_popup(
+    parent,
+    provider: str,
+    x: int,
+    y: int,
+    target,
+    *,
+    width: int = 180,
+):
+    popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+        ((x, y), (width, 26)), False
     )
     popup.setTarget_(target)
     popup.setAction_("setProviderOpenPreference:")
@@ -3579,9 +5509,9 @@ def add_provider_opener_popup(parent, provider: str, x: int, y: int, target):
     return popup
 
 
-def add_terminal_popup(parent, x: int, y: int, target):
+def add_terminal_popup(parent, x: int, y: int, target, *, width: int = 150):
     popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-        ((x, y), (150, 26)), False
+        ((x, y), (width, 26)), False
     )
     popup.setTarget_(target)
     popup.setAction_("setSessionTerminal:")
@@ -3783,7 +5713,9 @@ def add_text_view(parent, text: str, x: int, y: int, width: int, height: int):
     scroll = NSScrollView.alloc().initWithFrame_(((x, y), (width, height)))
     scroll.setHasVerticalScroller_(True)
     scroll.setHasHorizontalScroller_(False)
-    text_view = NSTextView.alloc().initWithFrame_(((0, 0), (width, height)))
+    text_view = AnimationProgramTextView.alloc().initWithFrame_(
+        ((0, 0), (width, height))
+    )
     text_view.setString_(text)
     text_view.setVerticallyResizable_(True)
     text_view.setHorizontallyResizable_(False)
@@ -3883,6 +5815,12 @@ def validate_lid_animation(animation: LedAnimationSetting) -> None:
     normalize_animation_duration(animation.duration_seconds)
 
 
+def validate_agent_animation_program(program: str) -> None:
+    normalized = normalize_led_text(program)
+    validate_led_text(normalized)
+    validate_led_text(apply_brightness(normalized, 1))
+
+
 def program_for_lid_animation(
     animation: LedAnimationSetting,
     *,
@@ -3914,7 +5852,7 @@ def restore_led_display(target, token_value) -> None:
 
 def hook_status_text(config: ProviderConfig) -> str:
     if not config.exists:
-        return f"Not installed - config will be created at {config.config_path}"
+        return "Not installed — config created on install"
     if config.hook_events:
         event_count = len(config.hook_events)
         suffix = "event" if event_count == 1 else "events"
@@ -3926,6 +5864,21 @@ def device_id_for_root(root: Path) -> str:
     return str(root.expanduser())
 
 
+def linked_phone_device_id(link: IOSLink) -> str:
+    return f"{LINKED_PHONE_DEVICE_PREFIX}{link.link_id}"
+
+
+def remote_event_data(snapshot: BatterySnapshot | None) -> dict[str, object]:
+    source: dict[str, object] = {"name": socket.gethostname()}
+    if snapshot is not None and snapshot.battery_present:
+        source["battery"] = {
+            "level": snapshot.percent,
+            "charging": snapshot.is_charging,
+            "plugged_in": snapshot.is_plugged,
+        }
+    return {"source": source}
+
+
 def device_connection_signature(
     devices: list[StatusBarDevice],
 ) -> tuple[tuple[str, str, str], ...]:
@@ -3934,7 +5887,11 @@ def device_connection_signature(
             (
                 device.device_id,
                 str(device.target),
-                device_mount_key(device.root),
+                (
+                    f"remote/{device.remote_link.name}:{device.remote_link.server}"
+                    if device.remote_link is not None
+                    else device_mount_key(device.root)
+                ),
             )
             for device in devices
             if device.connected
@@ -3952,7 +5909,7 @@ def device_mount_key(root: Path) -> str:
 
 def device_display_name(name: str) -> str:
     normalized = normalized_device_name(name)
-    if "sidepulsedot" in normalized:
+    if "sidepulsedot" in normalized or "pulsedot" in normalized:
         return "SidePulse Dot"
     if "sidepulsepro" in normalized:
         return "SidePulse Pro"
@@ -3998,6 +5955,7 @@ def disambiguate_device_names(devices: list[StatusBarDevice]) -> list[StatusBarD
                 display=device.display,
                 brightness=device.brightness,
                 reason=device.reason,
+                remote_link=device.remote_link,
             )
         )
     return result
@@ -4109,19 +6067,81 @@ def session_open_action_title(status: AgentStatus, action: str, settings=None) -
     return session_open_action_label(status, action)
 
 
-def session_row_icon_for_status(status: AgentStatus):
+def session_row_icon_for_status(
+    status: AgentStatus, animation_frame: int | None = None, *, dark_mode: bool | None = None,
+):
+    if dark_mode is None:
+        dark_mode = is_dark_appearance()
+    state = state_for_mode(status.mode)
+    if animation_frame is not None and state in (STATE_WORKING, STATE_ASK):
+        return animated_session_row_icon(
+            state, animation_frame, session_origin_icon_for_status(status), dark_mode,
+        )
+    cache_key = (
+        status.mode.value,
+        status.provider.lower(),
+        normalized_origin_text(status.origin),
+        dark_mode,
+    )
+    if cache_key in _session_row_icon_cache:
+        return _session_row_icon_cache[cache_key]
+
     status_icon = status_icon_for_status(status)
     origin_icon = session_origin_icon_for_status(status)
     if origin_icon is None:
-        return status_icon
-    if status_icon is None:
-        return origin_icon
-    return horizontal_icon_pair(status_icon, origin_icon)
+        image = status_icon
+    elif status_icon is None:
+        image = origin_icon
+    else:
+        image = horizontal_icon_pair(status_icon, origin_icon, dark_mode=dark_mode)
+    _session_row_icon_cache[cache_key] = image
+    return image
 
 
 def status_icon_for_status(status: AgentStatus):
     state = state_for_mode(status.mode)
     return image_for_symbol(state.symbol, state.label)
+
+
+@lru_cache(maxsize=STATUS_ICON_FRAME_COUNT * 2)
+def animated_status_icon(state: StatusBarState, frame: int):
+    source = image_for_symbol(state.symbol, state.label)
+    if source is None:
+        return None
+    phase = frame / STATUS_ICON_FRAME_COUNT
+    pulse = (1.0 + math.cos(2.0 * math.pi * phase)) / 2.0
+    scale = 1.0 if state == STATE_WORKING else 0.82 + 0.18 * pulse
+    opacity = 1.0 if state == STATE_WORKING else 0.45 + 0.55 * pulse
+    image = NSImage.alloc().initWithSize_((18.0, 18.0))
+    image.lockFocus()
+    NSGraphicsContext.saveGraphicsState()
+    try:
+        transform = NSAffineTransform.transform()
+        transform.translateXBy_yBy_(9.0, 9.0)
+        if state == STATE_WORKING:
+            transform.rotateByDegrees_(-360.0 * phase)
+        transform.scaleBy_(scale)
+        transform.concat()
+        source.drawInRect_fromRect_operation_fraction_(
+            ((-7.5, -7.5), (15.0, 15.0)), image_source_rect(source),
+            NSCompositingOperationSourceOver, opacity,
+        )
+    finally:
+        NSGraphicsContext.restoreGraphicsState()
+        image.unlockFocus()
+    image.setTemplate_(True)
+    return image
+
+
+@lru_cache(maxsize=512)
+def animated_session_row_icon(state: StatusBarState, frame: int, origin_icon, dark_mode: bool = False):
+    # Only the status glyph moves; the provider/host badge remains stationary.
+    icon = animated_status_icon(state, frame)
+    if origin_icon is None:
+        return icon
+    if icon is None:
+        return origin_icon
+    return horizontal_icon_pair(icon, origin_icon, dark_mode=dark_mode)
 
 
 def session_origin_icon_for_status(status: AgentStatus):
@@ -4138,57 +6158,71 @@ def provider_icon_for_status(status: AgentStatus):
 
 def provider_icon_for_provider(provider: str):
     provider = provider.lower()
+    if provider in _provider_icon_cache:
+        return _provider_icon_cache[provider]
+    image = None
     if provider == "codex":
         for path in ("/Applications/Codex.app", "/Applications/ChatGPT.app"):
             image = app_icon(path)
             if image is not None:
-                return image
-        return image_for_symbol("sparkles", "Codex")
-    if provider == "claude":
+                break
+        image = image or image_for_symbol("sparkles", "Codex")
+    elif provider == "claude":
         image = app_icon("/Applications/Claude.app")
-        if image is not None:
-            return image
-        return image_for_symbol("brain.head.profile", "Claude")
-    if provider == "grok":
+        image = image or image_for_symbol("brain.head.profile", "Claude")
+    elif provider == "grok":
         image = app_icon("/Applications/Grok.app")
-        if image is not None:
-            return image
-        return grok_badge_icon()
-    return image_for_symbol("terminal", provider.title() or "Agent")
+        image = image or grok_badge_icon()
+    elif provider == "opencode":
+        image = app_icon("/Applications/OpenCode.app")
+        image = image or image_for_symbol(
+            "chevron.left.forwardslash.chevron.right", "opencode"
+        )
+    else:
+        # Any other provider resolves its own app by name, so a new agent needs no branch
+        # here. Only providers with an alias or a custom glyph need one.
+        image = provider_app_icon(provider)
+        image = image or image_for_symbol("terminal", provider_label(provider) or "Agent")
+    _provider_icon_cache[provider] = image
+    return image
 
 
 def host_icon_for_origin(origin: str | None):
     normalized = normalized_origin_text(origin)
     if not normalized:
         return None
+    if normalized in _origin_icon_cache:
+        return _origin_icon_cache[normalized]
+    image = None
     if "vs code" in normalized or "vscode" in normalized or "visual studio code" in normalized:
-        return first_app_icon(
+        image = first_app_icon(
             (
                 "/Applications/Visual Studio Code.app",
                 "/Applications/Visual Studio Code - Insiders.app",
             )
         ) or image_for_symbol("chevron.left.forwardslash.chevron.right", "VS Code")
-    if "cursor" in normalized:
-        return first_app_icon(("/Applications/Cursor.app",)) or image_for_symbol(
+    elif "cursor" in normalized:
+        image = first_app_icon(("/Applications/Cursor.app",)) or image_for_symbol(
             "cursorarrow",
             "Cursor",
         )
-    if "windsurf" in normalized:
-        return first_app_icon(("/Applications/Windsurf.app",)) or image_for_symbol(
+    elif "windsurf" in normalized:
+        image = first_app_icon(("/Applications/Windsurf.app",)) or image_for_symbol(
             "wind",
             "Windsurf",
         )
-    if any(token in normalized for token in ("cli", "terminal", "command line")):
-        return first_app_icon(
+    elif any(token in normalized for token in ("cli", "terminal", "command line")):
+        image = first_app_icon(
             (
                 "/System/Applications/Utilities/Terminal.app",
                 "/Applications/iTerm.app",
                 "/Applications/iTerm2.app",
             )
         ) or image_for_symbol("terminal", "Terminal")
-    if "transcript" in normalized:
-        return image_for_symbol("doc.text", "Transcript")
-    return None
+    elif "transcript" in normalized:
+        image = image_for_symbol("doc.text", "Transcript")
+    _origin_icon_cache[normalized] = image
+    return image
 
 
 def first_app_icon(paths: tuple[str, ...]):
@@ -4226,7 +6260,16 @@ def composite_app_icons(host_icon, provider_icon):
     return image
 
 
-def horizontal_icon_pair(left_icon, right_icon):
+def is_dark_appearance(appearance=None) -> bool:
+    appearance = appearance or NSApplication.sharedApplication().effectiveAppearance()
+    return appearance.bestMatchFromAppearancesWithNames_(
+        [NSAppearanceNameAqua, NSAppearanceNameDarkAqua],
+    ) == NSAppearanceNameDarkAqua
+
+
+def horizontal_icon_pair(left_icon, right_icon, *, dark_mode: bool | None = None):
+    if dark_mode is None:
+        dark_mode = is_dark_appearance()
     left_width = 15.5
     right_width = float(right_icon.size().width)
     width = left_width + 3.0 + right_width
@@ -4239,6 +6282,12 @@ def horizontal_icon_pair(left_icon, right_icon):
             image_source_rect(left_icon),
             NSCompositingOperationSourceOver,
             1.0,
+        )
+        # The combined image contains a full-color app badge and cannot be a
+        # template. Tint only the status glyph, preserving its animated alpha.
+        (NSColor.whiteColor() if dark_mode else NSColor.blackColor()).set()
+        NSRectFillUsingOperation(
+            ((0.0, 0.0), (left_width, height)), NSCompositingOperationSourceIn,
         )
         right_icon.drawInRect_fromRect_operation_fraction_(
             ((left_width + 3.0, 0.0), (right_width, height)),
@@ -4262,6 +6311,11 @@ def normalized_origin_text(origin: str | None) -> str:
 
 
 _grok_badge_icon = None
+_app_icon_cache = {}
+_provider_icon_cache = {}
+_origin_icon_cache = {}
+_session_row_icon_cache = {}
+_symbol_icon_cache = {}
 
 
 def grok_badge_icon():
@@ -4295,12 +6349,31 @@ def grok_badge_icon():
     return image
 
 
+def provider_app_icon(provider: str):
+    """Resolve a provider's own application icon by name.
+
+    LaunchServices matches an application name case-insensitively, so a provider named
+    "opencode" finds OpenCode.app and "ghostty" finds Ghostty.app. This keeps new
+    providers from needing a branch in provider_icon_for_provider. Returns None when no
+    application matches, which includes every provider that is not an installed app.
+    """
+    try:
+        path = NSWorkspace.sharedWorkspace().fullPathForApplication_(provider)
+    except Exception:
+        return None
+    return app_icon(path) if path else None
+
+
 def app_icon(path: str):
+    if path in _app_icon_cache:
+        return _app_icon_cache[path]
     if not Path(path).exists():
+        _app_icon_cache[path] = None
         return None
     image = NSWorkspace.sharedWorkspace().iconForFile_(path)
     if image is not None:
         image.setSize_((18, 18))
+    _app_icon_cache[path] = image
     return image
 
 
@@ -4466,6 +6539,9 @@ def project_name_from_cwd(cwd: str | None) -> str | None:
 
 
 def image_for_symbol(symbol: str, description: str):
+    cache_key = (symbol, description)
+    if cache_key in _symbol_icon_cache:
+        return _symbol_icon_cache[cache_key]
     try:
         image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
             symbol,
@@ -4475,6 +6551,7 @@ def image_for_symbol(symbol: str, description: str):
             image.setTemplate_(True)
     except Exception:
         image = None
+    _symbol_icon_cache[cache_key] = image
     return image
 
 
@@ -5043,15 +7120,21 @@ def applescript_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def run_status_bar() -> None:
+def run_status_bar(*, show_settings: bool = False) -> None:
     app = NSApplication.sharedApplication()
     controller = StatusBarController.alloc().init()
+    controller.open_settings_on_launch = show_settings
     app.setDelegate_(controller)
     app.run()
 
 
-def main() -> int:
-    run_status_bar()
+def main(*, show_settings: bool = False) -> int:
+    if show_settings:
+        from .ipc import request_settings_window
+
+        if request_settings_window():
+            return 0
+    run_status_bar(show_settings=show_settings)
     return 0
 
 

@@ -6,6 +6,7 @@ import json
 import os
 import plistlib
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -48,6 +49,7 @@ from sidepulse.device_writer import (
     MAX_LED_BYTES,
     MAX_LED_LINES,
     DeviceWriteError,
+    default_mount_roots,
     discover_devices,
     normalize_led_text,
     validate_led_text,
@@ -81,8 +83,12 @@ from sidepulse.led_status import (
     AgentLedController,
     LedDisplayState,
     MultiAgentLedController,
+    apply_brightness,
+    builtin_animation_file_name,
+    builtin_animation_program,
     display_state_for_mode,
     led_count_for_target,
+    program_for_agent_mode,
     program_for_display_state,
     program_for_slots,
     slot_render_key,
@@ -90,20 +96,24 @@ from sidepulse.led_status import (
 )
 from sidepulse.lid_sleep import (
     ClosedLidAwakeController,
+    DisplaySleepRequestError,
     IOREG_SLEEP_DISABLED_COMMAND,
     MacSleepSnapshot,
     PMSET_ASSERTIONS_COMMAND,
     SleepHelperRequiredError,
     closed_lid_awake_should_hold,
+    external_display_is_active,
     parse_bool_ioreg_property,
     parse_pmset_assertions,
     read_mac_sleep_snapshot,
+    run_pmset_displaysleepnow,
     run_sudo_pmset_disablesleep,
     sleep_helper_sudoers_rule,
 )
 from sidepulse.models import AgentMode, AgentStatus, AggregateStatus
 from sidepulse.origin import ProcessInfo, origin_from_processes
 from sidepulse.providers import (
+    detect_codex_config_from_text,
     detect_grok_config,
     default_log_path,
     default_state_dir,
@@ -113,12 +123,15 @@ from sidepulse.sd_eject_guard_launch import (
     SD_EJECT_GUARD_BINARY_NAME,
     SD_EJECT_GUARD_DISPLAY_NAME,
     SD_EJECT_GUARD_LABEL,
+    SD_EJECT_GUARD_LOG_MAX_BYTES,
     SdEjectGuardInstallError,
     SdEjectGuardPaths,
     build_sd_eject_guard_plist,
     install_sd_eject_guard,
+    read_log_tail,
     sd_eject_guard_installed,
     stop_sd_eject_guard,
+    truncate_log_if_large,
     uninstall_sd_eject_guard,
 )
 from sidepulse.session_actions import (
@@ -132,6 +145,37 @@ from sidepulse.session_actions import (
     session_vscode_link,
 )
 from sidepulse.settings import (
+    ANIMATION_STATE_LID_CLOSED,
+    ANIMATION_STATE_LID_OPEN,
+    ANIMATION_STATES,
+    AGENT_ANIMATION_AMBER_PULSE,
+    AGENT_ANIMATION_CYAN_COMPLETE,
+    AGENT_ANIMATION_CYAN_ROLL,
+    AGENT_ANIMATION_CUSTOM,
+    AGENT_ANIMATION_DEFAULT,
+    AGENT_ANIMATION_EMBER_ATTENTION,
+    AGENT_ANIMATION_EMBER_COMPLETE,
+    AGENT_ANIMATION_EMBER_IDLE,
+    AGENT_ANIMATION_EMBER_LID_OPEN,
+    AGENT_ANIMATION_EMBER_TIDE,
+    AGENT_ANIMATION_IDLE_PULSE,
+    AGENT_ANIMATION_KITT,
+    AGENT_ANIMATION_KITT_RED,
+    AGENT_ANIMATION_LID_CLOSED,
+    AGENT_ANIMATION_LID_OPEN,
+    AGENT_ANIMATION_NIGHT_RIDER,
+    AGENT_ANIMATION_IMMEDIATE_OFF,
+    AGENT_ANIMATION_SLOW_OFF,
+    AGENT_ANIMATION_PROFILE_CYAN,
+    AGENT_ANIMATION_PROFILE_EMBER,
+    AGENT_ANIMATION_PROFILE_PURPLE,
+    AGENT_ANIMATION_PURPLE_ATTENTION,
+    AGENT_ANIMATION_PURPLE_COMPLETE,
+    AGENT_ANIMATION_PURPLE_IDLE,
+    AGENT_ANIMATION_PURPLE_LID_OPEN,
+    AGENT_ANIMATION_PURPLE_TIDE,
+    AGENT_ANIMATION_SOLID_GREEN,
+    AGENT_ANIMATION_WORKING_MODES,
     CLOSED_LID_AWAKE_AGENTS,
     CLOSED_LID_AWAKE_ALWAYS,
     CLOSED_LID_AWAKE_NEVER,
@@ -159,11 +203,17 @@ from sidepulse.settings import (
     TERMINAL_APP_WEZTERM,
     AgentMonitorSettings,
     DeviceDisplaySetting,
+    agent_animation_profile_document,
+    agent_animation_profile_id,
+    builtin_agent_animation_profiles,
+    custom_agent_animation_id,
+    default_agent_animation_id,
     default_config_dir,
     default_lid_animation,
     default_settings_path,
     load_settings,
     save_settings,
+    with_imported_agent_animation_profile,
 )
 from sidepulse.status_bar_launch import (
     LAUNCH_AGENT_LABEL,
@@ -802,6 +852,49 @@ class AgentMonitorTests(unittest.TestCase):
             finally:
                 server.stop()
 
+    def test_hook_event_reaches_app_when_xdg_state_home_differs(self) -> None:
+        """A shell hook must still find an app that resolved another state dir.
+
+        The LaunchAgent plist forwards only PATH and PYTHONUNBUFFERED, so the app never
+        sees XDG_STATE_HOME and binds under ~/.local/state. A hook started from the user's
+        shell does see it. Before candidate probing the send failed silently.
+        """
+        # An AF_UNIX path is capped near 104 bytes and the macOS default temp dir is long,
+        # so root this fixture somewhere short.
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            home = Path(tmp) / "home"
+            app_dir = home / ".local" / "state" / "sidepulse" / "agent-monitor"
+            app_dir.mkdir(parents=True)
+
+            received: list[tuple[str, dict]] = []
+            server = HookEventServer(
+                lambda provider, line: received.append((provider, line)),
+                socket_path=app_dir / "events.sock",
+            )
+            try:
+                server.start()
+                environment = {
+                    "HOME": str(home),
+                    "XDG_STATE_HOME": str(Path(tmp) / "xdg"),
+                }
+                with patch.dict(os.environ, environment):
+                    sent = send_hook_event(
+                        "claude",
+                        {"hook_event_name": "Stop", "session_id": "claude-session"},
+                        timeout=0.5,
+                    )
+
+                deadline = time.time() + 1
+                while sent and not received and time.time() < deadline:
+                    time.sleep(0.01)
+
+                self.assertTrue(sent)
+                self.assertTrue(received)
+                self.assertEqual(received[0][0], "claude")
+                self.assertEqual(received[0][1]["hook_event_name"], "Stop")
+            finally:
+                server.stop()
+
     def test_live_sidepulse_ingests_events_and_persists_latest_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -841,46 +934,146 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(reloaded.snapshot().aggregate.mode, AgentMode.TOOL_RUNNING)
             self.assertEqual(reloaded.snapshot().statuses[0].origin, "Codex UI")
 
-    def test_status_bar_startup_replay_ingests_recent_debug_logs(self) -> None:
-        try:
-            from sidepulse import status_bar
-        except SystemExit as exc:
-            self.skipTest(str(exc))
+    def test_codex_interrupt_clears_active_status_and_permissions(self) -> None:
+        for active_event in ("UserPromptSubmit", "PreToolUse", "PermissionRequest"):
+            with self.subTest(active_event=active_event), tempfile.TemporaryDirectory() as tmp:
+                latest = Path(tmp) / "latest.json"
+                monitor = LiveAgentMonitor(latest_state_path=latest)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            log = base / "codex.jsonl"
-            session_id = "eeeeeeee-ffff-7aaa-8bbb-cccccccccccc"
-            log.write_text(
-                json.dumps(
-                    {
+                def ingest(event_name):
+                    record = parse_log_line("codex", json.dumps({
                         "logged_at": datetime.now(timezone.utc).isoformat(),
                         "event": {
-                            "hook_event_name": "UserPromptSubmit",
+                            "hook_event_name": event_name,
+                            "session_id": "interrupted-session",
+                            "turn_id": "interrupted-turn",
+                            "tool_name": "Bash",
+                            "tool_input": {"command": "sleep 100"},
+                        },
+                    }))
+                    self.assertIsNotNone(record)
+                    monitor.ingest_record(record)
+
+                ingest(active_event)
+                self.assertEqual(monitor.snapshot().aggregate.active_count, 1)
+                ingest("Interrupt")
+                self.assertEqual(monitor.snapshot().aggregate.active_count, 0)
+                self.assertEqual(monitor.pending_permissions_by_session, {})
+                status = monitor.statuses_by_key["codex:session:interrupted-session"]
+                self.assertEqual(status.mode, AgentMode.IDLE_READY)
+                self.assertEqual(status.event_name, "Interrupt")
+                reloaded = LiveAgentMonitor(latest_state_path=latest)
+                self.assertEqual(reloaded.snapshot().aggregate.active_count, 0)
+                ingest("UserPromptSubmit")
+                self.assertEqual(monitor.snapshot().aggregate.mode, AgentMode.WORKING)
+
+    def test_live_sidepulse_recovers_stop_missed_during_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            latest = base / "latest.json"
+            codex_log = base / "codex.jsonl"
+            session_id = "codex-session"
+            prompt_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+            stop_at = prompt_at + timedelta(seconds=5)
+            latest.write_text(
+                json.dumps(
+                    {
+                        "updated_at": prompt_at.isoformat(),
+                        "statuses": [
+                            {
+                                "provider": "codex",
+                                "agent_id": f"codex:session:{session_id}",
+                                "display_name": "project: Restart recovery",
+                                "mode": "working",
+                                "updated_at": prompt_at.isoformat(),
+                                "event_name": "UserPromptSubmit",
+                                "session_id": session_id,
+                                "cwd": "/tmp/project",
+                            }
+                        ],
+                    }
+                )
+                + "\n"
+            )
+            codex_log.write_text(
+                json.dumps(
+                    {
+                        "logged_at": stop_at.isoformat(),
+                        "event": {
+                            "hook_event_name": "Stop",
                             "session_id": session_id,
                             "cwd": "/tmp/project",
-                            "prompt": "startup replay should restore this",
+                            "last_assistant_message": "Finished.",
                         },
                     }
                 )
                 + "\n"
             )
-            monitor = LiveAgentMonitor()
 
-            with patch(
-                "sidepulse.status_bar.detect_log_path",
-                return_value=log,
-            ):
-                replayed = status_bar.replay_recent_debug_logs(
-                    monitor,
-                    providers=("codex",),
-                    max_lines=20,
+            monitor = LiveAgentMonitor(
+                sources=(SourceSpec("event-bus", base / "events.sock"),),
+                recovery_sources=(SourceSpec("codex", codex_log),),
+                stale_after_seconds=3600,
+                latest_state_path=latest,
+            )
+
+            status = monitor.snapshot().statuses[0]
+            self.assertEqual(status.mode, AgentMode.COMPLETED)
+            self.assertEqual(status.event_name, "Stop")
+            persisted = json.loads(latest.read_text())["statuses"][0]
+            self.assertEqual(persisted["mode"], AgentMode.COMPLETED.value)
+            self.assertEqual(persisted["event_name"], "Stop")
+
+    def test_live_sidepulse_recovery_does_not_replace_newer_cached_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            latest = base / "latest.json"
+            codex_log = base / "codex.jsonl"
+            session_id = "codex-session"
+            prompt_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+            stop_at = prompt_at + timedelta(seconds=5)
+            latest.write_text(
+                json.dumps(
+                    {
+                        "updated_at": stop_at.isoformat(),
+                        "statuses": [
+                            {
+                                "provider": "codex",
+                                "agent_id": f"codex:session:{session_id}",
+                                "display_name": "project: Restart recovery",
+                                "mode": "completed",
+                                "updated_at": stop_at.isoformat(),
+                                "event_name": "Stop",
+                                "session_id": session_id,
+                                "cwd": "/tmp/project",
+                            }
+                        ],
+                    }
                 )
+                + "\n"
+            )
+            codex_log.write_text(
+                json.dumps(
+                    {
+                        "logged_at": prompt_at.isoformat(),
+                        "event": {
+                            "hook_event_name": "UserPromptSubmit",
+                            "session_id": session_id,
+                            "cwd": "/tmp/project",
+                        },
+                    }
+                )
+                + "\n"
+            )
 
-            snapshot = monitor.snapshot()
-            self.assertEqual(replayed, 1)
-            self.assertEqual(snapshot.aggregate.mode, AgentMode.WORKING)
-            self.assertIn("startup replay", snapshot.statuses[0].display_name)
+            monitor = LiveAgentMonitor(
+                recovery_sources=(SourceSpec("codex", codex_log),),
+                latest_state_path=latest,
+            )
+
+            status = monitor.snapshot().statuses[0]
+            self.assertEqual(status.mode, AgentMode.COMPLETED)
+            self.assertEqual(status.event_name, "Stop")
 
     def test_status_bar_session_menu_title_is_task_and_project(self) -> None:
         try:
@@ -994,7 +1187,7 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertGreater(image.size().width, 38)
         self.assertEqual(image.size().height, 18)
 
-    def test_virtual_screen_bar_frame_covers_notch_plus_led_band(self) -> None:
+    def test_virtual_sidepulse_notch_frame_covers_notch_plus_led_band(self) -> None:
         try:
             from sidepulse import virtual_device
         except (ImportError, SystemExit) as exc:
@@ -1025,7 +1218,7 @@ class AgentMonitorTests(unittest.TestCase):
             ((0.0, 0.0), (232.0, 5.0)),
         )
 
-    def test_virtual_screen_bar_on_notchless_display_is_led_band_only(self) -> None:
+    def test_virtual_sidepulse_notch_on_notchless_display_is_led_band_only(self) -> None:
         try:
             from sidepulse import virtual_device
         except (ImportError, SystemExit) as exc:
@@ -1053,7 +1246,7 @@ class AgentMonitorTests(unittest.TestCase):
             ((850.0, 1075.0), (220.0, 5.0)),
         )
 
-    def test_virtual_screen_bar_redraws_at_60fps(self) -> None:
+    def test_virtual_sidepulse_notch_redraws_at_60fps(self) -> None:
         try:
             from sidepulse import virtual_device
         except (ImportError, SystemExit) as exc:
@@ -1061,6 +1254,29 @@ class AgentMonitorTests(unittest.TestCase):
 
         self.assertEqual(virtual_device.FRAME_RATE, 60.0)
         self.assertAlmostEqual(virtual_device.FRAME_INTERVAL, 1.0 / 60.0)
+
+    def test_compact_preview_loops_one_shot_program_without_changing_loops(self) -> None:
+        try:
+            from sidepulse import virtual_device
+        except (ImportError, SystemExit) as exc:
+            self.skipTest(str(exc))
+
+        one_shot = "off 90ms\n#00E5FF 180ms ease\noff 320ms"
+        self.assertEqual(
+            virtual_device.compact_preview_program(one_shot),
+            f"{one_shot}\nrepeat",
+        )
+        looping = "#00E5FF 180ms ease\nrepeat"
+        self.assertEqual(virtual_device.compact_preview_program(looping), looping)
+
+        shutdown = (
+            "0:#000000 75ms ease; 7:#000000 75ms ease\n"
+            "1:#000000 75ms ease; 6:#000000 75ms ease"
+        )
+        shutdown_preview = virtual_device.compact_preview_program(shutdown)
+        self.assertTrue(shutdown_preview.startswith("#00E5FF\n"))
+        self.assertTrue(shutdown_preview.endswith("\nrepeat"))
+        self.assertNotIn("#00E5FF", shutdown)
 
     def test_led_wasm_controller_uses_packaged_firmware_engine(self) -> None:
         try:
@@ -1094,7 +1310,45 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(controller.step(0), [(255, 0, 0), (0, 255, 0)])
 
-    def test_virtual_screen_bar_led_blend_spans_three_leds(self) -> None:
+    def test_core_animation_programs_transition_from_current_pixels(self) -> None:
+        try:
+            from sidepulse.led_wasm import LedWasmUnavailableError, SdLedWasmController
+        except ImportError as exc:
+            self.skipTest(str(exc))
+
+        try:
+            controller = SdLedWasmController(led_count=8)
+        except LedWasmUnavailableError as exc:
+            self.skipTest(str(exc))
+
+        controller.parse(builtin_animation_program("cyan-roll", 8), 0)
+        working_pixels = controller.step(700)
+        controller.parse(builtin_animation_program("solid-green", 8), 700)
+        self.assertEqual(controller.step(700), working_pixels)
+        transition_pixels = controller.step(860)
+        self.assertNotEqual(transition_pixels, working_pixels)
+        self.assertNotEqual(transition_pixels, [(0, 255, 102)] * 8)
+        self.assertEqual(controller.step(1020), [(0, 255, 102)] * 8)
+
+        controller.parse(builtin_animation_program("lid-closed", 8), 1020)
+        green = (0, 255, 102)
+        black = (0, 0, 0)
+        self.assertEqual(controller.step(1020), [green] * 8)
+        self.assertEqual(
+            controller.step(1095),
+            [black, green, green, green, green, green, green, black],
+        )
+        self.assertEqual(
+            controller.step(1170),
+            [black, black, green, green, green, green, black, black],
+        )
+        self.assertEqual(
+            controller.step(1245),
+            [black, black, black, green, green, black, black, black],
+        )
+        self.assertEqual(controller.step(1320), [black] * 8)
+
+    def test_virtual_sidepulse_notch_led_blend_spans_three_leds(self) -> None:
         try:
             from sidepulse import virtual_device
         except (ImportError, SystemExit) as exc:
@@ -1840,7 +2094,7 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(by_title["One LED Per Agent"].state(), 1)
         self.assertEqual(by_title["Agent Status"].state(), 0)
 
-    def test_status_bar_screen_bar_remove_lives_in_screen_bar_submenu(self) -> None:
+    def test_status_bar_sidepulse_notch_remove_lives_in_sidepulse_notch_submenu(self) -> None:
         try:
             from sidepulse import status_bar
         except SystemExit as exc:
@@ -1848,7 +2102,7 @@ class AgentMonitorTests(unittest.TestCase):
 
         device = status_bar.StatusBarDevice(
             device_id=status_bar.VIRTUAL_DEVICE_ID,
-            name="Screen Bar",
+            name=status_bar.VIRTUAL_DEVICE_NAME,
             root=Path(status_bar.VIRTUAL_DEVICE_ID),
             target=Path(status_bar.VIRTUAL_DEVICE_ID),
             connected=True,
@@ -1867,17 +2121,18 @@ class AgentMonitorTests(unittest.TestCase):
         )
 
         menu = status_bar.build_menu(snapshot, status_bar.STATE_IDLE, target)
+        self.assertEqual(status_bar.VIRTUAL_DEVICE_NAME, "SidePulse Notch")
         titles = [
             menu.itemAtIndex_(index).title()
             for index in range(menu.numberOfItems())
             if menu.itemAtIndex_(index).title()
         ]
-        screen_bar_item = next(
+        sidepulse_notch_item = next(
             menu.itemAtIndex_(index)
             for index in range(menu.numberOfItems())
-            if menu.itemAtIndex_(index).title() == "Screen Bar"
+            if menu.itemAtIndex_(index).title() == "SidePulse Notch"
         )
-        submenu = screen_bar_item.submenu()
+        submenu = sidepulse_notch_item.submenu()
         submenu_titles = [
             submenu.itemAtIndex_(index).title()
             for index in range(submenu.numberOfItems())
@@ -1889,8 +2144,8 @@ class AgentMonitorTests(unittest.TestCase):
             if submenu.itemAtIndex_(index).view() is not None
         )
 
-        self.assertNotIn("Remove Screen Bar", titles)
-        self.assertIn("Remove Screen Bar", submenu_titles)
+        self.assertNotIn("Remove SidePulse Notch", titles)
+        self.assertIn("Remove SidePulse Notch", submenu_titles)
         self.assertNotIn("Brightness 100%", submenu_titles)
         self.assertEqual(submenu_view_count, 0)
 
@@ -1903,7 +2158,7 @@ class AgentMonitorTests(unittest.TestCase):
             if menu.itemAtIndex_(index).title()
         ]
 
-        self.assertIn("Add Screen Bar", titles)
+        self.assertIn("Add SidePulse Notch", titles)
 
     def test_status_bar_virtual_multiagent_program_carries_the_brightness(self) -> None:
         """The Screen Bar's multiagent branch passes brightness like its neighbours.
@@ -2104,6 +2359,176 @@ class AgentMonitorTests(unittest.TestCase):
 
         self.assertEqual(kind, LED_DISPLAY_MULTIAGENT)
 
+    def test_status_bar_poll_devices_refreshes_on_remote_device_change(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        calls: list[object] = []
+        target = SimpleNamespace(
+            observe_connected_devices=lambda: True,
+            last_snapshot=object(),
+            refresh_=lambda sender: calls.append(sender),
+        )
+
+        status_bar.StatusBarController.poll_devices_once(target)
+
+        self.assertEqual(calls, [None])
+
+    def test_status_bar_battery_poll_does_not_overlap_reads(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        target = SimpleNamespace(
+            battery_poll_in_flight=False,
+            battery_poll_pending=False,
+            _read_battery_snapshot_async=lambda: None,
+        )
+
+        with patch("sidepulse.status_bar.threading.Thread") as thread:
+            status_bar.StatusBarController.poll_battery_once(target)
+            status_bar.StatusBarController.poll_battery_once(target)
+
+        self.assertTrue(target.battery_poll_in_flight)
+        self.assertTrue(target.battery_poll_pending)
+        thread.assert_called_once_with(
+            target=target._read_battery_snapshot_async,
+            daemon=True,
+        )
+        thread.return_value.start.assert_called_once_with()
+
+    def test_status_bar_battery_poll_result_syncs_leds_immediately(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        snapshot = BatterySnapshot(percent=55, is_plugged=True, is_charging=True)
+        calls: list[tuple[str, object]] = []
+        target = SimpleNamespace(
+            pending_battery_snapshot=snapshot,
+            pending_battery_error=None,
+            battery_poll_in_flight=True,
+            battery_poll_pending=False,
+            last_battery_error=None,
+            last_snapshot=SimpleNamespace(
+                aggregate=SimpleNamespace(mode=AgentMode.WORKING),
+            ),
+            accept_battery_snapshot=lambda value: value,
+            sync_keep_awake=lambda mode, value: calls.append(
+                ("awake", (mode, value))
+            ),
+            active_led_display_kind=lambda value: "battery",
+            sync_leds=lambda mode, value, display: calls.append(
+                ("leds", (mode, value, display))
+            ),
+        )
+
+        status_bar.StatusBarController.handle_battery_snapshot(target)
+
+        self.assertFalse(target.battery_poll_in_flight)
+        self.assertIsNone(target.pending_battery_snapshot)
+        self.assertEqual(calls[0], ("awake", (AgentMode.WORKING, snapshot)))
+        self.assertEqual(
+            calls[1],
+            ("leds", (AgentMode.WORKING, snapshot, "battery")),
+        )
+
+    def test_status_bar_syncs_agent_status_to_linked_phone_once(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        link = status_bar.IOSLink("Peter's iPhone", "a" * 64)
+        device = status_bar.StatusBarDevice(
+            device_id=status_bar.linked_phone_device_id(link),
+            name=link.name,
+            root=Path("ios/aaaaaaaaaaaa"),
+            target=Path("ios/aaaaaaaaaaaa"),
+            connected=True,
+            display=status_bar.LED_DISPLAY_AGENT,
+            remote_link=link,
+        )
+        fake = SimpleNamespace(
+            settings=AgentMonitorSettings(),
+            status_bar_devices=lambda remember=True: [device],
+            ensure_device_selection=lambda: None,
+            last_led_error=None,
+            device_errors={},
+            remote_led_program_by_device={},
+            last_led_display_kind_by_device={},
+            reset_led_controllers_for_device=lambda device_id: None,
+            active_led_display_kind_for_device=lambda item, battery: item.display,
+        )
+
+        with patch("sidepulse.status_bar.send_ios_program", return_value="OK") as send:
+            status_bar.StatusBarController.sync_leds_now(
+                fake,
+                AgentMode.WORKING,
+                None,
+                status_bar.LED_DISPLAY_AGENT,
+            )
+            status_bar.StatusBarController.sync_leds_now(
+                fake,
+                AgentMode.WORKING,
+                None,
+                status_bar.LED_DISPLAY_AGENT,
+            )
+
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], link)
+        self.assertIn("source", send.call_args.kwargs["data"])
+
+    def test_status_bar_syncs_battery_level_to_linked_phone(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        link = status_bar.IOSLink("Peter's iPhone", "b" * 64)
+        device = status_bar.StatusBarDevice(
+            device_id=status_bar.linked_phone_device_id(link),
+            name=link.name,
+            root=Path("ios/bbbbbbbbbbbb"),
+            target=Path("ios/bbbbbbbbbbbb"),
+            connected=True,
+            display=status_bar.LED_DISPLAY_BATTERY,
+            remote_link=link,
+        )
+        snapshot = BatterySnapshot(percent=57, is_plugged=False)
+        fake = SimpleNamespace(
+            settings=AgentMonitorSettings(),
+            status_bar_devices=lambda remember=True: [device],
+            ensure_device_selection=lambda: None,
+            last_led_error=None,
+            device_errors={},
+            remote_led_program_by_device={},
+            last_led_display_kind_by_device={},
+            reset_led_controllers_for_device=lambda device_id: None,
+            active_led_display_kind_for_device=lambda item, battery: item.display,
+        )
+
+        with patch("sidepulse.status_bar.send_ios_program", return_value="OK") as send:
+            status_bar.StatusBarController.sync_leds_now(
+                fake,
+                AgentMode.IDLE_READY,
+                snapshot,
+                status_bar.LED_DISPLAY_BATTERY,
+            )
+
+        self.assertEqual(
+            send.call_args.args[1],
+            status_bar.program_for_battery(snapshot, led_count=8, brightness=255),
+        )
+        self.assertEqual(
+            send.call_args.kwargs["data"]["source"]["battery"]["level"],
+            57,
+        )
+
     def test_status_bar_sync_skips_custom_device_display(self) -> None:
         try:
             from sidepulse import status_bar
@@ -2191,6 +2616,39 @@ class AgentMonitorTests(unittest.TestCase):
         write.assert_called_once_with("off", device_path=device.target)
         self.assertEqual(fake.settings.display_for_device(device.device_id), LED_DISPLAY_CUSTOM)
         self.assertEqual(messages[-1], "SidePulse Dot: Manual, LEDs cleared.")
+
+    def test_status_bar_manual_linked_phone_clears_remote_leds(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        link = status_bar.IOSLink("Peter's iPhone", "c" * 64)
+        device = status_bar.StatusBarDevice(
+            device_id=status_bar.linked_phone_device_id(link),
+            name=link.name,
+            root=Path("ios/cccccccccccc"),
+            target=Path("ios/cccccccccccc"),
+            connected=True,
+            display=LED_DISPLAY_CUSTOM,
+            remote_link=link,
+        )
+        fake = SimpleNamespace(
+            last_battery_snapshot=BatterySnapshot(percent=49, is_plugged=False),
+            device_errors={},
+            last_led_error=None,
+        )
+
+        with patch("sidepulse.status_bar.send_ios_program", return_value="OK") as send:
+            error = status_bar.StatusBarController.clear_manual_device_display(fake, device)
+
+        self.assertIsNone(error)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[:2], (link, "off"))
+        self.assertEqual(
+            send.call_args.kwargs["data"]["source"]["battery"]["level"],
+            49,
+        )
 
     def test_status_bar_menu_has_sleep_prevention_title_and_policy_choices(self) -> None:
         try:
@@ -2380,6 +2838,7 @@ class AgentMonitorTests(unittest.TestCase):
             agent_led_controllers_by_device={},
             battery_led_controllers_by_device={},
             multiagent_led_controllers_by_device={},
+            remote_led_program_by_device={},
             virtual_slot_allocator=allocator,
             last_led_display_kind_by_device={"x": "multiagent"},
             last_led_error="old",
@@ -2458,7 +2917,67 @@ class AgentMonitorTests(unittest.TestCase):
             if hasattr(view, "numberOfTabViewItems")
         ]
         self.assertEqual(len(tab_views), 1)
-        self.assertEqual(tab_views[0].numberOfTabViewItems(), 6)
+        self.assertEqual(
+            [str(item.label()) for item in tab_views[0].tabViewItems()],
+            ["Agents", "Animations", "Advanced", "History", "Diagnostics"],
+        )
+        animations_tab = next(
+            tab_views[0].tabViewItemAtIndex_(index)
+            for index in range(tab_views[0].numberOfTabViewItems())
+            if str(tab_views[0].tabViewItemAtIndex_(index).identifier()) == "animations"
+        )
+        agent_animations = animations_tab.view()
+        self.assertFalse(
+            any(
+                hasattr(view, "numberOfTabViewItems")
+                for view in agent_animations.subviews()
+            )
+        )
+        previews = [
+            view
+            for view in agent_animations.subviews()
+            if isinstance(view, status_bar.VirtualLedView)
+        ]
+        self.assertEqual(len(previews), len(status_bar.ANIMATION_UI_STATES))
+        show_buttons = [
+            view
+            for view in agent_animations.subviews()
+            if hasattr(view, "title") and str(view.title()) == "Show"
+        ]
+        self.assertEqual(len(show_buttons), len(status_bar.ANIMATION_UI_STATES))
+        self.assertEqual(
+            {str(button.representedObject()) for button in show_buttons},
+            set(status_bar.ANIMATION_UI_STATES),
+        )
+        edit_buttons = [
+            view
+            for view in agent_animations.subviews()
+            if hasattr(view, "title") and str(view.title()) == "Edit"
+        ]
+        self.assertEqual(len(edit_buttons), len(status_bar.ANIMATION_UI_STATES))
+        self.assertEqual(
+            {str(button.representedObject()) for button in edit_buttons},
+            set(status_bar.ANIMATION_UI_STATES),
+        )
+        labels = {
+            str(view.stringValue())
+            for view in agent_animations.subviews()
+            if hasattr(view, "stringValue")
+        }
+        self.assertIn("Lid Open", labels)
+        self.assertIn("Lid Closed", labels)
+        self.assertIn("Working / Tool / Long Task", labels)
+        self.assertNotIn("Tool Running", labels)
+        self.assertNotIn("Long Task Progress", labels)
+        self.assertNotIn("agent_animation_tool_running", target.settings_fields)
+        self.assertNotIn("agent_animation_long_task_progress", target.settings_fields)
+        self.assertNotIn(
+            "lid",
+            {
+                str(tab_views[0].tabViewItemAtIndex_(index).identifier())
+                for index in range(tab_views[0].numberOfTabViewItems())
+            },
+        )
         self.assertIn("debug_log_status", target.settings_fields)
         self.assertIn("status_history_status", target.settings_fields)
         self.assertIn("status_history_chart", target.settings_fields)
@@ -2468,11 +2987,146 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIn("idle_timeout_minutes", target.settings_fields)
         self.assertIn("sleep_prevention_min_battery_percent", target.settings_fields)
         self.assertIn("status_history_timeframe", target.settings_fields)
-        self.assertIn("closed_animation_program", target.settings_fields)
-        self.assertIn("closed_animation_duration", target.settings_fields)
-        self.assertIn("open_animation_program", target.settings_fields)
-        self.assertIn("open_animation_duration", target.settings_fields)
+        self.assertIn("agent_animation_lid_closed", target.settings_fields)
+        self.assertIn("agent_animation_lid_open", target.settings_fields)
+        for mode in status_bar.ANIMATION_UI_STATES:
+            self.assertIn(f"agent_animation_{mode}", target.settings_fields)
+            self.assertIn(
+                f"agent_animation_preview_{mode}", target.settings_fields
+            )
         self.assertNotIn("closed_lid_system_override", target.settings_buttons)
+
+    def test_status_bar_validates_custom_agent_animation_program(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        status_bar.validate_agent_animation_program("off\n#FF0000 pulse\nrepeat")
+        with self.assertRaises(DeviceWriteError):
+            status_bar.validate_agent_animation_program("x" * 513)
+
+    def test_animation_preview_timer_runs_while_menu_tracks_input(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        timer = object()
+        modes = []
+        run_loop = SimpleNamespace(
+            addTimer_forMode_=lambda added_timer, mode: modes.append(
+                (added_timer, mode)
+            )
+        )
+        fake = SimpleNamespace(agent_animation_preview_timer=None)
+        with (
+            patch(
+                "sidepulse.status_bar.NSTimer",
+                SimpleNamespace(
+                    timerWithTimeInterval_target_selector_userInfo_repeats_=(
+                        lambda *args: timer
+                    )
+                ),
+            ),
+            patch(
+                "sidepulse.status_bar.NSRunLoop",
+                SimpleNamespace(mainRunLoop=lambda: run_loop),
+            ),
+        ):
+            status_bar.StatusBarController.start_agent_animation_preview_timer(fake)
+
+        self.assertEqual(fake.agent_animation_preview_timer, timer)
+        self.assertEqual(
+            modes,
+            [
+                (timer, status_bar.NSRunLoopCommonModes),
+                (timer, status_bar.NSEventTrackingRunLoopMode),
+            ],
+        )
+
+    def test_status_bar_timers_run_while_menu_tracks_input(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        timer = object()
+        modes = []
+        run_loop = SimpleNamespace(
+            addTimer_forMode_=lambda added_timer, mode: modes.append(
+                (added_timer, mode)
+            )
+        )
+        with (
+            patch(
+                "sidepulse.status_bar.NSTimer",
+                SimpleNamespace(
+                    scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_=(
+                        lambda *args: timer
+                    )
+                ),
+            ),
+            patch(
+                "sidepulse.status_bar.NSRunLoop",
+                SimpleNamespace(mainRunLoop=lambda: run_loop),
+            ),
+        ):
+            self.assertIs(
+                status_bar.schedule_status_bar_timer(1, object(), "pollLid:"),
+                timer,
+            )
+
+        self.assertEqual(
+            modes,
+            [
+                (timer, status_bar.NSRunLoopCommonModes),
+                (timer, status_bar.NSEventTrackingRunLoopMode),
+            ],
+        )
+
+    def test_status_bar_show_agent_animation_on_device_writes_and_restores(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "SidePulsePro"
+            root.mkdir()
+            device = status_bar.StatusBarDevice(
+                device_id=str(root),
+                name="SidePulse Pro",
+                root=root,
+                target=root / "LEDS.LED",
+                connected=True,
+                display="agent",
+            )
+            restore_calls = []
+            fake = SimpleNamespace(
+                performSelectorOnMainThread_withObject_waitUntilDone_=(
+                    lambda selector, value, wait: restore_calls.append(
+                        (selector, value, wait)
+                    )
+                )
+            )
+
+            with patch("sidepulse.status_bar.time.sleep"):
+                status_bar.StatusBarController.show_agent_animation_on_device_worker(
+                    fake,
+                    AgentMode.WORKING,
+                    AGENT_ANIMATION_KITT,
+                    "",
+                    [device],
+                    17,
+                )
+
+            program = (root / "LEDS.LED").read_text()
+            self.assertIn("7:#00E5FF 320ms pulse 595ms", program)
+            self.assertEqual(
+                restore_calls,
+                [("restoreLedDisplay:", "17", False)],
+            )
 
     def test_status_history_status_text_is_compact(self) -> None:
         try:
@@ -2608,6 +3262,7 @@ class AgentMonitorTests(unittest.TestCase):
             self.skipTest(str(exc))
 
         with tempfile.TemporaryDirectory() as tmp:
+            recovery_source = SourceSpec("codex", Path(tmp) / "codex.jsonl")
             fake = SimpleNamespace(
                 settings=AgentMonitorSettings(idle_timeout_seconds=1234)
             )
@@ -2620,10 +3275,15 @@ class AgentMonitorTests(unittest.TestCase):
                     "sidepulse.status_bar.default_latest_state_path",
                     return_value=Path(tmp) / "latest.json",
                 ),
+                patch(
+                    "sidepulse.status_bar.default_sources",
+                    return_value=(recovery_source,),
+                ),
             ):
                 monitor = status_bar.StatusBarController.build_monitor(fake)
 
         self.assertEqual(monitor.stale_after_seconds, 1234)
+        self.assertEqual(monitor.recovery_sources, (recovery_source,))
 
     def test_status_bar_setup_window_has_first_launch_controls(self) -> None:
         try:
@@ -3440,6 +4100,11 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertIn("--provider codex", text)
             self.assertIn(str(log), text)
             self.assertNotIn("echo old", text)
+            self.assertIn("[[hooks.Interrupt]]", text)
+            self.assertIn("timeout = 3", text.split("[[hooks.Interrupt.hooks]]")[1])
+            self.assertIn("Interrupt", detect_codex_config_from_text(config, text).hook_events)
+            install_codex_hooks(log_path=log, config_path=config, python_executable="python3")
+            self.assertEqual(config.read_text().count("[[hooks.Interrupt]]"), 1)
 
     def test_codex_installer_refreshes_managed_hook_trust_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4142,7 +4807,6 @@ class AgentMonitorTests(unittest.TestCase):
             cleanup_removed=None,
             cleanup_skipped=None,
         )
-
         with patch(
             "sidepulse.sd_eject_guard_launch.install_sd_eject_guard",
             return_value=guard_result,
@@ -4246,10 +4910,24 @@ class AgentMonitorTests(unittest.TestCase):
             changed=False,
             backup_path=None,
         )
+        cursor_result = SimpleNamespace(
+            provider="cursor",
+            config_path=Path("/tmp/cursor-hooks.json"),
+            log_path=Path("/tmp/cursor.jsonl"),
+            changed=True,
+            backup_path=None,
+        )
         grok_result = SimpleNamespace(
             provider="grok",
             config_path=Path("/tmp/grok-hook.json"),
             log_path=Path("/tmp/grok.jsonl"),
+            changed=True,
+            backup_path=None,
+        )
+        junie_result = SimpleNamespace(
+            provider="junie",
+            config_path=Path("/tmp/junie-config.json"),
+            log_path=Path("/tmp/junie.jsonl"),
             changed=True,
             backup_path=None,
         )
@@ -4268,11 +4946,30 @@ class AgentMonitorTests(unittest.TestCase):
             cleanup_removed=None,
             cleanup_skipped=None,
         )
+        service_result = SimpleNamespace(
+            path=Path("/tmp/io.sidepulse.service.plist"),
+            changed=True,
+            started=True,
+            detail="",
+        )
+        relay_config = SimpleNamespace(
+            receiver_channel="receiver-code",
+            server="https://bridge.sidepulse.io",
+        )
 
         with (
+            patch.object(cli_module.sys, "platform", "darwin"),
+            patch.object(cli_module, "ensure_receiver_config", return_value=relay_config),
+            patch("sidepulse.service_launch.install_service", return_value=service_result) as service,
             patch.object(cli_module, "install_codex_hooks", return_value=codex_result) as codex,
             patch.object(cli_module, "install_claude_hooks", return_value=claude_result) as claude,
+            patch.object(
+                cli_module,
+                "install_cursor_hooks",
+                return_value=cursor_result,
+            ) as cursor,
             patch.object(cli_module, "install_grok_hooks", return_value=grok_result) as grok,
+            patch.object(cli_module, "install_junie_hooks", return_value=junie_result) as junie,
             patch(
                 "sidepulse.sd_eject_guard_launch.install_sd_eject_guard",
                 return_value=guard_result,
@@ -4287,9 +4984,12 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(result, 0)
         codex.assert_called_once()
         claude.assert_called_once()
+        cursor.assert_called_once()
         grok.assert_called_once()
+        junie.assert_called_once()
         guard.assert_called_once_with(scope="auto", dry_run=False)
         launch.assert_called_once_with(start=True)
+        service.assert_called_once_with(start=True, dry_run=False)
 
     def test_sidepulse_setup_no_status_bar_still_installs_guard(self) -> None:
         parser = cli_module.build_sidepulse_parser()
@@ -4311,8 +5011,21 @@ class AgentMonitorTests(unittest.TestCase):
             cleanup_removed=None,
             cleanup_skipped=None,
         )
+        service_result = SimpleNamespace(
+            path=Path("/tmp/io.sidepulse.service.plist"),
+            changed=False,
+            started=True,
+            detail="",
+        )
+        relay_config = SimpleNamespace(
+            receiver_channel="receiver-code",
+            server="https://bridge.sidepulse.io",
+        )
 
         with (
+            patch.object(cli_module.sys, "platform", "darwin"),
+            patch.object(cli_module, "ensure_receiver_config", return_value=relay_config),
+            patch("sidepulse.service_launch.install_service", return_value=service_result),
             patch.object(cli_module, "install_hook_results", return_value=[hook_result]),
             patch(
                 "sidepulse.sd_eject_guard_launch.install_sd_eject_guard",
@@ -4326,6 +5039,41 @@ class AgentMonitorTests(unittest.TestCase):
         guard.assert_called_once_with(scope="user", dry_run=False)
         launch.assert_not_called()
 
+    def test_sidepulse_setup_is_cli_only_on_linux(self) -> None:
+        parser = cli_module.build_sidepulse_parser()
+        args = parser.parse_args(["setup"])
+        hook_result = SimpleNamespace(
+            provider="codex",
+            config_path=Path("/tmp/codex.toml"),
+            log_path=Path("/tmp/codex.jsonl"),
+            changed=False,
+            backup_path=None,
+        )
+        service_result = SimpleNamespace(
+            path=Path("/tmp/sidepulse.service"),
+            changed=True,
+            started=False,
+            detail="systemd user manager unavailable",
+        )
+
+        with (
+            patch.object(cli_module.sys, "platform", "linux"),
+            patch.object(cli_module, "install_hook_results", return_value=[hook_result]),
+            patch("sidepulse.service_launch.install_service", return_value=service_result) as service,
+            patch("sidepulse.sd_eject_guard_launch.install_sd_eject_guard") as guard,
+            patch("sidepulse.status_bar_launch.install_launch_agent") as launch,
+            patch("builtins.print") as output,
+        ):
+            result = cli_module.cmd_sidepulse_setup(args)
+
+        self.assertEqual(result, 0)
+        guard.assert_not_called()
+        launch.assert_not_called()
+        service.assert_called_once_with(start=True, dry_run=False)
+        rendered = "\n".join(" ".join(map(str, call.args)) for call in output.call_args_list)
+        self.assertIn("CLI-only setup", rendered)
+        self.assertIn("linked phones and mounted SidePulse devices", rendered)
+
     def test_sidepulse_write_decodes_escaped_newlines_and_writes_leds_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             device = Path(tmp) / "SidePulsePro"
@@ -4338,6 +5086,32 @@ class AgentMonitorTests(unittest.TestCase):
 
             self.assertEqual(target, device / "LEDS.LED")
             self.assertEqual(target.read_text(), "off\n#FF00FF pulse")
+
+    def test_sidepulse_write_syncs_program_to_the_device(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "SidePulsePro"
+            device.mkdir()
+            synced: list[int] = []
+
+            with patch("sidepulse.device_writer.os.fsync", synced.append):
+                target = write_led_program("off", device_path=device)
+
+            self.assertEqual(target.read_text(), "off")
+            # The file itself, plus the directory entry for the new file.
+            self.assertEqual(len(synced), 2)
+
+    def test_sidepulse_write_survives_a_filesystem_that_cannot_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "SidePulsePro"
+            device.mkdir()
+
+            def refuse(fd: int) -> None:
+                raise OSError("sync not supported")
+
+            with patch("sidepulse.device_writer.os.fsync", refuse):
+                target = write_led_program("off", device_path=device)
+
+            self.assertEqual(target.read_text(), "off")
 
     def test_sidepulse_write_uses_leds_led_even_when_old_file_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4365,6 +5139,36 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0].root, device)
             self.assertEqual(candidates[0].target, device / "LEDS.LED")
+
+    def test_linux_mount_roots_cover_common_desktop_locations(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SIDEPULSE_MOUNT_ROOTS", None)
+            roots = default_mount_roots(
+                platform="linux",
+                home=Path("/home/alice"),
+            )
+
+        self.assertIn(Path("/media/alice"), roots)
+        self.assertIn(Path("/run/media/alice"), roots)
+        self.assertIn(Path("/mnt"), roots)
+
+    def test_sidepulse_discovers_dot_across_default_mount_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            first = base / "media"
+            second = base / "run-media"
+            first.mkdir()
+            second.mkdir()
+            device = second / "SidePulseDot"
+            device.mkdir()
+
+            with patch(
+                "sidepulse.device_writer.default_mount_roots",
+                return_value=(first, second),
+            ):
+                candidates = discover_devices()
+
+        self.assertEqual([candidate.root for candidate in candidates], [device])
 
     def test_sidepulse_write_prefers_leds_led_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4449,14 +5253,19 @@ class AgentMonitorTests(unittest.TestCase):
 
         self.assertEqual(
             program_for_display_state(LedDisplayState.IDLE),
-            "off\n#020204 6s pulse\nrepeat",
+            "off 2s\n"
+            "2:#006060 3:#00E5FF 4:#00E5FF 5:#006060 2s ease\n"
+            "repeat",
         )
-        self.assertEqual(program_for_display_state(LedDisplayState.DONE), "#00FF66")
+        self.assertEqual(
+            program_for_display_state(LedDisplayState.DONE),
+            "#00FF66 320ms cosine",
+        )
         self.assertIn("#FF3A00 1.6s pulse", program_for_display_state(LedDisplayState.ASK))
         self.assertEqual(
             program_for_display_state(LedDisplayState.WORKING, led_count=2).splitlines(),
             [
-                "off 160ms cosine",
+                "off 320ms cosine",
                 "0:#00E5FF 760ms pulse 0ms; 1:#00E5FF 760ms pulse 260ms",
                 "repeat",
             ],
@@ -4465,9 +5274,303 @@ class AgentMonitorTests(unittest.TestCase):
             len(program_for_display_state(LedDisplayState.WORKING, led_count=8).splitlines()),
             3,
         )
+        kitt_program = program_for_agent_mode(
+            AgentMode.WORKING,
+            led_count=8,
+            brightness=128,
+            animation_style=AGENT_ANIMATION_KITT,
+        )
+        validate_led_text(kitt_program)
+        self.assertLessEqual(len(kitt_program.encode("utf-8")), 512)
+        self.assertIn("7:#00E5FF 320ms pulse 595ms", kitt_program)
+        self.assertIn("6:#00E5FF 320ms pulse 0ms", kitt_program)
+        red_kitt_program = program_for_agent_mode(
+            AgentMode.WORKING,
+            led_count=8,
+            animation_style=AGENT_ANIMATION_KITT_RED,
+        )
+        validate_led_text(red_kitt_program)
+        self.assertIn("7:#FF1800 320ms pulse 595ms", red_kitt_program)
+        for mode in AgentMode:
+            with self.subTest(kitt_mode=mode.value):
+                validate_led_text(
+                    program_for_agent_mode(
+                        mode,
+                        animation_style=AGENT_ANIMATION_KITT,
+                    )
+                )
+        custom_program = program_for_agent_mode(
+            AgentMode.COMPLETED,
+            brightness=64,
+            animation_style=AGENT_ANIMATION_CUSTOM,
+            custom_program="off\\n#FF0000 pulse\\nrepeat",
+        )
+        self.assertEqual(
+            custom_program,
+            "brightness 64\noff\n#FF0000 pulse\nrepeat",
+        )
         self.assertEqual(
             program_for_display_state(LedDisplayState.DONE, brightness=128),
-            "brightness 128\n#00FF66",
+            "brightness 128\n#00FF66 320ms cosine",
+        )
+
+    def test_builtin_animation_programs_are_loaded_from_led_files(self) -> None:
+        self.assertEqual(
+            builtin_animation_program(AGENT_ANIMATION_SLOW_OFF, 2),
+            "off 1s",
+        )
+        self.assertEqual(
+            builtin_animation_program(AGENT_ANIMATION_SLOW_OFF, 8),
+            "off 1s",
+        )
+        self.assertEqual(
+            builtin_animation_program(AGENT_ANIMATION_IMMEDIATE_OFF, 2),
+            "off",
+        )
+        self.assertEqual(
+            builtin_animation_program(AGENT_ANIMATION_IMMEDIATE_OFF, 8),
+            "off",
+        )
+        self.assertEqual(builtin_animation_file_name("idle-pulse", 2), "idle-pulse-2.LED")
+        self.assertEqual(builtin_animation_file_name("idle-pulse", 8), "idle-pulse-8.LED")
+        self.assertEqual(
+            builtin_animation_program("idle-pulse", 8),
+            "off 2s\n"
+            "2:#006060 3:#00E5FF 4:#00E5FF 5:#006060 2s ease\n"
+            "repeat",
+        )
+        self.assertEqual(
+            builtin_animation_program("idle-pulse", 2),
+            "off 2s\n0:#006060 1:#006060 2s ease\nrepeat",
+        )
+        self.assertEqual(builtin_animation_file_name("cyan-roll", 2), "cyan-roll-2.LED")
+        self.assertEqual(builtin_animation_file_name("cyan-roll", 8), "cyan-roll-8.LED")
+        self.assertEqual(builtin_animation_file_name("cyan-roll", 5), "cyan-roll-8.LED")
+        self.assertIn("1:#00E5FF", builtin_animation_program("cyan-roll", 2))
+        self.assertNotIn("2:#00E5FF", builtin_animation_program("cyan-roll", 2))
+        self.assertIn("7:#FF1800", builtin_animation_program("kitt-red", 8))
+        self.assertEqual(
+            builtin_animation_file_name("ember-tide", 2),
+            "ember-tide-2.LED",
+        )
+        self.assertIn(
+            "1:#F23819 760ms pulse 260ms",
+            builtin_animation_program("ember-tide", 2),
+        )
+        self.assertIn(
+            "7:#F23819 760ms pulse 665ms",
+            builtin_animation_program("ember-tide", 8),
+        )
+        self.assertIn(
+            "7:#FF1200 360ms pulse 630ms",
+            builtin_animation_program("night-rider", 8),
+        )
+        self.assertEqual(
+            builtin_animation_file_name(AGENT_ANIMATION_PURPLE_IDLE, 2),
+            "purple-idle-2.LED",
+        )
+        self.assertIn(
+            "2:#9F009F 3:#FF00FF 4:#FF00FF 5:#9F009F 2s ease",
+            builtin_animation_program(AGENT_ANIMATION_PURPLE_IDLE, 8),
+        )
+        self.assertIn(
+            "1:#FF00FF 760ms pulse 260ms",
+            builtin_animation_program(AGENT_ANIMATION_PURPLE_TIDE, 2),
+        )
+        self.assertIn(
+            "#FF00FF 1.6s pulse",
+            builtin_animation_program(AGENT_ANIMATION_PURPLE_ATTENTION, 8),
+        )
+        self.assertEqual(
+            builtin_animation_program(AGENT_ANIMATION_PURPLE_COMPLETE, 8),
+            "#FF00FF 320ms cosine",
+        )
+        self.assertIn(
+            "#FF00FF 220ms ease",
+            builtin_animation_program(AGENT_ANIMATION_PURPLE_LID_OPEN, 8),
+        )
+
+    def test_color_profiles_use_the_exact_cyan_animation_shapes(self) -> None:
+        def without_colors(program: str) -> str:
+            return re.sub(r"#[0-9A-Fa-f]{6}", "#COLOR", program)
+
+        for led_count in (2, 8):
+            cyan_idle_shape = without_colors(
+                builtin_animation_program(AGENT_ANIMATION_IDLE_PULSE, led_count)
+            )
+            self.assertEqual(
+                without_colors(
+                    builtin_animation_program(AGENT_ANIMATION_EMBER_IDLE, led_count)
+                ),
+                cyan_idle_shape,
+            )
+            self.assertEqual(
+                without_colors(
+                    builtin_animation_program(
+                        AGENT_ANIMATION_PURPLE_IDLE,
+                        led_count,
+                    )
+                ),
+                cyan_idle_shape,
+            )
+
+        corresponding_animations = (
+            (
+                AGENT_ANIMATION_CYAN_ROLL,
+                AGENT_ANIMATION_EMBER_TIDE,
+                AGENT_ANIMATION_PURPLE_TIDE,
+            ),
+            (
+                AGENT_ANIMATION_AMBER_PULSE,
+                AGENT_ANIMATION_EMBER_ATTENTION,
+                AGENT_ANIMATION_PURPLE_ATTENTION,
+            ),
+            (
+                AGENT_ANIMATION_CYAN_COMPLETE,
+                AGENT_ANIMATION_EMBER_COMPLETE,
+                AGENT_ANIMATION_PURPLE_COMPLETE,
+            ),
+            (
+                AGENT_ANIMATION_LID_OPEN,
+                AGENT_ANIMATION_EMBER_LID_OPEN,
+                AGENT_ANIMATION_PURPLE_LID_OPEN,
+            ),
+        )
+        for led_count in (2, 8):
+            for cyan_id, ember_id, purple_id in corresponding_animations:
+                cyan_shape = without_colors(
+                    builtin_animation_program(cyan_id, led_count)
+                )
+                with self.subTest(profile="Ember", animation=cyan_id, leds=led_count):
+                    self.assertEqual(
+                        without_colors(
+                            builtin_animation_program(ember_id, led_count)
+                        ),
+                        cyan_shape,
+                    )
+                with self.subTest(profile="Purple", animation=cyan_id, leds=led_count):
+                    self.assertEqual(
+                        without_colors(
+                            builtin_animation_program(purple_id, led_count)
+                        ),
+                        cyan_shape,
+                    )
+
+    def test_idle_profiles_use_a_symmetric_center_bright_gradient(self) -> None:
+        for animation_id in (
+            AGENT_ANIMATION_IDLE_PULSE,
+            AGENT_ANIMATION_EMBER_IDLE,
+            AGENT_ANIMATION_PURPLE_IDLE,
+        ):
+            with self.subTest(animation=animation_id):
+                colors = re.findall(
+                    r"#[0-9A-Fa-f]{6}",
+                    builtin_animation_program(animation_id, 8).splitlines()[1],
+                )
+                self.assertEqual(len(colors), 4)
+                self.assertEqual(colors[0], colors[3])
+                self.assertEqual(colors[1], colors[2])
+                outer_peak = max(bytes.fromhex(colors[0][1:]))
+                center_peak = max(bytes.fromhex(colors[1][1:]))
+                self.assertLess(outer_peak, center_peak)
+
+    def test_purple_profile_uses_ff00ff_for_every_colored_animation(self) -> None:
+        purple_animations = (
+            AGENT_ANIMATION_PURPLE_TIDE,
+            AGENT_ANIMATION_PURPLE_ATTENTION,
+            AGENT_ANIMATION_PURPLE_COMPLETE,
+            AGENT_ANIMATION_PURPLE_LID_OPEN,
+        )
+        for led_count in (2, 8):
+            for animation_id in purple_animations:
+                with self.subTest(animation=animation_id, leds=led_count):
+                    self.assertEqual(
+                        set(
+                            re.findall(
+                                r"#[0-9A-Fa-f]{6}",
+                                builtin_animation_program(animation_id, led_count),
+                            )
+                        ),
+                        {"#FF00FF"},
+                    )
+        self.assertEqual(
+            builtin_animation_program(AGENT_ANIMATION_PURPLE_IDLE, 2),
+            "off 2s\n0:#FF00FF 1:#FF00FF 2s ease\nrepeat",
+        )
+        self.assertEqual(
+            builtin_animation_program(AGENT_ANIMATION_PURPLE_IDLE, 8),
+            "off 2s\n"
+            "2:#9F009F 3:#FF00FF 4:#FF00FF 5:#9F009F 2s ease\n"
+            "repeat",
+        )
+
+    def test_ember_profile_uses_f23819_as_its_primary_color(self) -> None:
+        ember_animations = (
+            AGENT_ANIMATION_EMBER_TIDE,
+            AGENT_ANIMATION_EMBER_ATTENTION,
+            AGENT_ANIMATION_EMBER_COMPLETE,
+            AGENT_ANIMATION_EMBER_LID_OPEN,
+        )
+        for led_count in (2, 8):
+            for animation_id in ember_animations:
+                with self.subTest(animation=animation_id, leds=led_count):
+                    self.assertEqual(
+                        set(
+                            re.findall(
+                                r"#[0-9A-Fa-f]{6}",
+                                builtin_animation_program(animation_id, led_count),
+                            )
+                        ),
+                        {"#F23819"},
+                    )
+        self.assertEqual(
+            builtin_animation_program(AGENT_ANIMATION_EMBER_IDLE, 2),
+            "off 2s\n0:#F23819 1:#F23819 2s ease\nrepeat",
+        )
+        self.assertEqual(
+            builtin_animation_program(AGENT_ANIMATION_EMBER_IDLE, 8),
+            "off 2s\n"
+            "2:#972310 3:#F23819 4:#F23819 5:#972310 2s ease\n"
+            "repeat",
+        )
+
+    def test_core_state_transitions_and_lid_close_outside_in_program(self) -> None:
+        completed = builtin_animation_program("solid-green", 8)
+        working = builtin_animation_program("cyan-roll", 8)
+        lid_closed = builtin_animation_program("lid-closed", 8)
+
+        self.assertEqual(completed, "#00FF66 320ms cosine")
+        self.assertTrue(working.startswith("off 320ms cosine\n"))
+        self.assertEqual(
+            lid_closed.splitlines(),
+            [
+                "0:#000000 75ms ease; 7:#000000 75ms ease",
+                "1:#000000 75ms ease; 6:#000000 75ms ease",
+                "2:#000000 75ms ease; 5:#000000 75ms ease",
+                "3:#000000 75ms ease; 4:#000000 75ms ease",
+                "#000000 1s",
+            ],
+        )
+        self.assertEqual(
+            builtin_animation_program("lid-closed", 2),
+            "0:#000000 300ms ease; 1:#000000 300ms ease\n#000000 1s",
+        )
+        self.assertEqual(
+            default_lid_animation(LID_ANIMATION_CLOSED).duration_seconds,
+            1.3,
+        )
+
+    def test_device_brightness_multiplies_authored_file_brightness(self) -> None:
+        self.assertEqual(
+            apply_brightness("brightness 128\n#FF0000", 128),
+            "brightness 64\n#FF0000",
+        )
+        self.assertEqual(
+            apply_brightness(
+                "brightness 200\n#FF0000\nbrightness 100\n#00FF00",
+                64,
+            ),
+            "brightness 50\n#FF0000\nbrightness 25\n#00FF00",
         )
 
     def test_write_mode_to_leds_uses_device_specific_program(self) -> None:
@@ -4481,7 +5584,7 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(result.target, device / "LEDS.LED")
             self.assertEqual(
                 (device / "LEDS.LED").read_text(),
-                "off 160ms cosine\n"
+                "off 320ms cosine\n"
                 "0:#00E5FF 760ms pulse 0ms; 1:#00E5FF 760ms pulse 260ms\n"
                 "repeat",
             )
@@ -4490,15 +5593,19 @@ class AgentMonitorTests(unittest.TestCase):
 
             self.assertEqual(
                 (device / "LEDS.LED").read_text(),
-                "off\n#020204 6s pulse\nrepeat",
+                "off 2s\n0:#006060 1:#006060 2s ease\nrepeat",
             )
 
             write_mode_to_leds(AgentMode.COMPLETED, device_path=device, brightness=64)
 
-            self.assertEqual((device / "LEDS.LED").read_text(), "brightness 64\n#00FF66")
+            self.assertEqual(
+                (device / "LEDS.LED").read_text(),
+                "brightness 64\n#00FF66 320ms cosine",
+            )
 
     def test_led_count_uses_product_name(self) -> None:
         self.assertEqual(led_count_for_target(Path("/Volumes/SidePulseDot/LEDS.LED")), 2)
+        self.assertEqual(led_count_for_target(Path("/Volumes/PulseDot/LEDS.LED")), 2)
         self.assertEqual(led_count_for_target(Path("/Volumes/SidePulsePro/LEDS.LED")), 8)
 
     def test_sidepulse_working_program_uses_eight_leds(self) -> None:
@@ -4510,7 +5617,7 @@ class AgentMonitorTests(unittest.TestCase):
 
             lines = (device / "LEDS.LED").read_text().splitlines()
             self.assertEqual(len(lines), 3)
-            self.assertEqual(lines[0], "off 160ms cosine")
+            self.assertEqual(lines[0], "off 320ms cosine")
             self.assertIn("0:#00E5FF 760ms pulse 0ms", lines[1])
             self.assertIn("5:#00E5FF 760ms pulse 475ms", lines[1])
             self.assertIn("7:#00E5FF 760ms pulse 665ms", lines[1])
@@ -5157,6 +6264,56 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(second.error, "device went away")
             # Backoff, so the second sync did not touch the device again.
             self.assertEqual(len(calls), 1)
+    def test_agent_led_controller_repairs_externally_changed_program(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "SidePulsePro"
+            device.mkdir()
+            controller = AgentLedController(device_path=device, brightness=211)
+
+            first = controller.sync_mode(
+                AgentMode.WORKING,
+                animation_style=AGENT_ANIMATION_PURPLE_TIDE,
+            )
+            target = device / "LEDS.LED"
+            target.write_text("off 2s\n3:#006060 4:#006060 2s ease\nrepeat")
+
+            repaired = controller.sync_mode(
+                AgentMode.WORKING,
+                animation_style=AGENT_ANIMATION_PURPLE_TIDE,
+            )
+
+            self.assertTrue(repaired.changed)
+            self.assertEqual(target.read_text(), first.program)
+
+    def test_agent_led_controller_tracks_mode_and_animation_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "SidePulsePro"
+            device.mkdir()
+            controller = AgentLedController(device_path=device)
+
+            default = controller.sync_mode(AgentMode.WORKING)
+            same_default = controller.sync_mode(AgentMode.TOOL_RUNNING)
+            kitt = controller.sync_mode(
+                AgentMode.WORKING,
+                animation_style=AGENT_ANIMATION_KITT,
+            )
+            custom_tool = controller.sync_mode(
+                AgentMode.TOOL_RUNNING,
+                animation_style=AGENT_ANIMATION_CUSTOM,
+                custom_program="#123456",
+            )
+            unchanged = controller.sync_mode(
+                AgentMode.TOOL_RUNNING,
+                animation_style=AGENT_ANIMATION_CUSTOM,
+                custom_program="#123456",
+            )
+
+            self.assertTrue(default.changed)
+            self.assertFalse(same_default.changed)
+            self.assertTrue(kitt.changed)
+            self.assertTrue(custom_tool.changed)
+            self.assertFalse(unchanged.changed)
+            self.assertEqual((device / "LEDS.LED").read_text(), "#123456")
 
     def test_battery_parser_uses_adapter_watts_and_raw_capacity(self) -> None:
         payload = plistlib.dumps(
@@ -5212,8 +6369,9 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIn(f"3:{BATTERY_CHARGING_MINT} 360ms ease", lines[0])
         self.assertIn("4:#000000 360ms ease", lines[0])
         self.assertEqual(lines[1], f"4:{BATTERY_CHARGING_MINT} 790ms pulse")
-        self.assertEqual(len(lines), 2)
-        self.assertNotIn("repeat", program)
+        self.assertEqual(lines[2], "4:#000000 800ms none")
+        self.assertEqual(lines[3], "repeat")
+        self.assertEqual(len(lines), 4)
         self.assertNotIn("\noff", program)
 
     def test_unplugged_battery_program_eases_to_static_level(self) -> None:
@@ -5261,10 +6419,26 @@ class AgentMonitorTests(unittest.TestCase):
 
         validate_led_text(program)
         self.assertIn(f"6:{BATTERY_CHARGING_MINT} 1400ms pulse", program)
-        self.assertNotIn("repeat", program)
+        self.assertTrue(program.endswith("repeat"))
         self.assertNotIn("none", program)
 
-    def test_battery_led_controller_animates_charging_on_cadence(self) -> None:
+    def test_plugged_but_not_charging_uses_static_battery_display(self) -> None:
+        snapshot = BatterySnapshot(
+            percent=80,
+            is_plugged=True,
+            is_charging=False,
+            adapter_watts=140,
+            full_charge_watts=140,
+        )
+
+        program = program_for_battery(snapshot, led_count=8)
+
+        validate_led_text(program)
+        self.assertNotIn("pulse", program)
+        self.assertNotIn("repeat", program)
+        self.assertIn("0:#00FF66 360ms ease", program)
+
+    def test_battery_led_controller_only_rewrites_when_program_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             device = Path(tmp) / "SidePulsePro"
             device.mkdir()
@@ -5276,6 +6450,13 @@ class AgentMonitorTests(unittest.TestCase):
                 adapter_watts=70,
                 full_charge_watts=140,
             )
+            faster_snapshot = BatterySnapshot(
+                percent=50,
+                is_plugged=True,
+                is_charging=True,
+                adapter_watts=96,
+                full_charge_watts=140,
+            )
 
             with patch(
                 "sidepulse.battery.time.monotonic",
@@ -5283,7 +6464,7 @@ class AgentMonitorTests(unittest.TestCase):
             ):
                 first = controller.sync_snapshot(snapshot)
                 second = controller.sync_snapshot(snapshot)
-                third = controller.sync_snapshot(snapshot)
+                third = controller.sync_snapshot(faster_snapshot)
 
             self.assertTrue(first.changed)
             self.assertFalse(second.changed)
@@ -5391,6 +6572,251 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertTrue(
             closed_lid_awake_should_hold(CLOSED_LID_AWAKE_ALWAYS, agents_active=False)
         )
+
+    def test_lid_close_holds_final_led_state_only_when_sleep_is_allowed(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        self.assertTrue(
+            status_bar.lid_closed_led_state_should_hold(
+                lid_closed=True,
+                sleep_prevention_policy=SLEEP_PREVENTION_AGENTS,
+                agents_active=False,
+            )
+        )
+        self.assertFalse(
+            status_bar.lid_closed_led_state_should_hold(
+                lid_closed=True,
+                sleep_prevention_policy=SLEEP_PREVENTION_AGENTS,
+                agents_active=True,
+            )
+        )
+        self.assertFalse(
+            status_bar.lid_closed_led_state_should_hold(
+                lid_closed=False,
+                sleep_prevention_policy=SLEEP_PREVENTION_AGENTS,
+                agents_active=False,
+            )
+        )
+        self.assertFalse(
+            status_bar.lid_closed_led_state_should_hold(
+                lid_closed=True,
+                sleep_prevention_policy=SLEEP_PREVENTION_ALWAYS,
+                agents_active=False,
+            )
+        )
+        self.assertTrue(
+            status_bar.lid_closed_led_state_should_hold(
+                lid_closed=True,
+                sleep_prevention_policy=SLEEP_PREVENTION_ALWAYS,
+                agents_active=False,
+                battery_safeguard_active=True,
+            )
+        )
+        self.assertTrue(
+            status_bar.lid_closed_led_state_should_hold(
+                lid_closed=True,
+                sleep_prevention_policy=SLEEP_PREVENTION_NEVER,
+                agents_active=True,
+            )
+        )
+        self.assertFalse(
+            status_bar.lid_closed_led_state_should_hold(
+                lid_closed=True,
+                sleep_prevention_policy=SLEEP_PREVENTION_AGENTS,
+                agents_active=None,
+            )
+        )
+
+    def test_lid_close_animation_runs_only_when_sleep_prevention_is_inactive(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        self.assertFalse(
+            status_bar.lid_close_animation_should_run(
+                sleep_prevention_policy=SLEEP_PREVENTION_ALWAYS,
+                agents_active=False,
+            )
+        )
+        self.assertFalse(
+            status_bar.lid_close_animation_should_run(
+                sleep_prevention_policy=SLEEP_PREVENTION_AGENTS,
+                agents_active=True,
+            )
+        )
+        self.assertFalse(
+            status_bar.lid_close_animation_should_run(
+                sleep_prevention_policy=SLEEP_PREVENTION_AGENTS,
+                agents_active=None,
+            )
+        )
+        self.assertTrue(
+            status_bar.lid_close_animation_should_run(
+                sleep_prevention_policy=SLEEP_PREVENTION_AGENTS,
+                agents_active=False,
+            )
+        )
+        self.assertTrue(
+            status_bar.lid_close_animation_should_run(
+                sleep_prevention_policy=SLEEP_PREVENTION_NEVER,
+                agents_active=True,
+            )
+        )
+
+    def test_lid_display_sleep_never_runs_with_an_external_or_unknown_display(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        self.assertTrue(
+            status_bar.closed_lid_display_sleep_should_request(
+                lid_closed=True,
+                external_display_active=False,
+                system_sleep_disabled=True,
+            )
+        )
+        self.assertFalse(
+            status_bar.closed_lid_display_sleep_should_request(
+                lid_closed=True,
+                external_display_active=True,
+                system_sleep_disabled=True,
+            )
+        )
+        self.assertFalse(
+            status_bar.closed_lid_display_sleep_should_request(
+                lid_closed=True,
+                external_display_active=None,
+                system_sleep_disabled=True,
+            )
+        )
+        self.assertFalse(
+            status_bar.closed_lid_display_sleep_should_request(
+                lid_closed=False,
+                external_display_active=False,
+                system_sleep_disabled=True,
+            )
+        )
+        self.assertFalse(
+            status_bar.closed_lid_display_sleep_should_request(
+                lid_closed=True,
+                external_display_active=False,
+                system_sleep_disabled=False,
+            )
+        )
+
+    def test_lid_poll_enables_hold_on_close_and_clears_it_on_open(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        animations = []
+        controller = status_bar.StatusBarController.alloc().init()
+        controller.lid_poll_in_flight = True
+        controller.pending_lid_error = None
+        controller.pending_lid_closed = True
+        controller.last_lid_error = None
+        controller.lid_poll_backoff_until_monotonic = 0.0
+        controller.last_lid_closed = False
+        controller.lid_closed_led_hold_active = False
+
+        with (
+            patch("sidepulse.status_bar.log_status_bar"),
+            patch.object(
+                status_bar.StatusBarController,
+                "should_run_lid_close_animation",
+                return_value=True,
+            ),
+            patch.object(
+                status_bar.StatusBarController,
+                "should_hold_lid_closed_led_state",
+                return_value=True,
+            ),
+            patch.object(
+                status_bar.StatusBarController,
+                "play_lid_animation",
+                side_effect=lambda kind: animations.append(kind),
+            ),
+        ):
+            controller.handleLidPollResult_(None)
+            self.assertTrue(controller.lid_closed_led_hold_active)
+            self.assertEqual(animations, [LID_ANIMATION_CLOSED])
+
+            controller.pending_lid_closed = False
+            controller.handleLidPollResult_(None)
+
+        self.assertFalse(controller.lid_closed_led_hold_active)
+        self.assertEqual(animations, [LID_ANIMATION_CLOSED, LID_ANIMATION_OPEN])
+
+    def test_lid_poll_skips_close_animation_while_sleep_prevention_is_active(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        controller = status_bar.StatusBarController.alloc().init()
+        controller.lid_poll_in_flight = True
+        controller.pending_lid_error = None
+        controller.pending_lid_closed = True
+        controller.last_lid_error = None
+        controller.lid_poll_backoff_until_monotonic = 0.0
+        controller.last_lid_closed = False
+        controller.lid_closed_led_hold_active = True
+
+        with (
+            patch("sidepulse.status_bar.log_status_bar"),
+            patch.object(
+                status_bar.StatusBarController,
+                "should_run_lid_close_animation",
+                return_value=False,
+            ),
+            patch.object(
+                status_bar.StatusBarController,
+                "play_lid_animation",
+            ) as play_lid_animation,
+        ):
+            controller.handleLidPollResult_(None)
+
+        self.assertTrue(controller.last_lid_closed)
+        self.assertFalse(controller.lid_closed_led_hold_active)
+        play_lid_animation.assert_not_called()
+
+    def test_lid_close_hold_suppresses_refresh_until_conditions_change(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        controller = status_bar.StatusBarController.alloc().init()
+        controller.leds_enabled = True
+        controller.lid_closed_led_hold_active = True
+        controller.led_animation_until_monotonic = 0.0
+        controller.led_sync_in_flight = False
+
+        with (
+            patch.object(controller, "sync_virtual_status_device"),
+            patch.object(
+                status_bar.StatusBarController,
+                "should_hold_lid_closed_led_state",
+                side_effect=[True, False],
+            ),
+            patch("sidepulse.status_bar.threading.Thread") as thread,
+            patch("sidepulse.status_bar.log_status_bar"),
+        ):
+            controller.sync_leds(AgentMode.IDLE_READY, None, "agent")
+            thread.assert_not_called()
+            self.assertTrue(controller.lid_closed_led_hold_active)
+
+            controller.sync_leds(AgentMode.WORKING, None, "agent")
+            thread.assert_called_once()
+            thread.return_value.start.assert_called_once()
+
+        self.assertFalse(controller.lid_closed_led_hold_active)
 
     def test_status_bar_sleep_prevention_never_releases_all_sleep_prevention(self) -> None:
         try:
@@ -5645,6 +7071,22 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertTrue(controller.process_running())
         self.assertFalse(controller.changed_system_disable)
 
+    def test_closed_lid_awake_controller_can_skip_duplicate_caffeinate(self) -> None:
+        disabled_calls: list[bool] = []
+        controller = ClosedLidAwakeController(
+            process_factory=lambda *_args, **_kwargs: FakeProcess(),
+            sleep_disabled_setter=disabled_calls.append,
+            use_system_disable=True,
+            use_caffeinate=False,
+        )
+
+        self.assertTrue(
+            controller.update(CLOSED_LID_AWAKE_ALWAYS, agents_active=False)
+        )
+        self.assertEqual(disabled_calls, [True])
+        self.assertFalse(controller.process_running())
+        self.assertTrue(controller.system_disable_active())
+
     def test_closed_lid_awake_controller_drives_existing_system_disable(self) -> None:
         disabled_calls: list[bool] = []
         controller = ClosedLidAwakeController(
@@ -5709,6 +7151,45 @@ class AgentMonitorTests(unittest.TestCase):
 
         self.assertIn("install-sleep-helper", str(ctx.exception))
         self.assertNotIn("/usr/bin/osascript", calls[0])
+
+    def test_display_sleep_request_uses_the_supported_pmset_command(self) -> None:
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        run_pmset_displaysleepnow(runner=runner)
+
+        self.assertEqual(calls[0][0], ["/usr/bin/pmset", "displaysleepnow"])
+        self.assertEqual(calls[0][1]["check"], False)
+
+    def test_display_sleep_request_reports_failure(self) -> None:
+        def runner(command, **_kwargs):
+            return subprocess.CompletedProcess(command, 1, "", "not allowed")
+
+        with self.assertRaises(DisplaySleepRequestError) as ctx:
+            run_pmset_displaysleepnow(runner=runner)
+
+        self.assertIn("not allowed", str(ctx.exception))
+
+    def test_external_display_detector_requires_an_active_non_builtin_display(self) -> None:
+        quartz = SimpleNamespace(
+            CGGetOnlineDisplayList=lambda *_args: (0, (1, 2, 3), 3),
+            CGDisplayIsBuiltin=lambda display_id: display_id == 1,
+            CGDisplayIsActive=lambda display_id: display_id == 2,
+        )
+        with patch.dict(sys.modules, {"Quartz": quartz}):
+            self.assertTrue(external_display_is_active())
+
+    def test_external_display_detector_returns_unknown_on_failure(self) -> None:
+        quartz = SimpleNamespace(
+            CGGetOnlineDisplayList=lambda *_args: (1, (), 0),
+            CGDisplayIsBuiltin=lambda _display_id: False,
+            CGDisplayIsActive=lambda _display_id: True,
+        )
+        with patch.dict(sys.modules, {"Quartz": quartz}):
+            self.assertIsNone(external_display_is_active())
 
     def test_sleep_helper_sudoers_rule_is_narrow(self) -> None:
         self.assertEqual(
@@ -5854,6 +7335,308 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(loaded.recent_session_retention_seconds, 36 * 60 * 60)
             self.assertEqual(loaded.idle_timeout_seconds, 15 * 60)
 
+    def test_settings_round_trip_agent_animations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings = AgentMonitorSettings()
+            settings = settings.with_agent_animation(
+                AgentMode.WORKING,
+                AGENT_ANIMATION_KITT,
+            )
+            settings = settings.with_agent_animation(
+                AgentMode.BLOCKED_ERROR,
+                AGENT_ANIMATION_CUSTOM,
+                custom_program="off\n#FF0000 pulse\nrepeat",
+            )
+
+            save_settings(settings, settings_path)
+            loaded = load_settings(settings_path)
+
+            saved_json = json.loads(settings_path.read_text())
+            custom_metadata = next(
+                iter(saved_json["custom_agent_animations"].values())
+            )
+            self.assertNotIn("program", custom_metadata)
+            custom_path = settings_path.parent / "animations" / custom_metadata["file"]
+            self.assertEqual(
+                custom_path.read_text(),
+                "off\n#FF0000 pulse\nrepeat\n",
+            )
+
+            self.assertEqual(
+                loaded.agent_animation(AgentMode.WORKING).style,
+                AGENT_ANIMATION_KITT,
+            )
+            self.assertEqual(
+                loaded.agent_animation(AgentMode.BLOCKED_ERROR).custom_program,
+                "off\n#FF0000 pulse\nrepeat",
+            )
+            self.assertEqual(
+                loaded.agent_animation(AgentMode.COMPLETED).style,
+                AGENT_ANIMATION_CYAN_COMPLETE,
+            )
+
+            custom_path.write_text("brightness 128\n#123456\n")
+            reloaded = load_settings(settings_path)
+            self.assertEqual(
+                reloaded.agent_animation(AgentMode.BLOCKED_ERROR).custom_program,
+                "brightness 128\n#123456",
+            )
+
+    def test_agent_animation_catalog_is_shared_by_every_state(self) -> None:
+        settings = AgentMonitorSettings()
+        animation_id = custom_agent_animation_id(
+            "Purple Sweep",
+            settings.custom_agent_animations,
+        )
+        settings = settings.with_custom_agent_animation(
+            animation_id,
+            name="Purple Sweep",
+            program="off\n#AA44FF 700ms pulse\nrepeat",
+        )
+
+        expected = (
+            AGENT_ANIMATION_SLOW_OFF,
+            AGENT_ANIMATION_IMMEDIATE_OFF,
+            AGENT_ANIMATION_IDLE_PULSE,
+            AGENT_ANIMATION_CYAN_ROLL,
+            AGENT_ANIMATION_CYAN_COMPLETE,
+            AGENT_ANIMATION_AMBER_PULSE,
+            AGENT_ANIMATION_SOLID_GREEN,
+            AGENT_ANIMATION_KITT,
+            AGENT_ANIMATION_KITT_RED,
+            AGENT_ANIMATION_EMBER_IDLE,
+            AGENT_ANIMATION_EMBER_TIDE,
+            AGENT_ANIMATION_EMBER_ATTENTION,
+            AGENT_ANIMATION_EMBER_COMPLETE,
+            AGENT_ANIMATION_EMBER_LID_OPEN,
+            AGENT_ANIMATION_PURPLE_IDLE,
+            AGENT_ANIMATION_PURPLE_TIDE,
+            AGENT_ANIMATION_PURPLE_ATTENTION,
+            AGENT_ANIMATION_PURPLE_COMPLETE,
+            AGENT_ANIMATION_PURPLE_LID_OPEN,
+            AGENT_ANIMATION_NIGHT_RIDER,
+            AGENT_ANIMATION_LID_OPEN,
+            AGENT_ANIMATION_LID_CLOSED,
+            animation_id,
+        )
+        self.assertEqual(settings.agent_animation_choices(), expected)
+        for mode in ANIMATION_STATES:
+            with self.subTest(mode=mode):
+                selected = settings.with_agent_animation(mode, animation_id)
+                self.assertEqual(selected.agent_animation_id(mode), animation_id)
+                self.assertEqual(
+                    selected.agent_animation(mode).custom_program,
+                    "off\n#AA44FF 700ms pulse\nrepeat",
+                )
+
+    def test_working_tool_and_long_task_share_one_animation_setting(self) -> None:
+        settings = AgentMonitorSettings().with_agent_animation(
+            AgentMode.TOOL_RUNNING,
+            AGENT_ANIMATION_KITT,
+        )
+
+        self.assertEqual(
+            {
+                settings.agent_animation_id(mode)
+                for mode in AGENT_ANIMATION_WORKING_MODES
+            },
+            {AGENT_ANIMATION_KITT},
+        )
+
+    def test_animation_profile_round_trip_includes_every_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings = AgentMonitorSettings()
+            custom_id = custom_agent_animation_id(
+                "Purple Sweep",
+                settings.custom_agent_animations,
+            )
+            settings = settings.with_custom_agent_animation(
+                custom_id,
+                name="Purple Sweep",
+                program="#AA44FF 700ms pulse\nrepeat",
+            )
+            for index, mode in enumerate(AgentMode):
+                selection = custom_id if index % 2 else AGENT_ANIMATION_KITT
+                settings = settings.with_agent_animation(mode, selection)
+            profile_id = agent_animation_profile_id(
+                "Focus",
+                settings.agent_animation_profiles,
+            )
+            settings = settings.with_agent_animation_profile(
+                profile_id,
+                name="Focus",
+            )
+            save_settings(settings, settings_path)
+
+            loaded = load_settings(settings_path)
+            profile = loaded.agent_animation_profiles[profile_id]
+            self.assertEqual(set(profile.animations), set(ANIMATION_STATES))
+            reset = loaded
+            for mode in AgentMode:
+                reset = reset.with_agent_animation(mode, AGENT_ANIMATION_DEFAULT)
+            applied = reset.with_applied_agent_animation_profile(profile_id)
+            self.assertEqual(
+                [applied.agent_animation_id(mode) for mode in AgentMode],
+                [loaded.agent_animation_id(mode) for mode in AgentMode],
+            )
+
+    def test_cyan_is_the_default_builtin_profile(self) -> None:
+        settings = AgentMonitorSettings()
+
+        self.assertEqual(
+            settings.matching_agent_animation_profile_id(),
+            AGENT_ANIMATION_PROFILE_CYAN,
+        )
+        self.assertEqual(
+            [settings.agent_animation_id(mode) for mode in ANIMATION_STATES],
+            [default_agent_animation_id(mode) for mode in ANIMATION_STATES],
+        )
+
+        purple = settings.with_applied_agent_animation_profile(
+            AGENT_ANIMATION_PROFILE_PURPLE
+        )
+        self.assertEqual(
+            purple.matching_agent_animation_profile_id(),
+            AGENT_ANIMATION_PROFILE_PURPLE,
+        )
+        self.assertEqual(
+            purple.agent_animation_id(AgentMode.WORKING),
+            AGENT_ANIMATION_PURPLE_TIDE,
+        )
+        self.assertEqual(
+            purple.agent_animation_id(ANIMATION_STATE_LID_OPEN),
+            AGENT_ANIMATION_PURPLE_LID_OPEN,
+        )
+        self.assertEqual(
+            purple.agent_animation_id(ANIMATION_STATE_LID_CLOSED),
+            AGENT_ANIMATION_LID_CLOSED,
+        )
+
+    def test_shipped_profile_json_matches_builtin_profiles(self) -> None:
+        profiles = builtin_agent_animation_profiles()
+        expected = {
+            "cyan": AGENT_ANIMATION_PROFILE_CYAN,
+            "ember": AGENT_ANIMATION_PROFILE_EMBER,
+            "purple": AGENT_ANIMATION_PROFILE_PURPLE,
+        }
+        for file_stem, profile_id in expected.items():
+            with self.subTest(profile=file_stem):
+                document = json.loads(
+                    (
+                        Path(__file__).parent.parent
+                        / "profiles"
+                        / f"{file_stem}.json"
+                    ).read_text()
+                )
+                profile = profiles[profile_id]
+                self.assertEqual(document["name"], profile.name)
+                self.assertEqual(document["animations"], profile.animations)
+                self.assertEqual(set(profile.animations), set(ANIMATION_STATES))
+
+    def test_builtin_profiles_keep_saved_animation_selections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "agent_animations": {
+                            AgentMode.IDLE_READY.value: {
+                                "style": AGENT_ANIMATION_KITT,
+                                "custom_program": "",
+                            }
+                        },
+                        "agent_animation_profiles": {
+                            "profile:default": {
+                                "name": "Default",
+                                "animations": {
+                                    mode: default_agent_animation_id(mode)
+                                    for mode in ANIMATION_STATES
+                                },
+                            }
+                        },
+                    }
+                )
+            )
+
+            loaded = load_settings(settings_path)
+
+        self.assertEqual(
+            loaded.agent_animation_id(AgentMode.IDLE_READY),
+            AGENT_ANIMATION_KITT,
+        )
+        self.assertEqual(
+            set(loaded.agent_animation_profiles),
+            {
+                AGENT_ANIMATION_PROFILE_CYAN,
+                AGENT_ANIMATION_PROFILE_EMBER,
+                AGENT_ANIMATION_PROFILE_PURPLE,
+            },
+        )
+
+    def test_animation_profile_json_is_self_contained_and_importable(self) -> None:
+        settings = AgentMonitorSettings()
+        custom_id = custom_agent_animation_id(
+            "Purple Sweep",
+            settings.custom_agent_animations,
+        )
+        settings = settings.with_custom_agent_animation(
+            custom_id,
+            name="Purple Sweep",
+            program="#AA44FF 700ms pulse\nrepeat",
+        )
+        for mode in AgentMode:
+            settings = settings.with_agent_animation(mode, custom_id)
+
+        document = agent_animation_profile_document(settings)
+
+        self.assertEqual(document["format"], "sidepulse-animation-profile")
+        self.assertEqual(document["version"], 1)
+        self.assertEqual(document["name"], "Current")
+        self.assertEqual(
+            set(document["animations"]),
+            set(ANIMATION_STATES),
+        )
+        self.assertEqual(
+            document["custom_animations"][custom_id]["program"],
+            "#AA44FF 700ms pulse\nrepeat",
+        )
+
+        imported, profile_id = with_imported_agent_animation_profile(
+            AgentMonitorSettings(),
+            json.loads(json.dumps(document)),
+        )
+        self.assertIn(profile_id, imported.agent_animation_profiles)
+        for mode in AgentMode:
+            self.assertEqual(imported.agent_animation_id(mode), custom_id)
+            self.assertEqual(
+                imported.agent_animation(mode).custom_program,
+                "#AA44FF 700ms pulse\nrepeat",
+            )
+
+    def test_animation_profile_json_requires_all_agent_states(self) -> None:
+        document = agent_animation_profile_document(AgentMonitorSettings())
+        del document["animations"][AgentMode.UNKNOWN.value]
+
+        with self.assertRaisesRegex(ValueError, "every agent state"):
+            with_imported_agent_animation_profile(
+                AgentMonitorSettings(),
+                document,
+            )
+
+    def test_settings_do_not_migrate_pr_kitt_toggle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text(json.dumps({"kitt_mode_enabled": True}))
+
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(
+                loaded.agent_animation(AgentMode.WORKING).style,
+                AGENT_ANIMATION_CYAN_ROLL,
+            )
+
     def test_settings_migrates_missing_agent_list_timing_to_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings_path = Path(tmp) / "settings.json"
@@ -5884,6 +7667,7 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIn("codex", providers)
         self.assertIn("claude", providers)
         self.assertIn("grok", providers)
+        self.assertIn("junie", providers)
         self.assertNotIn("codex-transcripts", providers)
         self.assertNotIn("claude-transcripts", providers)
 
@@ -6299,6 +8083,21 @@ class AgentMonitorTests(unittest.TestCase):
 
     def test_sd_eject_guard_default_binary_uses_background_item_name(self) -> None:
         self.assertEqual(SD_EJECT_GUARD_BINARY_NAME, SD_EJECT_GUARD_DISPLAY_NAME)
+
+    def test_sd_eject_guard_log_cleaner_truncates_files_over_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "sd-eject-guard.out.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("wb") as handle:
+                handle.seek(SD_EJECT_GUARD_LOG_MAX_BYTES)
+                handle.write(b"x")
+
+            self.assertTrue(truncate_log_if_large(log))
+            self.assertEqual(log.stat().st_size, 0)
+
+            log.write_text("prevented eject of disk4s1\n", encoding="utf-8")
+            self.assertFalse(truncate_log_if_large(log))
+            self.assertEqual(read_log_tail(log, 5), "prevented eject of disk4s1")
 
     def test_sd_eject_guard_installed_checks_user_and_system_plists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

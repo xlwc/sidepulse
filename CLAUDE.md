@@ -8,11 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 SidePulse Dot (2-LED USB-C) devices. The devices mount as disk volumes under
 `/Volumes` and are driven entirely by writing a small DSL program to
 `LEDS.LED` — there is no driver and no USB protocol. The main product is a
-PyObjC menu-bar app that turns AI agent hook events (Codex, Claude, Grok) into
-a glanceable LED state.
+PyObjC menu-bar app that turns AI agent hook events (Codex, Claude, Grok,
+Cursor, Junie) into a glanceable LED state.
 
-`ios/` is an independent Xcode app plus Python APNs tooling; it does not share
-code with `src/`.
+The iOS app lives outside this repo. `links.py` pairs an iPhone and pushes LED
+programs to it through the bridge; `relay.py` and `service.py` forward hook
+events between machines through the same bridge.
 
 ## Commands
 
@@ -115,15 +116,19 @@ working.
   `jsonl_log.append_jsonl_line`, which keeps them `0600` and rotates them at a
   size cap; failing to do either must still leave the hook exiting 0. New log
   writers belong on that helper, not on a bare `open(..., "a")`.
-- **Version in three places agree.** `pyproject.toml`, `src/sidepulse/__init__.py`,
-  and the release git tag. Bump the first two together.
+- **The git tag is the version.** `pyproject.toml` declares the version dynamic
+  (setuptools-scm, `fallback_version = "0"`) and `sidepulse.__version__` reads
+  the installed distribution metadata. Do not hardcode a version in either file.
 
 ## Releasing
 
-`git tag vX.Y.Z && git push --tags` gates on the full suite, then publishes and
-reinstalls the artifact **from PyPI** on clean macOS and Linux runners to re-run
-the clean-room tests against what users download. Point those tests at any
-build with `SIDEPULSE_INSTALL_SPEC='sidepulse==X.Y.Z'`.
+Versions are calendar versions of the form `1.YYYYMMDD.SECONDS`.
+`scripts/release.sh` builds and verifies the release files locally; it does not
+tag or publish. It needs Python 3.10 or later: set `PYTHON_BIN` when the
+`python3` on `PATH` is older. Pushing a `v<version>` tag gates on the full suite,
+then publishes and reinstalls the artifact **from PyPI** on clean macOS and Linux
+runners to re-run the clean-room tests against what users download. Point those
+tests at any build with `SIDEPULSE_INSTALL_SPEC='sidepulse==<version>'`.
 
 Signed/notarized PKG: `packaging/build_macos_pkg.sh` (see `packaging/README.md`;
 `ALLOW_UNSIGNED=1` for local verification only).
