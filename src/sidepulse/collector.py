@@ -59,6 +59,19 @@ class CachedTranscriptRecords:
 
 
 @dataclass(frozen=True)
+class CachedLogRecords:
+    """Parsed provider log, keyed on every generation the reader opens.
+
+    Separate from ``CachedTranscriptRecords`` because a provider log is read
+    across its rotated backups, so one live-file ``(mtime, size)`` pair does not
+    describe what was read.
+    """
+
+    signature: tuple[tuple[float, int] | None, ...]
+    records: tuple[HookEvent, ...]
+
+
+@dataclass(frozen=True)
 class CachedTranscriptFileList:
     expires_at: float
     paths: tuple[Path, ...]
@@ -119,7 +132,7 @@ class AgentMonitor:
         self.idle_visible_seconds = idle_visible_seconds
         self.post_tool_working_visible_seconds = post_tool_working_visible_seconds
         self.max_lines_per_source = max_lines_per_source
-        self._log_records_cache: dict[tuple[str, str, int], CachedTranscriptRecords] = {}
+        self._log_records_cache: dict[tuple[str, str, int], CachedLogRecords] = {}
         self._transcript_records_cache: dict[tuple[str, str], CachedTranscriptRecords] = {}
         self._transcript_file_list_cache: dict[tuple[str, int], CachedTranscriptFileList] = {}
         self._latest_status_signature: tuple[Any, ...] | None = None
@@ -277,25 +290,50 @@ class AgentMonitor:
 
     def _iter_records(self) -> Iterable[HookEvent]:
         for source in self.sources:
-            if not source.path.exists():
-                continue
             if source.provider == CODEX_TRANSCRIPT_PROVIDER:
+                if not source.path.exists():
+                    continue
                 yield from self._iter_codex_transcript_records(source.path)
                 continue
             if source.provider == CLAUDE_TRANSCRIPT_PROVIDER:
+                if not source.path.exists():
+                    continue
                 yield from self._iter_claude_transcript_records(source.path)
                 continue
+            # No existence gate on the live path here: the backups can hold the
+            # whole window while it is absent. `_cached_log_records` returns
+            # nothing when no generation exists.
             yield from self._cached_log_records(source)
 
+    def _log_source_signature(
+        self, path: Path
+    ) -> tuple[tuple[float, int] | None, ...] | None:
+        """Stat every retained generation, or None when none of them exist.
+
+        Keyed on the backups as well as the live file because the reader opens
+        them: keying on the live file alone would serve a stale cache entry
+        while the live file is momentarily gone, and would miss the case where
+        only backups exist.
+        """
+        signatures = tuple(
+            file_signature(candidate)
+            for candidate in (
+                path,
+                *(backup_path(path, index) for index in range(1, DEFAULT_BACKUP_COUNT + 1)),
+            )
+        )
+        if all(signature is None for signature in signatures):
+            return None
+        return signatures
+
     def _cached_log_records(self, source: SourceSpec) -> tuple[HookEvent, ...]:
-        try:
-            stat = source.path.stat()
-        except OSError:
+        signature = self._log_source_signature(source.path)
+        if signature is None:
             return ()
 
         key = (source.provider, str(source.path), self.max_lines_per_source)
         cached = self._log_records_cache.get(key)
-        if cached is not None and cached.mtime == stat.st_mtime and cached.size == stat.st_size:
+        if cached is not None and cached.signature == signature:
             return cached.records
 
         records: list[HookEvent] = []
@@ -307,9 +345,8 @@ class AgentMonitor:
                 records.append(record)
 
         cached_records = tuple(records)
-        self._log_records_cache[key] = CachedTranscriptRecords(
-            mtime=stat.st_mtime,
-            size=stat.st_size,
+        self._log_records_cache[key] = CachedLogRecords(
+            signature=signature,
             records=cached_records,
         )
         return cached_records
@@ -1862,8 +1899,8 @@ def read_recent_lines_across_rotations(
     5000 lines -- that means about 1 KiB per record, and a provider log that
     records tool inputs runs several times that. Expect every retained
     generation to be opened and parsed on a real install, and note that
-    ``AgentMonitor._cached_log_records`` keys its cache on the live file's mtime
-    and size, so each hook event invalidates it.
+    ``AgentMonitor._cached_log_records`` keys its cache on the live file's
+    signature and every backup's, so each hook event invalidates it.
     """
     if max_lines <= 0:
         return []
@@ -1880,7 +1917,12 @@ def read_recent_lines_across_rotations(
         try:
             older = read_recent_lines(backup_path(path, index), max_lines - len(lines))
         except OSError:
-            break
+            # Continue, not break: `rotate_log`'s shuffle can drop a generation
+            # under concurrent hook processes, leaving `.1` absent while `.2`
+            # still holds records. Stopping at the gap would hide them, and a
+            # session whose newest event sits behind it would vanish from the
+            # snapshot. This matches `audit.read_status_audit_records`.
+            continue
         if not older:
             continue
         lines = older + lines

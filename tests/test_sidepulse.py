@@ -305,6 +305,62 @@ class AgentMonitorTests(unittest.TestCase):
                 collector_module.read_recent_lines_across_rotations(log, 5),
             )
 
+    def test_reading_a_rotated_log_skips_past_a_missing_generation(self) -> None:
+        """A gap in the backups must not hide the generations behind it.
+
+        ``rotate_log`` can drop a generation under concurrent hook processes, so
+        ``.1`` is absent while ``.2`` still holds records. Breaking there returns
+        short and a session whose newest event lives in ``.2`` disappears. The
+        sibling reader ``audit.read_status_audit_records`` already continues.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "codex.jsonl"
+            log.write_text("live-0\n", encoding="utf-8")
+            log.with_name(log.name + ".2").write_text("old-2\n", encoding="utf-8")
+
+            self.assertEqual(
+                ["old-2", "live-0"],
+                collector_module.read_recent_lines_across_rotations(log, 8),
+            )
+
+    def test_snapshot_reads_backups_when_the_live_log_is_missing(self) -> None:
+        """The rotation-tolerant reader has to be reachable from the real path.
+
+        ``_iter_records`` skipped a source whose live file was absent, so the
+        tolerance in ``read_recent_lines_across_rotations`` never ran on the path
+        users take -- only in the test that calls the helper directly.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            codex = Path(tmp) / "codex.jsonl"
+            now = datetime.now(timezone.utc).isoformat()
+            codex.with_name(codex.name + ".1").write_text(
+                json.dumps(
+                    {
+                        "logged_at": now,
+                        "event": {
+                            "hook_event_name": "Notification",
+                            "session_id": "waiting-session",
+                            "notification_type": "idle_prompt",
+                            "message": "Codex is waiting for your input",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("codex", codex),),
+                stale_after_seconds=999999999,
+            )
+            snapshot = monitor.snapshot()
+
+            self.assertEqual(
+                {"codex:session:waiting-session"},
+                {status.agent_id for status in snapshot.statuses},
+            )
+            self.assertEqual(snapshot.aggregate.mode, AgentMode.WAITING_FOR_INPUT)
+
     def test_reading_a_rotated_log_stops_once_the_line_budget_is_met(self) -> None:
         """The top-up stops as soon as the line budget is met.
 
