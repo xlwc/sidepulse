@@ -203,6 +203,14 @@ class SlotAllocator:
         # band change restarts the flash clock, so WORKING -> TOOL_RUNNING (both
         # working) and BLOCKED_ERROR -> WAITING_FOR_INPUT (both alert) leave it
         # running.
+        #
+        # A fresh alert arriving after the window has already closed does not
+        # restart it either, and that is the same decision rather than a gap in
+        # it. The flash tracks the five-minute prompt cache TTL, not whether
+        # something needs answering: once the window is out the session is cold,
+        # so blinking would assert a cheap resume that is no longer true. The
+        # steady band still says what the session needs. Restarting the clock
+        # here is what would make the flash mean two things at once.
         for occupant in self._slots:
             if occupant is None:
                 continue
