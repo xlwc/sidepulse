@@ -33,8 +33,7 @@ The command works on macOS and Linux with Python 3.10 or newer. The
 `~/.local/share/sidepulse/venv`, installs SidePulse from GitHub, links the CLI
 at `~/.local/bin/sidepulse`, and runs `sidepulse setup`. On macOS, setup also
 installs the menu-bar app and hardware helpers. On Linux, it automatically
-uses CLI-only mode for mounted SidePulse devices and iPhone linking/push. Run
-`sidepulse update` to upgrade to the newest version from GitHub.
+uses CLI-only mode for mounted SidePulse devices and iPhone linking/push.
 
 Setup also installs a headless SidePulse service. It runs through a LaunchAgent
 on macOS and a user systemd service on Linux. Setup restarts the service, so an
@@ -66,26 +65,16 @@ sidepulse setup
 
 ### Updating
 
+`sidepulse update` is not available in this fork. Upstream's version downloads
+`https://sidepulse.io/setup.sh`, runs it without a checksum, and installs
+upstream's default branch over the current install. To update this fork, pull
+the checkout and reinstall from it:
+
 ```sh
-sidepulse update
-sidepulse update --dry-run
+git pull
+./scripts/install-user.sh
+sidepulse setup
 ```
-
-`update` runs the same installer as `curl -fsSL https://sidepulse.io/setup.sh | bash`.
-It downloads the script completely before executing it, so curl failures do not
-run a partial installer. The website script forwards to `scripts/setup.sh` on
-GitHub, keeping both entry points on one implementation.
-
-The installer updates `~/.local/share/sidepulse/venv` from GitHub, refreshes the
-CLI links, and runs `sidepulse setup` to configure hooks and restart services.
-It replaces the installed code even when the package version has not changed.
-Settings and linked devices are retained. Downloads and builds finish before
-the background service and menu-bar app are paused; if installation fails,
-the installer attempts to restart them. Restart manually started processes yourself.
-
-Both commands honor `PYTHON_BIN`, `SIDEPULSE_INSTALL_SPEC`,
-`SIDEPULSE_INSTALL_ROOT`, and `SIDEPULSE_BIN_DIR`. They use the managed install
-path above, even when invoked from a development checkout or bundled app.
 
 Send an LED program to SidePulse:
 

@@ -136,11 +136,11 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     version = subparsers.add_parser("version", help="Print the installed SidePulse version.")
     version.set_defaults(func=cmd_version)
-    update = subparsers.add_parser("update", help="Update using the one-command setup installer.")
-    update.add_argument(
-        "--dry-run", action="store_true",
-        help="Show the setup command without downloading or changing anything.",
+    update = subparsers.add_parser(
+        "update",
+        help="Not available in this fork; prints how to update from a checkout.",
     )
+    update.add_argument("--dry-run", action="store_true", help="Same as without it.")
     update.set_defaults(func=cmd_sidepulse_update)
     subparsers.add_parser(
         "agent-monitor",
