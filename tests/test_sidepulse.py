@@ -8095,6 +8095,61 @@ class AgentMonitorTests(unittest.TestCase):
                     )
                 )
 
+    def test_two_open_prompts_drop_both_of_their_mirrors(self) -> None:
+        """A request key is not used up by the first mirror it pairs with.
+
+        The child and the parent each raise a prompt, and each prompt sends its
+        own session-keyed ``Notification``. Neither mirror says which prompt it
+        copies. If the first mirror consumed the child's key, the second would
+        find no key left and pin the session on Ask after both prompts are
+        answered.
+        """
+        now = datetime.now(timezone.utc)
+        session_id = "claude-two-mirrors"
+        event = self._mirror_fixture(now, session_id)
+        child_id = "a94aab97f06a0367c"
+        child_tool = {"tool_name": "Bash", "tool_input": {"command": "pytest -q"}}
+        parent_tool = {"tool_name": "Bash", "tool_input": {"command": "git status"}}
+        mirror = {
+            "hook_event_name": "Notification",
+            "message": "Claude needs your permission",
+            "notification_type": "permission_prompt",
+        }
+        records = [
+            event(
+                0,
+                {"hook_event_name": "PreToolUse", "tool_name": "Task", "tool_input": {}},
+            ),
+            event(
+                2,
+                {"hook_event_name": "PermissionRequest", "agent_id": child_id, **child_tool},
+            ),
+            event(3, {"hook_event_name": "PermissionRequest", **parent_tool}),
+            event(
+                5,
+                {
+                    "hook_event_name": "PostToolUse",
+                    "agent_id": child_id,
+                    "tool_response": "{}",
+                    **child_tool,
+                },
+            ),
+            event(
+                6,
+                {"hook_event_name": "PostToolUse", "tool_response": "{}", **parent_tool},
+            ),
+            event(8, mirror),
+            event(9, mirror),
+        ]
+
+        monitor = LiveAgentMonitor(stale_after_seconds=3600)
+        for record in records:
+            monitor.ingest_record(record)
+
+        statuses = collector_module.multiagent_statuses(monitor.snapshot())
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(slot_band(statuses[0].mode), BAND_WORKING)
+
     def test_the_live_monitor_shows_a_parent_prompt_after_a_child_prompt_is_answered(
         self,
     ) -> None:

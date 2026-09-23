@@ -1791,6 +1791,12 @@ def notification_mirrors_another_agents_permission(
     a prompt raised while no child has one open, or a prompt whose
     ``PermissionRequest`` hook never fired, still alerts.
 
+    A key is not used up when a mirror pairs with it. A mirror carries nothing
+    that says which prompt it copies, so with a child's and a parent's prompt
+    both open, a consumed key leaves the second mirror unpaired and the session
+    stuck on Ask. The cost is that a parent prompt whose own request hook never
+    fired stays hidden while a child's key still covers it.
+
     ``mode`` is the caller's ``status.mode``, already computed. It is a parameter
     rather than a second ``mode_for_event`` call so a change to that function's
     ``Notification`` branch cannot leave two readers disagreeing.
