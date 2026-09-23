@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import os
@@ -20,6 +21,7 @@ from sidepulse.relay import (
     RelayConfig,
     configure_outbound_channel,
     ensure_receiver_config,
+    listen_for_relay_events,
     load_relay_config,
     new_relay_channel,
     parse_relay_event,
@@ -336,6 +338,61 @@ class RelayTransportTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         return sends
+
+
+class RelayListenerTests(unittest.TestCase):
+    def test_listener_reconnects_after_a_broken_chunked_response(self) -> None:
+        stop = RecordingStop(stop_after_waits=2)
+        with patch(
+            "sidepulse.relay.urllib.request.urlopen",
+            side_effect=[http.client.IncompleteRead(b""), OSError("down")],
+        ) as open_url:
+            listen_for_relay_events(self._config(), stop, lambda *_args: None)
+
+        self.assertEqual(open_url.call_count, 2)
+
+    def test_listener_backs_off_while_the_bridge_stays_down(self) -> None:
+        stop = RecordingStop(stop_after_waits=4)
+        with patch(
+            "sidepulse.relay.urllib.request.urlopen",
+            side_effect=OSError("down"),
+        ):
+            listen_for_relay_events(self._config(), stop, lambda *_args: None)
+
+        self.assertEqual(stop.waits, [1.0, 2.0, 4.0, 8.0])
+
+    def test_listener_backoff_resets_after_a_connection_succeeds(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        stop = RecordingStop(stop_after_waits=3)
+        with (
+            patch(
+                "sidepulse.relay.urllib.request.urlopen",
+                side_effect=[OSError("down"), OSError("down"), response, OSError("down")],
+            ),
+            patch("sidepulse.relay.iter_sse_messages", return_value=iter(())),
+        ):
+            listen_for_relay_events(self._config(), stop, lambda *_args: None)
+
+        self.assertEqual(stop.waits, [1.0, 2.0, 1.0])
+
+    def _config(self) -> RelayConfig:
+        return RelayConfig(server="https://bridge.sidepulse.io", receiver_channel="a" * 22)
+
+
+class RecordingStop(threading.Event):
+    """A stop event that records each backoff and sets itself after enough of them."""
+
+    def __init__(self, *, stop_after_waits: int) -> None:
+        super().__init__()
+        self.waits: list[float] = []
+        self.stop_after_waits = stop_after_waits
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.waits.append(timeout)
+        if len(self.waits) >= self.stop_after_waits:
+            self.set()
+        return self.is_set()
 
 
 class SidePulseServiceTests(unittest.TestCase):

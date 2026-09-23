@@ -31,6 +31,8 @@ RELAY_CONFIG_VERSION = 1
 RELAY_MESSAGE_VERSION = 1
 RELAY_CHANNEL_BYTES = 16
 SHORT_SOCKET_BASE = Path("/tmp")
+RELAY_RETRY_INITIAL_SECONDS = 1.0
+RELAY_RETRY_MAX_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -338,15 +340,21 @@ def listen_for_relay_events(
 ) -> None:
     channel = urllib.parse.quote(clean_channel(config.receiver_channel, required=True), safe="")
     url = f"{normalize_server(config.server)}/api/leds/{channel}"
+    delay = RELAY_RETRY_INITIAL_SECONDS
     while not stop.is_set():
         request = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
         try:
             with urllib.request.urlopen(request, timeout=30.0) as response:
+                delay = RELAY_RETRY_INITIAL_SECONDS
                 for value in iter_sse_messages(response):
                     if stop.is_set():
                         return
                     parsed = parse_relay_event(value)
                     if parsed is not None:
                         on_event(*parsed)
-        except (OSError, urllib.error.URLError):
-            stop.wait(1.0)
+        # Not just OSError: a stream cut mid-chunk raises http.client.IncompleteRead,
+        # and nothing restarts this thread while the channel stays the same.
+        except Exception:
+            pass
+        stop.wait(delay)
+        delay = min(delay * 2, RELAY_RETRY_MAX_SECONDS)
