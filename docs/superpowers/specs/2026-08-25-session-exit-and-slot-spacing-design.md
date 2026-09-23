@@ -285,7 +285,7 @@ inside the Task tool emits no hook of its own until the Task returns.
 That leaves the duplicate as the parent's newest status.
 `status_coalesce_sort_key` sorts on priority before recency, so a stale
 `WAITING_FOR_INPUT` beats every child's fresh `WORKING`. The slot holds the alert
-band for the rest of the sub-agent's run, which after the five-second flash reads
+band for the rest of the sub-agent's run, which after the five-minute flash reads
 as steady red.
 
 Dropping the duplicate costs the display nothing. The child's own
