@@ -260,9 +260,17 @@ def slot_render_key(
     Deliberately excludes the repeat count. Remaining flash time falls on every
     refresh, so keying on it -- or on the program text, which contains it --
     would rewrite LEDS.LED every 15s forever.
+
+    Includes ``flash_started_at`` for a flashing slot, which does not fall on
+    every refresh. Colours alone cannot tell one occupant's flash window from
+    the next one's: a slot changing hands within a band would look unchanged,
+    the write would be suppressed, and the device would keep running the
+    departed session's nearly-exhausted ``repeat``, cutting the new one's blink
+    short.
     """
     return (normalize_brightness(brightness),) + tuple(
-        (slot.color, slot.flash_color) for slot in slots
+        (slot.color, slot.flash_color, slot.flash_started_at if slot.flashing else None)
+        for slot in slots
     )
 
 

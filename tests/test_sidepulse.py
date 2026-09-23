@@ -4767,6 +4767,60 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(settled[0], (steady_red, 0, 0))
         self.assertEqual(settled[1], working_rgb)
 
+    def test_a_new_occupant_reflashes_a_slot_its_predecessor_left(self) -> None:
+        """The dedupe key must not let one session inherit another's flash clock.
+
+        ``slot_render_key`` held only colours, so a slot whose occupant is
+        replaced by a different session in the same band at the same index looks
+        unchanged and the write is suppressed. The device then keeps running the
+        old occupant's nearly-exhausted ``repeat``, so the arriving session
+        blinks for whatever was left of its predecessor's window instead of its
+        own five minutes.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "SidePulseDot"
+            device.mkdir()
+            controller = MultiAgentLedController(
+                device_path=device, rng=random.Random(1)
+            )
+            base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+            def status(name: str, mode: AgentMode, at: datetime) -> AgentStatus:
+                return AgentStatus(
+                    provider="claude",
+                    agent_id=f"claude:session:{name}",
+                    display_name=name,
+                    mode=mode,
+                    updated_at=at,
+                    event_name="PermissionRequest",
+                )
+
+            # `keeper` holds the other slot for the whole test, so the arriving
+            # session has exactly one free index -- the one `a` gave up.
+            first = controller.sync_statuses(
+                (
+                    status("keeper", AgentMode.WORKING, base),
+                    status("a", AgentMode.WAITING_FOR_INPUT, base),
+                ),
+                now=base,
+            )
+            self.assertTrue(first.changed)
+
+            later = base + timedelta(seconds=290)
+            second = controller.sync_statuses(
+                (
+                    status("keeper", AgentMode.WORKING, later),
+                    status("b", AgentMode.WAITING_FOR_INPUT, later),
+                ),
+                now=later,
+            )
+
+            self.assertTrue(
+                second.changed,
+                "an arriving session must not inherit its predecessor's repeat",
+            )
+            self.assertIn("repeat 328", second.program)
+
     def test_multiagent_controller_reset_keeps_every_slot_assignment(self) -> None:
         """Sticky position is the reason placement is random at all.
 

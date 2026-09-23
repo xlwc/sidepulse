@@ -50,13 +50,19 @@ class SlotBand:
     steady: str
     flash_peak: str | None
 
-    def slot(self, remaining_flash_seconds: float = 0.0) -> "Slot":
+    def slot(
+        self,
+        remaining_flash_seconds: float = 0.0,
+        *,
+        flash_started_at: datetime | None = None,
+    ) -> "Slot":
         """Render this band with ``remaining`` seconds of flash window left."""
         flashing = self.flash_peak is not None and remaining_flash_seconds > 0.0
         return Slot(
             color=self.steady,
             flash_color=self.flash_peak if flashing else None,
             remaining_flash_seconds=remaining_flash_seconds if flashing else 0.0,
+            flash_started_at=flash_started_at if flashing else None,
         )
 
 
@@ -132,6 +138,9 @@ class Slot:
     color: str
     flash_color: str | None = field(default=None, kw_only=True)
     remaining_flash_seconds: float = field(default=0.0, kw_only=True)
+    # When this slot's flash window opened, or None when it is not flashing.
+    # Carried for `led_status.slot_render_key`; see its docstring.
+    flash_started_at: datetime | None = field(default=None, kw_only=True)
 
     @property
     def flashing(self) -> bool:
@@ -289,5 +298,10 @@ class SlotAllocator:
             # No peakless-band guard here: `slot()` zeroes the remaining window
             # for a band that cannot flash, so one decision point is enough.
             age = max(0.0, (now - occupant.entered_at).total_seconds())
-            slots.append(occupant.band.slot(max(0.0, self.flash_seconds - age)))
+            slots.append(
+                occupant.band.slot(
+                    max(0.0, self.flash_seconds - age),
+                    flash_started_at=occupant.entered_at,
+                )
+            )
         return tuple(slots)
