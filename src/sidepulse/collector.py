@@ -195,7 +195,7 @@ class AgentMonitor:
         metadata_by_session: dict[str, StatusMetadata] = {}
         metadata_by_status: dict[str, StatusMetadata] = {}
         pending_permissions_by_session: dict[str, dict[str, set[str]]] = {}
-        permission_request_keys_by_session: dict[str, dict[str, datetime]] = {}
+        permission_request_keys_by_session: dict[str, dict[str, PermissionRequestMark]] = {}
 
         records = sorted(
             self._iter_records(),
@@ -413,8 +413,9 @@ class LiveAgentMonitor:
         self.pending_permissions_by_session: dict[str, dict[str, set[str]]] = {}
         # Not persisted with `latest.json`, like `pending_permissions_by_session`: a
         # restart loses the pairing and a mirror arriving in that gap is recorded
-        # session-keyed again. It expires on the parent's next hook either way.
-        self.permission_request_keys_by_session: dict[str, dict[str, datetime]] = {}
+        # session-keyed again. Entries expire on the next `PermissionRequest` from
+        # any session.
+        self.permission_request_keys_by_session: dict[str, dict[str, PermissionRequestMark]] = {}
         self.load_latest_state()
 
     def ingest_record(self, record: HookEvent) -> None:
@@ -1589,11 +1590,29 @@ def permission_signature(record: HookEvent) -> str | None:
 # and tight enough that an unrelated later prompt, whose own ``PermissionRequest``
 # went missing, still raises the alert on its own.
 PERMISSION_NOTIFICATION_MIRROR_SECONDS = 60.0
+# How long after a request its mirror can still be in flight. Measured mirror lag
+# over 272 pairs was 6 s at the median and 12 s at the worst; this sits above the
+# worst with margin. It bounds only the answered case -- an open prompt keeps its
+# key for the full `PERMISSION_NOTIFICATION_MIRROR_SECONDS`.
+PERMISSION_MIRROR_IN_FLIGHT_SECONDS = 15.0
+
+
+@dataclass(frozen=True)
+class PermissionRequestMark:
+    """One prompt this session raised, and when it was answered if it was.
+
+    ``answered_at`` is not the same as forgetting the key: a mirror already in
+    flight when the prompt was answered is still that prompt's mirror, and must
+    still be dropped rather than raised on the parent.
+    """
+
+    requested_at: datetime
+    answered_at: datetime | None = None
 
 
 def track_permission_request_keys(
     record: HookEvent,
-    permission_request_keys_by_session: dict[str, dict[str, datetime]],
+    permission_request_keys_by_session: dict[str, dict[str, PermissionRequestMark]],
 ) -> None:
     """Remember every key that raised a prompt in each session, recently.
 
@@ -1605,22 +1624,80 @@ def track_permission_request_keys(
     call of its own raises two prompts a second apart, and remembering one would
     lose the child's before its mirror arrives seconds later.
 
-    Each write drops every entry older than
+    Answers are recorded rather than removed. A key that is deleted the moment its
+    prompt is answered stops covering the mirror already in flight -- measured at
+    6 s after the request at the median and 12 s at the worst -- and that mirror
+    then lands on the parent as an alert with no open prompt behind it. Marking it
+    instead lets ``notification_mirrors_another_agents_permission`` keep honouring
+    the key for the in-flight window and stop honouring it after, which is what
+    frees the parent's own prompt to alert.
+
+    Each new request drops every entry older than
     ``PERMISSION_NOTIFICATION_MIRROR_SECONDS``, in every session rather than only
-    the one raising this prompt. That is what bounds the map: no mirror can pair
+    the one raising this prompt; marking an answer expires nothing. That is what bounds the map: no mirror can pair
     with an expired entry, so the map holds the sessions asking right now and not
     the sessions a days-long process has ever seen.
     """
-    if record.event_name != "PermissionRequest" or not record.session_id:
+    if not record.session_id:
         return
     session_key = permission_scope_key(record)
-    permission_request_keys_by_session.setdefault(session_key, {})[
-        record.status_key
-    ] = record.logged_at
 
+    if record.event_name == "PermissionRequest":
+        permission_request_keys_by_session.setdefault(session_key, {})[
+            record.status_key
+        ] = PermissionRequestMark(requested_at=record.logged_at)
+        _expire_permission_request_keys(
+            permission_request_keys_by_session, record.logged_at
+        )
+        return
+
+    if record.event_name in {"PostToolUse", "PostToolUseFailure", "PermissionDenied"}:
+        _mark_permission_request_answered(
+            permission_request_keys_by_session, session_key, record
+        )
+        return
+
+    if record.event_name in SESSION_TURN_END_EVENTS:
+        # Scoped like the matching branch in `track_pending_permissions`: a turn
+        # ending cancels every prompt in the session, children included, and no
+        # turn-end event carries an `agent_id` to reach a child by key.
+        for request_key in permission_request_keys_by_session.get(session_key, {}):
+            _mark_permission_request_answered(
+                permission_request_keys_by_session, session_key, record, request_key
+            )
+        return
+
+    if record.event_name == "SubagentStop":
+        _mark_permission_request_answered(
+            permission_request_keys_by_session, session_key, record
+        )
+
+
+def _mark_permission_request_answered(
+    permission_request_keys_by_session: dict[str, dict[str, PermissionRequestMark]],
+    session_key: str,
+    record: HookEvent,
+    request_key: str | None = None,
+) -> None:
+    keys = permission_request_keys_by_session.get(session_key)
+    if not keys:
+        return
+    key = request_key if request_key is not None else record.status_key
+    mark = keys.get(key)
+    if mark is None or mark.answered_at is not None:
+        return
+    keys[key] = PermissionRequestMark(
+        requested_at=mark.requested_at, answered_at=record.logged_at
+    )
+
+
+def _expire_permission_request_keys(
+    permission_request_keys_by_session: dict[str, dict[str, PermissionRequestMark]],
+    now: datetime,
+) -> None:
     for key, keys in list(permission_request_keys_by_session.items()):
-        for request_key, requested_at in list(keys.items()):
-            age = (record.logged_at - requested_at).total_seconds()
+        for request_key, mark in list(keys.items()):
+            age = (now - mark.requested_at).total_seconds()
             if age > PERMISSION_NOTIFICATION_MIRROR_SECONDS:
                 del keys[request_key]
         if not keys:
@@ -1630,7 +1707,7 @@ def track_permission_request_keys(
 def notification_mirrors_another_agents_permission(
     record: HookEvent,
     mode: AgentMode | None,
-    permission_request_keys_by_session: dict[str, dict[str, datetime]],
+    permission_request_keys_by_session: dict[str, dict[str, PermissionRequestMark]],
 ) -> bool:
     """Whether this ``Notification`` is a permission prompt belonging to a child.
 
@@ -1646,10 +1723,10 @@ def notification_mirrors_another_agents_permission(
     Dropping the mirror loses nothing the display needs: the child's own
     ``PermissionRequest`` already carries the alert, ``multiagent_statuses``
     lends it to the parent's slot, and its pending-signature lifecycle expires it
-    on the right event. Only a mirror is dropped whose session had a request under
-    some *other* key inside the mirror window -- so a prompt raised while no child
-    has one open, or a prompt whose ``PermissionRequest`` hook never fired, still
-    alerts.
+    on the right event. Only a mirror is dropped whose session has a request under
+    some *other* key that can still account for it (``_mark_covers_mirror``) -- so
+    a prompt raised while no child has one open, or a prompt whose
+    ``PermissionRequest`` hook never fired, still alerts.
 
     ``mode`` is the caller's ``status.mode``, already computed. It is a parameter
     rather than a second ``mode_for_event`` call so a change to that function's
@@ -1660,7 +1737,8 @@ def notification_mirrors_another_agents_permission(
     prompt: one ``prompt_id`` covered 36 requests with 31 distinct commands in the
     retained logs, so pairing on it would fold a turn's prompts into one. Measured
     mirror lag was 6 seconds at the median and 12 at the worst over 272 pairs,
-    against this function's 60 second bound.
+    against a bound of ``PERMISSION_MIRROR_IN_FLIGHT_SECONDS`` once the prompt is
+    answered and ``PERMISSION_NOTIFICATION_MIRROR_SECONDS`` while it is open.
     """
     if record.event_name != "Notification" or not record.session_id:
         return False
@@ -1673,11 +1751,26 @@ def notification_mirrors_another_agents_permission(
     tracked = permission_request_keys_by_session.get(session_key, {})
     return any(
         request_key != session_key
-        and 0.0
-        <= (record.logged_at - requested_at).total_seconds()
-        <= PERMISSION_NOTIFICATION_MIRROR_SECONDS
-        for request_key, requested_at in tracked.items()
+        and _mark_covers_mirror(mark, record.logged_at)
+        for request_key, mark in tracked.items()
     )
+
+
+def _mark_covers_mirror(mark: PermissionRequestMark, logged_at: datetime) -> bool:
+    """Whether this request can still account for a mirror arriving now.
+
+    An open prompt covers the whole ``PERMISSION_NOTIFICATION_MIRROR_SECONDS``
+    window. An answered one covers only the in-flight window, because past that
+    the next session-keyed ``Notification`` is a new prompt rather than a late
+    copy of the answered one -- which is the parent's own prompt that this path
+    exists to let through.
+    """
+    age = (logged_at - mark.requested_at).total_seconds()
+    if age < 0.0 or age > PERMISSION_NOTIFICATION_MIRROR_SECONDS:
+        return False
+    if mark.answered_at is None:
+        return True
+    return age <= PERMISSION_MIRROR_IN_FLIGHT_SECONDS
 
 
 def should_ignore_status_transition(

@@ -7747,6 +7747,232 @@ class AgentMonitorTests(unittest.TestCase):
             )
         )
 
+    def _mirror_fixture(self, now: datetime, session_id: str):
+        def event(offset: float, payload: dict[str, object]):
+            record = parse_log_line(
+                "claude",
+                json.dumps(
+                    {
+                        "logged_at": (now + timedelta(seconds=offset)).isoformat(),
+                        "session_id": session_id,
+                        "cwd": "/tmp/project",
+                        **payload,
+                    }
+                ),
+            )
+            self.assertIsNotNone(record)
+            return record
+
+        return event
+
+    def test_an_answered_child_prompt_stops_masking_the_parents_own_prompt(self) -> None:
+        """A request key must stop counting once its prompt is answered.
+
+        Nothing removed a key from ``permission_request_keys_by_session`` except
+        the 60 s age test, so for a full minute after any Task child's prompt was
+        answered every session-keyed ``Notification`` read as that child's mirror
+        and was dropped. That is exactly the case the mirror path exists to catch
+        -- a parent prompt whose ``PermissionRequest`` hook never fired -- so the
+        blocked session stayed invisible until the user noticed the terminal.
+        """
+        now = datetime.now(timezone.utc)
+        event = self._mirror_fixture(now, "claude-answered-child")
+        child_request = event(
+            0,
+            {
+                "hook_event_name": "PermissionRequest",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest -q"},
+                "agent_id": "a94aab97f06a0367c",
+            },
+        )
+        child_answer = event(
+            5,
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest -q"},
+                "tool_response": {"stdout": "ok"},
+                "agent_id": "a94aab97f06a0367c",
+            },
+        )
+        parent_prompt = event(
+            20,
+            {
+                "hook_event_name": "Notification",
+                "message": "Claude needs your permission",
+                "notification_type": "permission_prompt",
+            },
+        )
+
+        keys: dict[str, dict[str, object]] = {}
+        collector_module.track_permission_request_keys(child_request, keys)
+        collector_module.track_permission_request_keys(child_answer, keys)
+
+        self.assertFalse(
+            collector_module.notification_mirrors_another_agents_permission(
+                parent_prompt, AgentMode.WAITING_FOR_INPUT, keys
+            ),
+            "an answered child prompt must not suppress the parent's alert",
+        )
+
+    def test_a_mirror_already_in_flight_survives_its_prompt_being_answered(self) -> None:
+        """Answering fast must not turn the child's own mirror into a parent alert.
+
+        The measured mirror lag is 6 s at the median and 12 s at the worst, so a
+        prompt answered inside that window still has its ``Notification`` on the
+        way. Dropping the request key the instant the prompt is answered would
+        let that mirror land on the parent as ``WAITING_FOR_INPUT`` with no open
+        prompt behind it -- the stuck-on-Ask state this path removes.
+        """
+        now = datetime.now(timezone.utc)
+        event = self._mirror_fixture(now, "claude-fast-answer")
+        child_request = event(
+            0,
+            {
+                "hook_event_name": "PermissionRequest",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest -q"},
+                "agent_id": "a94aab97f06a0367c",
+            },
+        )
+        child_answer = event(
+            5,
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest -q"},
+                "tool_response": {"stdout": "ok"},
+                "agent_id": "a94aab97f06a0367c",
+            },
+        )
+        in_flight_mirror = event(
+            6,
+            {
+                "hook_event_name": "Notification",
+                "message": "Claude needs your permission",
+                "notification_type": "permission_prompt",
+            },
+        )
+
+        keys: dict[str, dict[str, object]] = {}
+        collector_module.track_permission_request_keys(child_request, keys)
+        collector_module.track_permission_request_keys(child_answer, keys)
+
+        self.assertTrue(
+            collector_module.notification_mirrors_another_agents_permission(
+                in_flight_mirror, AgentMode.WAITING_FOR_INPUT, keys
+            ),
+            "a mirror still in flight when its prompt was answered is still a mirror",
+        )
+
+    def test_every_way_a_child_prompt_ends_frees_the_parents_own_prompt(self) -> None:
+        """Each answering event, not only ``PostToolUse``, has to mark the key.
+
+        A prompt that is denied, whose call fails, whose turn ends, or whose
+        sub-agent stops is as finished as one whose call succeeds. Missing any of
+        them leaves the key open for the full mirror window, and the parent's own
+        prompt inside that window is dropped as the child's mirror.
+        """
+        child_id = "a94aab97f06a0367c"
+        child_tool = {"tool_name": "Bash", "tool_input": {"command": "pytest -q"}}
+        answers = {
+            "PostToolUseFailure": {
+                "hook_event_name": "PostToolUseFailure",
+                "agent_id": child_id,
+                "error": "exit 1",
+                **child_tool,
+            },
+            "PermissionDenied": {
+                "hook_event_name": "PermissionDenied",
+                "agent_id": child_id,
+                **child_tool,
+            },
+            "SubagentStop": {"hook_event_name": "SubagentStop", "agent_id": child_id},
+            "Stop": {"hook_event_name": "Stop"},
+            "UserPromptSubmit": {"hook_event_name": "UserPromptSubmit", "prompt": "next"},
+        }
+        now = datetime.now(timezone.utc)
+        for name, answer_payload in answers.items():
+            with self.subTest(answer=name):
+                event = self._mirror_fixture(now, f"claude-answer-{name}")
+                keys: dict[str, dict[str, object]] = {}
+                collector_module.track_permission_request_keys(
+                    event(
+                        0,
+                        {
+                            "hook_event_name": "PermissionRequest",
+                            "agent_id": child_id,
+                            **child_tool,
+                        },
+                    ),
+                    keys,
+                )
+                collector_module.track_permission_request_keys(
+                    event(5, answer_payload), keys
+                )
+                parent_prompt = event(
+                    20,
+                    {
+                        "hook_event_name": "Notification",
+                        "message": "Claude needs your permission",
+                        "notification_type": "permission_prompt",
+                    },
+                )
+
+                self.assertFalse(
+                    collector_module.notification_mirrors_another_agents_permission(
+                        parent_prompt, AgentMode.WAITING_FOR_INPUT, keys
+                    )
+                )
+
+    def test_the_live_monitor_shows_a_parent_prompt_after_a_child_prompt_is_answered(
+        self,
+    ) -> None:
+        """The fix has to hold through ``ingest_record``, not only the helpers.
+
+        The callers only track keys for records that produce a status, so the
+        helper-level tests alone cannot show that the parent's session ends up on
+        ``WAITING_FOR_INPUT``.
+        """
+        now = datetime.now(timezone.utc)
+        session_id = "claude-live-answered-child"
+        event = self._mirror_fixture(now, session_id)
+        child_id = "a94aab97f06a0367c"
+        child_tool = {"tool_name": "Bash", "tool_input": {"command": "pytest -q"}}
+        records = [
+            event(
+                0,
+                {"hook_event_name": "PermissionRequest", "agent_id": child_id, **child_tool},
+            ),
+            event(
+                5,
+                {
+                    "hook_event_name": "PostToolUse",
+                    "agent_id": child_id,
+                    "tool_response": {"stdout": "ok"},
+                    **child_tool,
+                },
+            ),
+            event(
+                20,
+                {
+                    "hook_event_name": "Notification",
+                    "message": "Claude needs your permission",
+                    "notification_type": "permission_prompt",
+                },
+            ),
+        ]
+
+        monitor = LiveAgentMonitor(stale_after_seconds=3600)
+        for record in records:
+            monitor.ingest_record(record)
+
+        self.assertEqual(
+            AgentMode.WAITING_FOR_INPUT,
+            monitor.statuses_by_key[f"claude:session:{session_id}"].mode,
+        )
+
     def test_an_ended_session_reaches_the_aggregate_but_not_the_strip(self) -> None:
         """One exit, two answers, on purpose.
 
