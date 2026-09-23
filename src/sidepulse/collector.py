@@ -274,7 +274,9 @@ class AgentMonitor:
                 )
                 continue
 
-            parts.append((source.provider, str(source.path), file_signature(source.path)))
+            parts.append(
+                (source.provider, str(source.path), self._log_source_signature(source.path))
+            )
         return tuple(parts)
 
     def _transcript_source_signature(

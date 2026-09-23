@@ -361,6 +361,10 @@ class AgentMonitorTests(unittest.TestCase):
             )
             self.assertEqual(snapshot.aggregate.mode, AgentMode.WAITING_FOR_INPUT)
 
+            codex.with_name(codex.name + ".1").unlink()
+
+            self.assertEqual((), monitor.snapshot().statuses)
+
     def test_reading_a_rotated_log_stops_once_the_line_budget_is_met(self) -> None:
         """The top-up stops as soon as the line budget is met.
 
