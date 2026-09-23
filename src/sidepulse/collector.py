@@ -1344,7 +1344,7 @@ def multiagent_statuses(snapshot) -> tuple[AgentStatus, ...]:
     now = snapshot.collected_at
     statuses.extend(
         status
-        for status in getattr(snapshot, "stale_statuses", ())
+        for status in snapshot.stale_statuses
         if status.mode == AgentMode.COMPLETED
         and status.age_seconds(now) <= COMPLETED_VISIBLE_SECONDS
     )
