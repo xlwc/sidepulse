@@ -2313,7 +2313,7 @@ class AgentMonitorTests(unittest.TestCase):
                     synced.append((tuple(passed), now))
                     or led_status_module.MultiAgentLedWrite(
                         target=device.target,
-                        program="brightness 128\n0:#3D0000",
+                        program="brightness 128\n0:#B00000",
                         changed=True,
                         slots=(BAND_ALERT.slot(FLASH_SECONDS),),
                     )
@@ -5717,9 +5717,9 @@ class AgentMonitorTests(unittest.TestCase):
             program.splitlines(),
             [
                 "brightness 128",
-                "0:#3D0000 1:#3D0000 2:#0000A0 3:#1E3D00 "
-                "4:#1E3D00 5:#000000 6:#000000 7:#000000",
-                "0:#FF1000 900ms pulse; 3:#408000 900ms pulse",
+                "0:#B00000 1:#B00000 2:#0000E6 3:#58B000 "
+                "4:#58B000 5:#000000 6:#000000 7:#000000",
+                "0:#FF1000 900ms pulse; 3:#80FF00 900ms pulse",
                 "repeat 328",
             ],
         )
@@ -5734,7 +5734,7 @@ class AgentMonitorTests(unittest.TestCase):
             program.splitlines(),
             [
                 "brightness 128",
-                "0:#3D0000 1:#000000 2:#000000 3:#000000 "
+                "0:#B00000 1:#000000 2:#000000 3:#000000 "
                 "4:#000000 5:#000000 6:#000000 7:#000000",
             ],
         )
@@ -5823,7 +5823,7 @@ class AgentMonitorTests(unittest.TestCase):
             program.splitlines(),
             [
                 "brightness 128",
-                "0:#3D0000 1:#0000A0",
+                "0:#B00000 1:#0000E6",
                 "0:#FF1000 900ms pulse",
                 "repeat 328",
             ],
@@ -5897,8 +5897,8 @@ class AgentMonitorTests(unittest.TestCase):
     def test_multiagent_flash_pulses_up_from_the_settled_colour(self) -> None:
         """The blink must never go below the baseline, and must end on it.
 
-        Measured against sdled.wasm: a flashing alert slot rises from 61 to 254
-        and returns to 61, while a working slot absent from the flash line holds
+        Measured against sdled.wasm: a flashing alert slot rises from 176 to 254
+        and returns to 176, while a working slot absent from the flash line holds
         every sample. The old pulse-to-black shape would put the minimum at 0 and
         leave the post-repeat hold on the bright colour.
         """

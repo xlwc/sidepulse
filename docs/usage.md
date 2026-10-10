@@ -15,9 +15,9 @@ This file is the operational half: how to turn it on, and what will surprise you
 
 | Band | Settled | Flashes up to | Means | Modes |
 |---|---|---|---|---|
-| Red | `#3D0000` | `#FF1000` | that session wants something from you | `BLOCKED_ERROR`, `WAITING_FOR_INPUT` |
-| Blue | `#0000A0` | — never flashes | working | `TOOL_RUNNING`, `WORKING`, `LONG_TASK_PROGRESS` |
-| Chartreuse | `#1E3D00` | `#408000` | finished, output unread | `COMPLETED`, `IDLE_READY` |
+| Red | `#B00000` | `#FF1000` | that session wants something from you | `BLOCKED_ERROR`, `WAITING_FOR_INPUT` |
+| Blue | `#0000E6` | — never flashes | working | `TOOL_RUNNING`, `WORKING`, `LONG_TASK_PROGRESS` |
+| Chartreuse | `#58B000` | `#80FF00` | finished, output unread | `COMPLETED`, `IDLE_READY` |
 | Off | `#000000` | — | empty slot | — |
 
 Red and chartreuse **blink for the first five minutes** after a session enters the
@@ -36,9 +36,9 @@ cache-warmth story: it is running, and it will still be running in six minutes.
 The cost is that a session working for an hour looks identical to one that started
 two seconds ago. Working is the boring state.
 
-The urgency axis is intensity: red peaks at full and chartreuse at half, and
-after five minutes both settle *below* a working slot's steady 63% — so once
-things are quiet, hue is what tells them apart, not brightness.
+Red and chartreuse both peak at full, and after five minutes both settle
+*below* a working slot's steady 90% — so once things are quiet, hue is what
+tells them apart, not brightness.
 
 Intensity lives in those hex values, not in the `brightness` directive, which is
 program-global and so cannot vary per slot. The directive carries your brightness
@@ -47,7 +47,7 @@ slider on top, as a master gain over all three bands.
 The hex values were chosen by eye on a mounted device, one band at a time, which
 is why the tiers are uneven and the secondary channels look arbitrary. Numeric
 intensity is not perceived intensity: blue carries no green at all and is turned
-up to 63% to hold its own beside red, and the finished band is chartreuse rather
+up to 90% to hold its own beside red, and the finished band is chartreuse rather
 than green. The code has them in one place, the
 `BAND_ALERT` / `BAND_WORKING` / `BAND_DONE` table in `led_slots.py`; this file
 restates them in the table above, in the worked example further down and in two
@@ -163,20 +163,18 @@ your `PATH`.
 ### Turning the slider down can hide the settled colours
 
 Per-device brightness works in this mode: the slider emits `brightness N`, which
-scales all three bands together. Red and chartreuse settle at the dim end of
-their band and blue holds 63%, so at a low slider setting the settled colours
-can quantize to nearly nothing — at 25%, `#3D0000` is an effective red of about
-15/255.
+scales all three bands together. Red and chartreuse settle at 69% and blue
+holds 90%, so at a low slider setting the settled colours get faint — at 25%,
+`#B00000` is an effective red of about 44/255.
 
 That is accepted rather than floored. Dimming the strip to almost nothing is a
 reasonable thing to want from a brightness slider, and a floor would surprise
 whoever asked for it. If settled slots are too faint for you, raise the slider or
 raise the `SlotBand.steady` values in `led_slots.py`.
 
-If you used this mode before the bands landed, expect the strip to look darker.
-That is mostly the bands, not your slider: a settled alert slot is now an
-effective red of 61/255 where the old flat amber ran at 128, and it is meant to
-be. The slider is a second, independent change — it was hidden in this mode and
+If you used this mode before the bands landed, expect the strip to look
+different. A settled alert slot is now an effective red of 176/255 where the old
+flat amber ran at 128. The slider is a second, independent change — it was hidden in this mode and
 ignored by the renderer, so whatever it was left at (255 unless you moved it
 while the device was on another display kind) now applies for the first time.
 The submenu shows the current percentage above the slider, so check it before
@@ -369,7 +367,7 @@ changed within the last five minutes. At default brightness there is no
 `brightness` directive at all; the intensity you see is the bands':
 
 ```text
-0:#3D0000 1:#000000 2:#000000 3:#0000A0 4:#3D0000 5:#000000 6:#000000 7:#3D0000
+0:#B00000 1:#000000 2:#000000 3:#0000E6 4:#B00000 5:#000000 6:#000000 7:#B00000
 0:#FF1000 900ms pulse; 4:#FF1000 900ms pulse; 7:#FF1000 900ms pulse
 repeat 328
 ```

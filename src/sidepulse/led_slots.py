@@ -85,9 +85,9 @@ class SlotBand:
 # blue with no green at all, so it cannot be confused with either other band, and
 # is turned up to compensate for blue contributing least to perceived brightness.
 # Done is chartreuse rather than green, and carries red deliberately.
-BAND_ALERT = SlotBand(steady="#3D0000", flash_peak="#FF1000")  # low 24% / high 100%
-BAND_WORKING = SlotBand(steady="#0000A0", flash_peak=None)  # 63%
-BAND_DONE = SlotBand(steady="#1E3D00", flash_peak="#408000")  # low 24% / medium 50%
+BAND_ALERT = SlotBand(steady="#B00000", flash_peak="#FF1000")  # low 69% / high 100%
+BAND_WORKING = SlotBand(steady="#0000E6", flash_peak=None)  # 90%
+BAND_DONE = SlotBand(steady="#58B000", flash_peak="#80FF00")  # low 69% / high 100%
 
 
 # Rank 1 is most important. Eviction runs off this: a newcomer takes the slot of
