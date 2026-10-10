@@ -2739,6 +2739,11 @@ class StatusBarController(NSObject):
             mode,
             battery_snapshot,
             self.active_led_display_kind(battery_snapshot),
+            slot_statuses=(
+                multiagent_statuses(self.last_snapshot)
+                if self.last_snapshot is not None
+                else ()
+            ),
         )
         if poll_again:
             self.poll_battery_once()

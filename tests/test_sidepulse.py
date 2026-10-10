@@ -2417,13 +2417,16 @@ class AgentMonitorTests(unittest.TestCase):
             last_battery_error=None,
             last_snapshot=SimpleNamespace(
                 aggregate=SimpleNamespace(mode=AgentMode.WORKING),
+                statuses=(),
+                stale_statuses=(),
+                collected_at=None,
             ),
             accept_battery_snapshot=lambda value: value,
             sync_keep_awake=lambda mode, value: calls.append(
                 ("awake", (mode, value))
             ),
             active_led_display_kind=lambda value: "battery",
-            sync_leds=lambda mode, value, display: calls.append(
+            sync_leds=lambda mode, value, display, slot_statuses=(): calls.append(
                 ("leds", (mode, value, display))
             ),
         )
@@ -2437,6 +2440,58 @@ class AgentMonitorTests(unittest.TestCase):
             calls[1],
             ("leds", (AgentMode.WORKING, snapshot, "battery")),
         )
+
+    def test_battery_poll_result_holds_the_multiagent_slots(self) -> None:
+        """The 30s battery poll must not blank a multiagent strip between refreshes.
+
+        `sync_leds` defaults `slot_statuses` to `()`, and `sync_leds_now` renders a
+        multiagent device from that tuple whatever display kind it was given, so
+        an omitted argument writes all-black until the next 15s refresh.
+        """
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+        status = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:a",
+            display_name="a",
+            mode=AgentMode.WORKING,
+            updated_at=base,
+            event_name="PreToolUse",
+            session_id="a",
+        )
+        battery = BatterySnapshot(percent=55, is_plugged=True, is_charging=True)
+        synced: list[tuple[object, ...]] = []
+        target = SimpleNamespace(
+            pending_battery_snapshot=battery,
+            pending_battery_error=None,
+            battery_poll_in_flight=True,
+            battery_poll_pending=False,
+            last_battery_error=None,
+            last_snapshot=MonitorSnapshot(
+                collected_at=base,
+                statuses=(status,),
+                stale_statuses=(),
+                sources=(),
+                aggregate=AggregateStatus(
+                    mode=AgentMode.WORKING, active_count=1, stale_count=0
+                ),
+            ),
+            accept_battery_snapshot=lambda value: value,
+            sync_keep_awake=lambda mode, value: None,
+            active_led_display_kind=lambda value: "multiagent",
+            sync_leds=lambda mode, value, kind, slot_statuses=(): synced.append(
+                (mode, kind, slot_statuses)
+            ),
+        )
+
+        status_bar.StatusBarController.handle_battery_snapshot(target)
+
+        self.assertEqual(len(synced), 1)
+        self.assertEqual(synced[0][2], (status,))
 
     def test_status_bar_syncs_agent_status_to_linked_phone_once(self) -> None:
         try:
