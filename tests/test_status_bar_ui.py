@@ -57,6 +57,7 @@ def tearDownModule():
 
 from AppKit import (  # noqa: E402
     NSApplication,
+    NSApplicationActivationPolicyAccessory,
     NSBitmapImageRep,
     NSControl,
     NSEvent,
@@ -189,6 +190,18 @@ class StatusBarTestCase(unittest.TestCase):
             raise unittest.SkipTest(f"AppKit unavailable in this session: {exc}")
         if cls.controller is None:
             raise unittest.SkipTest("StatusBarController could not be created")
+
+
+class DockPresenceTests(StatusBarTestCase):
+    def test_the_test_process_stays_out_of_the_dock(self):
+        """Homebrew's framework Python is an app bundle, so it defaults to a Dock icon.
+
+        tests/conftest.py makes the process an accessory app, as the real status
+        bar does on launch. Without it, every suite run bounces a Python icon.
+        """
+        self.assertEqual(
+            self.app.activationPolicy(), NSApplicationActivationPolicyAccessory
+        )
 
 
 class MenuBarVisibilityTests(StatusBarTestCase):
