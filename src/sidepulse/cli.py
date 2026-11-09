@@ -54,8 +54,9 @@ from .links import (
     listen_for_ios_registration,
     load_ios_links,
     new_pairing_channel,
-    normalize_apns_token,
+    normalize_phone_token,
     pairing_url,
+    remove_ios_link,
     render_terminal_qr,
     send_ios_program,
     store_ios_link,
@@ -142,6 +143,9 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
     )
     update.add_argument("--dry-run", action="store_true", help="Same as without it.")
     update.set_defaults(func=cmd_sidepulse_update)
+    from .firmware import add_firmware_parser
+
+    add_firmware_parser(subparsers)
     subparsers.add_parser(
         "agent-monitor",
         help="Install hooks and show live AI agent statuses.",
@@ -193,7 +197,7 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
 
     link = subparsers.add_parser(
         "link",
-        help="Link an iPhone or connect this computer to a remote SidePulse receiver.",
+        help="Link an iPhone or Android phone, or connect this computer to a remote SidePulse receiver.",
     )
     link.add_argument("relay_code", nargs="?", help="Relay code printed by the receiving Mac.")
     link.set_defaults(func=cmd_sidepulse_link)
@@ -212,6 +216,13 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
         ),
     )
     relay.set_defaults(func=cmd_sidepulse_relay)
+
+    unlink = subparsers.add_parser(
+        "unlink",
+        help="List linked phones or remove one by its displayed ID.",
+    )
+    unlink.add_argument("link_id", nargs="?", help="Exact linked phone ID to remove.")
+    unlink.set_defaults(func=cmd_sidepulse_unlink)
 
     service = subparsers.add_parser(
         "service",
@@ -494,7 +505,7 @@ def _cmd_sidepulse_delivery(
                 link,
                 program,
                 event_id=event_id,
-                title=title,
+                title="Update" if command == "push" and not has_notification else title,
                 message=message,
                 data=event_data,
             )
@@ -731,7 +742,7 @@ def cmd_sidepulse_link(args: argparse.Namespace) -> int:
             + ", ".join(f"{link.name} ({link.link_id})" for link in existing)
         )
         print()
-    print("Link your iPhone")
+    print("Link your iPhone or Android phone")
     print()
     print("Scan this QR code with your phone:")
     print()
@@ -768,13 +779,13 @@ def cmd_sidepulse_link(args: argparse.Namespace) -> int:
                     input_enabled = False
                     continue
                 try:
-                    token = normalize_apns_token(value)
+                    token = normalize_phone_token(value)
                 except LinkError as exc:
                     print(f"Invalid token: {exc}")
                     prompt_visible = False
                     continue
                 link = IOSLink(
-                    name="iPhone",
+                    name="Android phone" if token.startswith("fcm_") else "iPhone",
                     token=token,
                     server=server,
                     linked_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -801,6 +812,42 @@ def cmd_sidepulse_link(args: argparse.Namespace) -> int:
         "`sidepulse write` uses it when no local device is mounted; "
         "`sidepulse push` prefers it."
     )
+    return 0
+
+
+def cmd_sidepulse_unlink(args: argparse.Namespace) -> int:
+    links = load_ios_links()
+    if args.link_id is None:
+        if not links:
+            print("No linked phones.")
+            return 0
+        print("Linked phones:")
+        for link in links:
+            print(f"  {link.name} ({link.link_id})")
+        print("Remove one with `sidepulse unlink ID_FROM_LIST`.")
+        return 0
+
+    matches = [link for link in links if link.link_id.casefold() == args.link_id.casefold()]
+    if not matches:
+        print(f"sidepulse unlink: No linked phone has ID {args.link_id!r}.", file=sys.stderr)
+        return 1
+    if len(matches) != 1:
+        print(
+            f"sidepulse unlink: ID {args.link_id!r} matches multiple links. "
+            "Remove the intended entry from links.json by its full token.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        removed = remove_ios_link(matches[0].token)
+    except OSError as exc:
+        print(f"sidepulse unlink: Could not save the linked phones: {exc}", file=sys.stderr)
+        return 1
+    if removed is None:
+        print("sidepulse unlink: The linked phone has already been removed.", file=sys.stderr)
+        return 1
+    print(f"Unlinked {removed.name} ({removed.link_id}).")
     return 0
 
 
@@ -1489,6 +1536,8 @@ def print_install_results(results, *, dry_run: bool) -> None:
         print(f"  log: {result.log_path}")
         if result.backup_path:
             print(f"  backup: {result.backup_path}")
+        if result.provider == "codex" and result.changed and not dry_run:
+            print("  Restart Codex to activate these hooks in new sessions.")
 
 
 def cmd_uninstall(args: argparse.Namespace) -> int:

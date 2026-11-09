@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from .providers import default_state_dir
 
 
 SERVICE_LABEL = "io.sidepulse.service"
+SERVICE_DISPLAY_NAME = "SidePulse Background Service"
 
 
 @dataclass(frozen=True)
@@ -23,7 +25,20 @@ class ServiceInstallResult:
 
 
 def service_command() -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "service", "run"]
     return [sys.executable, "-m", "sidepulse", "service", "run"]
+
+
+def service_launcher_path() -> Path:
+    data_home = os.environ.get("XDG_DATA_HOME")
+    base = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
+    return base / "sidepulse" / "service" / SERVICE_DISPLAY_NAME
+
+
+def build_service_launcher_script() -> str:
+    command = " ".join(shlex.quote(part) for part in service_command())
+    return f"#!/bin/sh\nexport PYTHONUNBUFFERED=1\nexec {command}\n"
 
 
 def install_service(*, start: bool = True, dry_run: bool = False) -> ServiceInstallResult:
@@ -37,9 +52,13 @@ def install_service(*, start: bool = True, dry_run: bool = False) -> ServiceInst
 def install_launch_agent(*, start: bool, dry_run: bool) -> ServiceInstallResult:
     path = Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}.plist"
     state = default_state_dir()
+    launcher = service_launcher_path()
+    launcher_data = build_service_launcher_script().encode()
     payload = {
         "Label": SERVICE_LABEL,
-        "ProgramArguments": service_command(),
+        # macOS names unbundled background items after the registered program.
+        # Register our launcher rather than the shared Python interpreter.
+        "ProgramArguments": [str(launcher)],
         "RunAtLoad": True,
         "KeepAlive": True,
         "StandardOutPath": str(state / "service.out.log"),
@@ -54,12 +73,18 @@ def install_launch_agent(*, start: bool, dry_run: bool) -> ServiceInstallResult:
     }
     data = plistlib.dumps(payload, sort_keys=False)
     existing = path.read_bytes() if path.exists() else None
-    changed = existing != data
+    existing_launcher = launcher.read_bytes() if launcher.exists() else None
+    launcher_changed = existing_launcher != launcher_data or not os.access(launcher, os.X_OK)
+    changed = existing != data or launcher_changed
     if dry_run:
         return ServiceInstallResult(path, changed, False, "dry run")
     path.parent.mkdir(parents=True, exist_ok=True)
     state.mkdir(parents=True, exist_ok=True)
-    if changed:
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    if launcher_changed:
+        launcher.write_bytes(launcher_data)
+        launcher.chmod(0o755)
+    if existing != data:
         path.write_bytes(data)
     started = False
     if start:

@@ -3,17 +3,58 @@ set -eu
 
 PYTHON_BIN=${PYTHON_BIN:-python3}
 INSTALL_SPEC=${SIDEPULSE_INSTALL_SPEC:-"git+https://github.com/inteliwear/sidepulse.git"}
-VENV=${SIDEPULSE_INSTALL_ROOT:-"$HOME/.local/share/sidepulse"}/venv
+INSTALL_ROOT=${SIDEPULSE_INSTALL_ROOT:-"$HOME/.local/share/sidepulse"}
+VENV=$INSTALL_ROOT/venv
 BIN_DIR=${SIDEPULSE_BIN_DIR:-"$HOME/.local/bin"}
 
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-    printf 'SidePulse requires Python 3.10 or newer. Could not find %s.\n' "$PYTHON_BIN" >&2
-    exit 1
-fi
+usable_python() {
+    command -v "$1" >/dev/null 2>&1 &&
+        "$1" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1
+}
 
-if ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
-    printf 'SidePulse requires Python 3.10 or newer.\n' >&2
-    exit 1
+install_macos_python() (
+    # Keep uv and its Python private to SidePulse. The unmanaged installer does
+    # not edit shell profiles, and --no-bin avoids global Python symlinks.
+    uv_bin=$INSTALL_ROOT/uv/uv
+    if [ ! -x "$uv_bin" ]; then
+        bootstrap_dir=$(mktemp -d "${TMPDIR:-/tmp}/sidepulse-python.XXXXXX")
+        trap 'rm -rf "$bootstrap_dir"' EXIT
+        curl -fsSL https://astral.sh/uv/install.sh -o "$bootstrap_dir/install-uv.sh" || exit 1
+        UV_UNMANAGED_INSTALL="$INSTALL_ROOT/uv" sh "$bootstrap_dir/install-uv.sh" >&2 || exit 1
+    fi
+    printf 'Installing Python 3.13 for SidePulse…\n' >&2
+    UV_PYTHON_INSTALL_DIR="$INSTALL_ROOT/python" "$uv_bin" python install \
+        --no-config --no-bin 3.13 >&2 || exit 1
+    UV_PYTHON_INSTALL_DIR="$INSTALL_ROOT/python" "$uv_bin" python find \
+        --no-config --no-project --managed-python 3.13
+)
+
+# Updates use the existing interpreter even if the shell's python3 is older.
+if [ -x "$VENV/bin/python" ]; then
+    if ! usable_python "$VENV/bin/python"; then
+        printf 'The existing SidePulse environment needs Python 3.10 or newer: %s\n' "$VENV" >&2
+        exit 1
+    fi
+    PYTHON_BIN=$VENV/bin/python
+elif ! usable_python "$PYTHON_BIN"; then
+    found_python=
+    for candidate in python3 python3.14 python3.13 python3.12 python3.11 python3.10; do
+        if usable_python "$candidate"; then
+            found_python=$(command -v "$candidate")
+            break
+        fi
+    done
+    if [ -n "$found_python" ]; then
+        PYTHON_BIN=$found_python
+    elif [ "$(uname -s)" = "Darwin" ]; then
+        if ! PYTHON_BIN=$(install_macos_python) || ! usable_python "$PYTHON_BIN"; then
+            printf 'Could not install Python for SidePulse. Check your internet connection and try again.\n' >&2
+            exit 1
+        fi
+    else
+        printf 'SidePulse requires Python 3.10 or newer. Install it and run setup again.\n' >&2
+        exit 1
+    fi
 fi
 
 # Reuse a working environment on updates; recreating it can change the Python

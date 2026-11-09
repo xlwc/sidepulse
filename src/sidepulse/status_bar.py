@@ -1801,7 +1801,10 @@ class StatusBarController(NSObject):
         action = "installed" if install else "removed"
         if not result.changed:
             action = "already installed" if install else "already removed"
-        self.set_settings_message(f"{provider.title()} hooks {action}.")
+        message = f"{provider.title()} hooks {action}."
+        if provider == "codex" and install and result.changed:
+            message += " Restart Codex to activate them in new sessions."
+        self.set_settings_message(message)
         self.reload_monitor()
         self.refresh_settings_window()
         self.refresh_(None)
@@ -2148,7 +2151,7 @@ class StatusBarController(NSObject):
             None,
         )
         if link is None:
-            self.set_settings_message("That iPhone is no longer linked.")
+            self.set_settings_message("That phone is no longer linked.")
             self.refresh_(None)
             return
         if not confirm_linked_phone_removal(link.name):
@@ -2158,7 +2161,7 @@ class StatusBarController(NSObject):
         try:
             removed = remove_ios_link(link.token)
             if removed is None:
-                self.set_settings_message("That iPhone is no longer linked.")
+                self.set_settings_message("That phone is no longer linked.")
             else:
                 self.settings = self.settings.without_device(device_id)
                 save_settings(self.settings)
@@ -3599,7 +3602,7 @@ class StatusBarController(NSObject):
             status_path = self.keep_awake.poke_status_file(target)
             if status_path is not None:
                 read_any = True
-                log_status_bar(f"sd_keepalive touch={status_path}")
+                log_status_bar(f"sd_keepalive read={status_path}")
         if not read_any and self.keep_awake.last_status_error != self.last_status_read_error:
             self.last_status_read_error = self.keep_awake.last_status_error
             if self.last_status_read_error:
@@ -3843,11 +3846,11 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
 
     if device.remote_link is not None:
         submenu.addItem_(NSMenuItem.separatorItem())
-        submenu.addItem_(disabled_menu_item("Linked iPhone"))
+        submenu.addItem_(disabled_menu_item("Linked phone"))
         submenu.addItem_(disabled_menu_item(f"ID {device.remote_link.link_id}"))
         submenu.addItem_(disabled_menu_item(device.remote_link.server))
         remove_phone = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Remove iPhone...",
+            "Remove phone...",
             "removeLinkedPhone:",
             "",
         )
@@ -3986,7 +3989,7 @@ def confirm_linked_phone_removal(name: str) -> bool:
     alert = NSAlert.alloc().init()
     alert.setMessageText_(f"Remove {name}?")
     alert.setInformativeText_(
-        "This Mac will stop sending SidePulse updates to this iPhone. "
+        "This Mac will stop sending SidePulse updates to this phone. "
         "You can link it again later."
     )
     alert.addButtonWithTitle_("Remove")
@@ -6178,11 +6181,6 @@ def provider_icon_for_provider(provider: str):
     elif provider == "grok":
         image = app_icon("/Applications/Grok.app")
         image = image or grok_badge_icon()
-    elif provider == "opencode":
-        image = app_icon("/Applications/OpenCode.app")
-        image = image or image_for_symbol(
-            "chevron.left.forwardslash.chevron.right", "opencode"
-        )
     else:
         # Any other provider resolves its own app by name, so a new agent needs no branch
         # here. Only providers with an alias or a custom glyph need one.

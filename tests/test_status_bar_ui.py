@@ -472,9 +472,9 @@ class MenuBuildTests(StatusBarTestCase):
         self.assertIn("Agent Status", submenu_titles)
         self.assertIn("Manual", submenu_titles)
         self.assertNotIn("Battery Level", submenu_titles)
-        self.assertIn("Linked iPhone", submenu_titles)
+        self.assertIn("Linked phone", submenu_titles)
         self.assertIn("ID aaaaaaaaaaaa", submenu_titles)
-        self.assertIn("Remove iPhone...", submenu_titles)
+        self.assertIn("Remove phone...", submenu_titles)
         self.assertNotIn("Brightness 100%", submenu_titles)
 
     def test_remove_linked_iphone_requires_confirmation_and_deletes_link(self):
@@ -1115,6 +1115,16 @@ class IconTests(StatusBarTestCase):
                 ):
                     sb.provider_icon_for_provider(provider)
                 self.assertIn(bundle, looked_up)
+
+    def test_opencode_uses_generic_app_resolution(self):
+        """OpenCode may be registered outside the system Applications directory."""
+        expected = NSImage.alloc().initWithSize_((18, 18))
+        sb._provider_icon_cache.pop("opencode", None)
+        self.addCleanup(sb._provider_icon_cache.pop, "opencode", None)
+        with patch.object(sb, "provider_app_icon", return_value=expected) as resolve:
+            image = sb.provider_icon_for_provider("opencode")
+        resolve.assert_called_once_with("opencode")
+        self.assertIs(image, expected)
 
     def test_unmapped_provider_tries_its_own_app_before_the_glyph(self):
         """The terminal glyph always returns an image, so it hides a missing lookup.

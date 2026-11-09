@@ -123,6 +123,13 @@ class SetupUpdateTests(unittest.TestCase):
         result = subprocess.run([str(self.bin / 'sidepulse'), '--version'], env=self.env, capture_output=True, text=True)
         self.assertIn('old', result.stdout)
 
+    def test_update_reuses_venv_when_shell_python_is_unavailable(self):
+        self.assertEqual(self.install(self.old).returncode, 0)
+        self.log.write_text('')
+        result = self.install(self.new, PYTHON_BIN='missing-python')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(['new', ['--version']], self.calls())
+
     def test_setup_failure_resumes_previously_stopped_service(self):
         self.assertEqual(self.install(self.old).returncode, 0)
         self.log.write_text('')

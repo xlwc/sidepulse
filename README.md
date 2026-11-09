@@ -18,6 +18,9 @@ The device mounts as a disk drive. You can control the LEDs by writing to `LEDS.
 
 The LED control DSL is described in [`LEDS_FORMAT.md`](LEDS_FORMAT.md).
 
+Firmware downloads and release notes are available in
+[`firmware/README.md`](firmware/README.md).
+
 ## Installation
 
 Choose the level that fits how you want to use SidePulse.
@@ -28,15 +31,19 @@ Choose the level that fits how you want to use SidePulse.
 curl -fsSL https://sidepulse.io/setup.sh | bash
 ```
 
-The command works on macOS and Linux with Python 3.10 or newer. The
+The command works on macOS and Linux. It uses an existing Python 3.10 or newer
+when available. On macOS, if a suitable Python is missing, it automatically
+downloads Python 3.13 using uv into `~/.local/share/sidepulse`, without requiring
+Homebrew or administrator access. On Linux, install Python 3.10 or newer first. The
 [setup script](scripts/setup.sh) creates an isolated environment under
 `~/.local/share/sidepulse/venv`, installs SidePulse from GitHub, links the CLI
 at `~/.local/bin/sidepulse`, and runs `sidepulse setup`. On macOS, setup also
 installs the menu-bar app and hardware helpers. On Linux, it automatically
-uses CLI-only mode for mounted SidePulse devices and iPhone linking/push.
+uses CLI-only mode for mounted SidePulse devices and iPhone/Android linking and push.
 
 Setup also installs a headless SidePulse service. It runs through a LaunchAgent
-on macOS and a user systemd service on Linux. Setup restarts the service, so an
+named **SidePulse Background Service** in macOS background activity settings,
+and a user systemd service on Linux. Setup restarts the service, so an
 upgrade takes effect right away instead of leaving the previous build running.
 If a Linux session has no systemd user manager, setup still installs the unit
 and prints that it could not start; `sidepulse service run` remains available as
@@ -62,6 +69,44 @@ cd sidepulse
 python3 -m pip install -e .
 sidepulse setup
 ```
+
+### Firmware
+
+Show the firmware version of connected SidePulse devices:
+
+```sh
+sidepulse firmware version
+```
+
+Upgrade a connected device to the latest published firmware for its model:
+
+```sh
+sidepulse firmware upgrade
+sidepulse firmware upgrade --dry-run
+```
+
+The CLI downloads firmware from this repository on GitHub and verifies the ZIP
+and its contents before writing to the device. `--dry-run` downloads and checks
+the package without writing it. With multiple devices connected, select one
+using `--device /Volumes/SidePulse` or `--device /Volumes/PulseDot` (use the actual
+mount path on your computer).
+
+Choose a specific version or install a downloaded ZIP:
+
+```sh
+sidepulse firmware upgrade --version 1.1.0
+sidepulse firmware upgrade --file firmware/v1.1.0/sidepulse-pro-1.1.0-ota.zip
+```
+
+Use the ZIP for your model from the [firmware downloads](firmware/README.md).
+Local ZIPs work offline. The CLI rejects packages for the wrong model and older
+versions, and skips a version that is already installed. Copy-based upgrades
+require a writable device drive.
+
+After the transfer, leave the device connected for at least 10 seconds, then
+reconnect it and run `sidepulse firmware version` to confirm the installed
+version. Reconnecting avoids a cached status file. Use `sidepulse firmware
+version --json` for machine-readable output.
 
 ### Updating
 
@@ -132,16 +177,112 @@ sidepulse write "off" --device /media/$USER/SidePulseDot
 The writer decodes simple escapes such as `\n`, then enforces the controller's
 512-byte and 20-line limits before writing the LED control file.
 
-### Link an iPhone
+Mounted drives restricted to **read-only storage**, including by an MDM policy,
+automatically use an alternate LED transport on **firmware 1.1 or newer**:
+SidePulse Pro uses READ2ME through SD reads of `setup.html` (macOS), and
+SidePulse Dot uses direct SPC2 USB control (macOS and Linux). This applies to
+the CLI, menu bar, battery display, and background service without extra flags.
+Dot's USB library is included with the app and installed as a Python dependency.
+
+The app tries a normal file write first and falls back only when opening
+`LEDS.LED` is denied as read-only or by permissions. A failure after writing
+begins is never replayed through another transport. The firmware version is
+checked in `STATUS.TXT`; older or unrecognized firmware produces an error.
+Upgrade older firmware using a computer that permits storage writes.
+
+Alternate transports require a valid device acknowledgement before reporting
+success. Dot is matched to the selected mount's USB connection, including when
+multiple devices are attached. USB access can still be blocked by management
+policy, and Pro's SD reader must support uncached reads; these failures are
+reported without changing mount permissions. The fallback controls live LEDs;
+it does not install firmware or change startup programs. Pro file contents may
+appear stale until remount; Dot USB commands do not modify `LEDS.LED`.
+
+For an **unmounted macOS device**, the standalone standard-library utility can
+write the existing `LEDS.LED` directly through `/dev/diskN` or `/dev/rdiskN`:
+
+```sh
+# Replace disk4 with the SidePulse device. Unmount first if already mounted.
+diskutil unmountDisk /dev/disk4
+sudo python3 scripts/write_led_raw.py /dev/rdisk4 'off\n#ff00ff 1s pulse\nrepeat'
+sudo python3 scripts/write_led_raw.py /dev/disk4 - < animation.LED
+```
+
+It requires a whole drive of **at most 300,000 bytes**, verified using device
+capacity queries on the open disk before writing. Partitions, unknown capacity,
+mounted volumes, and larger drives are rejected, with no override. The filesystem
+must be FAT12 starting at sector zero, with one FAT and 512-byte sectors. Programs
+are limited to 512 bytes and 20 lines. It writes the existing file's first data
+sector and updates its directory size, preserving its FAT allocation.
+
+### Link an iPhone or Android phone
+
+Both apps can scan the QR code from `sidepulse link`, or you can paste the
+complete push token shown by the app. Android tokens use
+`fcm_<registration-token>_<32-character-sender-key>`. Keep the entire token,
+including its case and underscores. Android delivery uses the production
+bridge's FCM route and data messages; the phone applies the program to its
+connected Dot through USB. Its app must have USB access.
+
+Existing iPhone links are preserved. Android links are stored alongside them
+with private file permissions. Re-pairing the same registration replaces its
+sender key; Android link IDs stay stable when the sender key changes.
+`sidepulse push`, `sidepulse write`, `--to`, and `--all` support both platforms.
+For example:
+
+```sh
+sidepulse push "off\n#00ff00 pulse" --to "Pixel 10 Pro XL" --title "Build complete"
+```
 
 Run one command and either scan the terminal QR code with the SidePulse iOS app
-or paste the 64-character push token shown by the app:
+or paste the push token shown by the app. Production tokens have 64 hexadecimal
+characters; development tokens have the `dev_` prefix followed by 64 hexadecimal
+characters. The app appends `_<shared-key>` to identify this sender; keep that
+suffix and its exact letter case when pasting or saving the token. Keep the
+`dev_` prefix on development tokens. Removing the key in the iOS app stops this
+sender's pushes from being processed; pair again to receive a new key.
+
+Pairing issues the key in the iOS app. Saving a new token for the same device
+and APNs environment replaces its previous saved link. The CLI preserves the
+key's case and sends the entire token in the bridge URL; the updated bridge
+strips the suffix for Apple and adds it as top-level `shared_key` in both the
+push and recovery payloads. A request body cannot override that key.
+
+The app accepts only locally active keys. Missing, unknown, or removed keys
+produce no LED write, inbox entry, sender activity, or link-state change. Their
+notifications are suppressed in the foreground and dismissed when the app or
+**Update from Server** handles them. The update action finishes quietly when
+there is nothing authorized to update; with no active keys it skips fetching.
+Background alerts can appear before iOS lets the app run cleanup.
+
+Settings → **Active Push Keys** shows only the last four key characters, last
+accepted activity, and lifetime received count. The app deduplicates the latest
+256 event/message IDs per sender across push and recovery. Removing a key
+revokes it on the phone; removing a saved CLI link alone does not revoke the
+phone's key. Use matching updated versions of the bridge, iOS app, and CLI;
+older unkeyed senders must obtain a new token.
 
 ```sh
 sidepulse link
 ```
 
-Linked phones are stored locally. Remote LED-only writes are silent. Adding
+List saved phones and remove a stale link by its displayed ID:
+
+```sh
+sidepulse unlink
+sidepulse unlink ID_FROM_LIST
+sidepulse link
+```
+
+`unlink` requires an exact ID. This keeps phones with the same name separate.
+If two links have the same displayed ID, remove the intended entry by its full
+token from `~/.config/sidepulse/agent-monitor/links.json` (or the equivalent
+under `$XDG_CONFIG_HOME/sidepulse/agent-monitor/links.json`). Pair with the
+updated iOS build by scanning the QR code or pasting its current push token.
+Do not add or remove `dev_` by hand; the token determines the bridge route.
+
+Linked phones are stored locally. Remote LED-only `write` commands are silent;
+LED-only `push` commands use the notification title `Update`. Adding
 `--title` or `--message` produces one visible notification containing the same
 LED program and event metadata. Remote payloads also include the sending
 computer's name and available battery state. Set `SIDEPULSE_SERVER` to use
@@ -400,6 +541,11 @@ SidePulse Pro Eject Prevention keeps the built-in SD reader attached after
 macOS hibernate or lock-screen mount refusals. By default setup installs it
 system-wide when already running with system permissions, otherwise as a
 per-user LaunchAgent:
+
+The guard checks whether macOS restarted Disk Arbitration. If it did, the
+guard exits and launchd starts it again with a fresh disk session. KeepAlive
+must remain enabled for this recovery; an interactive guard run needs a manual
+restart after a Disk Arbitration restart.
 
 ```sh
 sidepulse setup --sd-eject-guard-scope auto
@@ -667,8 +813,8 @@ clamshell mode and SidePulse's no-external-display fallback, is documented in
 | When Agents Work | Keep the Mac awake while agents are Working / Tool Running / Progressing, plus the existing five-minute Ask / Done / Error grace period. |
 | Always | Keep the closed-lid sleep override active while the status-bar app is running. |
 
-The status-bar app still keeps the SidePulse Pro/SidePulse Dot volume active by touching
-a `keepalive` file on each connected device at least once per minute. The
+The status-bar app still keeps the SidePulse Pro/SidePulse Dot volume active by reading
+`STATUS.TXT` with the existing uncached, read-only macOS transport on each connected device at least once per minute. The
 closed-lid policy uses the SidePulse sleep helper when it is installed. The PKG
 installer sets this up automatically; source/dev installs can run the one-time
 setup command:
