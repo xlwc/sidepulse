@@ -21,7 +21,8 @@ This file is the operational half: how to turn it on, and what will surprise you
 | Off | `#000000` | — | empty slot | — |
 
 Red and chartreuse **blink for the first five minutes** after a session enters the
-band, pulsing up from the settled colour and back, then hold settled. Settled is
+band, pulsing from off up to the peak and back to off about once every 1.8 s,
+then hold settled. Settled is
 not "stale" — it is "this has been true for a while".
 
 Five minutes is the prompt cache TTL, and that is the whole point of the
@@ -367,40 +368,45 @@ changed within the last five minutes. At default brightness there is no
 `brightness` directive at all; the intensity you see is the bands':
 
 ```text
-0:#B00000 1:#000000 2:#000000 3:#0000E6 4:#B00000 5:#000000 6:#000000 7:#B00000
-0:#FF1000 900ms pulse; 4:#FF1000 900ms pulse; 7:#FF1000 900ms pulse
-repeat 328
+0:#000000 1:#000000 2:#000000 3:#0000E6 4:#000000 5:#000000 6:#000000 7:#000000
+0:#FF1000 1800ms pulse; 4:#FF1000 1800ms pulse; 7:#FF1000 1800ms pulse
+repeat 166
+0:#B00000 4:#B00000 7:#B00000
 ```
 
-Line 1 is every slot's baseline colour. Line 2 pulses only the recently-changed
-slots up to their band's peak and back; `pulse` returns to the line's start
-colour, so each cycle is a blink up from the baseline and unmentioned LEDs hold
-rock steady. Slot 3 is working and so never appears on line 2 at all, however
-recently it changed.
+Line 1 is every slot's baseline colour, with the recently-changed slots at off.
+Line 2 pulses only those slots up to their band's peak and back; `pulse` returns
+to the line's start colour, so each cycle is a blink from off to full and
+unmentioned LEDs hold rock steady. The off has to be on line 1 because `repeat`
+loops from line 1: a settled colour there would flicker on for one frame between
+every blink. The last line sets the flashing slots to their settled colour once
+`repeat` runs out. Slot 3 is working and so never appears on line 2 at all,
+however recently it changed.
 
 Turn the slider down and a `brightness N` line appears above line 1, scaling all
 three bands together.
 
-`repeat` is `ceil(longest_remaining_flash / 917ms)` — 917 ms being the measured
-blink cycle for a `900ms pulse`, not a value derived from the pulse duration, and
-confirmed against a physical strip as well as the firmware parser. It
+`repeat` is `ceil(longest_remaining_flash / 1817ms)` — 1817 ms being the
+measured blink cycle for an `1800ms pulse`, not a value derived from the pulse
+duration. It was measured against the firmware parser and has not yet been
+confirmed on a physical strip. It
 counts down as the flash window closes, which is why the write-dedupe key
 excludes it; keying on the program text would rewrite `LEDS.LED` every 15 s
 forever.
 
-Because the count is finite *and* line 1 is the baseline, a dead app leaves a
-device holding the settled appearance — not one blinking indefinitely, and not
-one frozen on the bright pre-settle colour either. On the MacBook built-in SD
+Because the count is finite *and* the line after `repeat` settles the flashing
+slots, a dead app leaves a device holding the settled appearance — not one
+blinking indefinitely, and not one frozen at the off point of a blink either. On the MacBook built-in SD
 reader that holds for about three minutes and then the strip goes dark, because a
 dead app also stops the once-a-minute `keepalive` touch and the reader powers the
-device off after three minutes of inactivity. Dark is still the point; frozen
-bright is what the pulse-up shape avoids. For the last slot to settle,
+device off after three minutes of inactivity. That dark is the reader's doing,
+not the program's. For the last slot to settle,
 that five-minute write is visually a no-op: the count has already run out and the
 device is holding the settled look before the host notices the boundary. For an
 earlier one it is not — `repeat` is sized to the longest remaining flash, so a
 slot that crosses its own five-minute mark keeps blinking until the next refresh
-drops it from line 2. Either way the write only ever touches line 2; line 1 does
-not move.
+drops it from line 2. Either way the settling slot lands on the colour the old
+program's last line would have given it.
 
 Two `LEDS.LED` parser constraints worth knowing if you edit the renderer, since
 `validate_led_text` checks only size and cannot catch either:

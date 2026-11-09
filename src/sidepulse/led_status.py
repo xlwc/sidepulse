@@ -326,23 +326,27 @@ def apply_brightness(program: str, brightness: int | float = 255) -> str:
 # --- multiagent slot rendering -------------------------------------------------
 #
 # The strip becomes N independent slots instead of one aggregate indicator. Line
-# 1 is every slot's *settled* colour; line 2 pulses only the recently-changed
-# slots up to their band's peak. `pulse` returns to the line's start colour, so
-# each cycle is a blink up from the baseline, and slots the flash line does not
-# mention hold rock steady. After the repeat count is exhausted the device holds
-# its final state -- which is the baseline, i.e. exactly the post-five-minute
-# appearance. That is why a dead app leaves the strip correct rather than frozen
-# on a state that has expired.
+# 1 is every slot's *settled* colour, except that recently-changed slots start
+# dark; line 2 pulses those up to their band's peak. `pulse` returns to the
+# line's start colour, so each cycle is a blink from off to full and back, and
+# slots the flash line does not mention hold rock steady. The trough has to live
+# on line 1 rather than on a line of its own: `repeat` loops from line 1, so a
+# settled colour there would show for one frame between every blink.
+#
+# The line after `repeat` sets the flashing slots to their settled colour once
+# the count is exhausted, which is exactly the post-five-minute appearance. That
+# is why a dead app leaves the strip correct rather than frozen dark.
 
 # Intensity lives in the band colours (see led_slots), so this directive is free
 # to carry the user's brightness slider as a master gain. 255 emits no directive
 # at all; anything lower scales every band together.
 SLOT_BRIGHTNESS = 255
-SLOT_FLASH_PULSE_MS = 900
-# Measured against resources/sdled.wasm, not derived from the pulse duration: a
-# `900ms pulse` blink completes every 917ms. Sampling `repeat 1|2|3` put the last
-# pixel movement at 912ms, 1829ms and 2746ms.
-SLOT_FLASH_CYCLE_MS = 917
+SLOT_FLASH_TROUGH = "#000000"
+SLOT_FLASH_PULSE_MS = 1800
+# Measured against resources/sdled.wasm, not derived from the pulse duration: an
+# `1800ms pulse` blink completes every 1817ms. Sampling `repeat 1|2|3` put the
+# settle after the last pulse at 1817ms, 3634ms and 5451ms.
+SLOT_FLASH_CYCLE_MS = 1817
 # `repeat 0` is rejected with bad-repeat and `repeat 65536` overflows, so the
 # count is clamped rather than merely computed.
 SLOT_MIN_REPEAT = 1
@@ -377,7 +381,8 @@ def program_for_slots(
 
     # Indexed segments need an explicit colour; `0:off` is rejected as bad-index.
     baseline = " ".join(
-        f"{index}:{slot.color}" for index, slot in enumerate(slots)
+        f"{index}:{SLOT_FLASH_TROUGH if slot.flashing else slot.color}"
+        for index, slot in enumerate(slots)
     )
     lines = [baseline]
 
@@ -390,6 +395,9 @@ def program_for_slots(
             )
         )
         lines.append(f"repeat {slot_repeat_count(slots)}")
+        lines.append(
+            " ".join(f"{index}:{slots[index].color}" for index in flashing)
+        )
 
     return apply_brightness("\n".join(lines), brightness)
 
