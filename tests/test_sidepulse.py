@@ -4740,7 +4740,7 @@ class AgentMonitorTests(unittest.TestCase):
             # working band has no peak, however freshly it changed.
             self.assertIn(BAND_ALERT.steady, output)
             self.assertIn(BAND_WORKING.steady, output)
-            self.assertIn(f"{BAND_ALERT.flash_peak} 1800ms pulse", output)
+            self.assertIn(f"{BAND_ALERT.flash_peak} 1980ms pulse", output)
 
     def test_sidepulse_sidepulse_command_shape(self) -> None:
         parser = build_parser(prog="sidepulse agent-monitor")
@@ -5723,8 +5723,8 @@ class AgentMonitorTests(unittest.TestCase):
                 "brightness 128",
                 "0:#000000 1:#B00000 2:#0000E6 3:#000000 "
                 "4:#58B000 5:#000000 6:#000000 7:#000000",
-                "0:#FF1000 1800ms pulse; 3:#80FF00 1800ms pulse",
-                "repeat 166",
+                "0:#FF1000 1980ms pulse; 3:#80FF00 1980ms pulse",
+                "repeat 151",
                 "0:#B00000 3:#58B000",
             ],
         )
@@ -5768,10 +5768,10 @@ class AgentMonitorTests(unittest.TestCase):
             slots = (BAND_ALERT.slot(remaining),) + (Slot(SLOT_EMPTY),) * 7
             return _repeat_line(program_for_slots(slots))
 
-        # ceil(remaining_ms / 1817ms), the measured blink cycle for an 1800ms pulse.
-        self.assertEqual(repeat_line(FLASH_SECONDS), "repeat 166")
+        # ceil(remaining_ms / 1817ms), the measured blink cycle for an 1980ms pulse.
+        self.assertEqual(repeat_line(FLASH_SECONDS), "repeat 151")
         self.assertEqual(repeat_line(2.0), "repeat 2")
-        self.assertEqual(repeat_line(1.817), "repeat 1")
+        self.assertEqual(repeat_line(1.997), "repeat 1")
         # repeat 0 is rejected by the parser, so the floor is 1, not 0.
         self.assertEqual(repeat_line(0.0001), "repeat 1")
         # The parser caps repeat at 65535.
@@ -5786,7 +5786,7 @@ class AgentMonitorTests(unittest.TestCase):
 
         program = program_for_slots(slots)
 
-        self.assertEqual(_repeat_line(program), "repeat 111")
+        self.assertEqual(_repeat_line(program), "repeat 101")
 
     def test_multiagent_worst_case_program_fits_the_device_limits(self) -> None:
         """Eight occupied slots all flashing is the most bytes and lines it can emit."""
@@ -5829,8 +5829,8 @@ class AgentMonitorTests(unittest.TestCase):
             [
                 "brightness 128",
                 "0:#000000 1:#0000E6",
-                "0:#FF1000 1800ms pulse",
-                "repeat 166",
+                "0:#FF1000 1980ms pulse",
+                "repeat 151",
                 "0:#B00000",
             ],
         )
@@ -5924,7 +5924,7 @@ class AgentMonitorTests(unittest.TestCase):
         except LedWasmUnavailableError as exc:
             self.skipTest(str(exc))
 
-        # remaining=2.0s gives `repeat 2`, a ~3634ms window, so the settled
+        # remaining=2.0s gives `repeat 2`, a ~3994ms window, so the settled
         # sample at 5000ms is safely past it without stepping 300 seconds.
         slots = (BAND_ALERT.slot(2.0), BAND_WORKING.slot()) + (Slot(SLOT_EMPTY),) * 6
         program = program_for_slots(slots)
@@ -6003,7 +6003,7 @@ class AgentMonitorTests(unittest.TestCase):
                 second.changed,
                 "an arriving session must not inherit its predecessor's repeat",
             )
-            self.assertIn("repeat 166", second.program)
+            self.assertIn("repeat 151", second.program)
 
     def test_multiagent_controller_reset_keeps_every_slot_assignment(self) -> None:
         """Sticky position is the reason placement is random at all.
@@ -6281,7 +6281,7 @@ class AgentMonitorTests(unittest.TestCase):
             )
 
             self.assertTrue(flashing.changed)
-            self.assertIn("1800ms pulse", flashing.program)
+            self.assertIn("1980ms pulse", flashing.program)
             self.assertFalse(still_flashing.changed)
             self.assertTrue(settling.changed)
             self.assertNotIn("pulse", settling.program)

@@ -21,7 +21,7 @@ This file is the operational half: how to turn it on, and what will surprise you
 | Off | `#000000` | — | empty slot | — |
 
 Red and chartreuse **blink for the first five minutes** after a session enters the
-band, pulsing from off up to the peak and back to off about once every 1.8 s,
+band, pulsing from off up to the peak and back to off about once every 2 s,
 then hold settled. Settled is
 not "stale" — it is "this has been true for a while".
 
@@ -369,8 +369,8 @@ changed within the last five minutes. At default brightness there is no
 
 ```text
 0:#000000 1:#000000 2:#000000 3:#0000E6 4:#000000 5:#000000 6:#000000 7:#000000
-0:#FF1000 1800ms pulse; 4:#FF1000 1800ms pulse; 7:#FF1000 1800ms pulse
-repeat 166
+0:#FF1000 1980ms pulse; 4:#FF1000 1980ms pulse; 7:#FF1000 1980ms pulse
+repeat 151
 0:#B00000 4:#B00000 7:#B00000
 ```
 
@@ -386,8 +386,8 @@ however recently it changed.
 Turn the slider down and a `brightness N` line appears above line 1, scaling all
 three bands together.
 
-`repeat` is `ceil(longest_remaining_flash / 1817ms)` — 1817 ms being the
-measured blink cycle for an `1800ms pulse`, not a value derived from the pulse
+`repeat` is `ceil(longest_remaining_flash / 1997ms)` — 1997 ms being the
+measured blink cycle for a `1980ms pulse`, not a value derived from the pulse
 duration. It was measured against the firmware parser and has not yet been
 confirmed on a physical strip. It
 counts down as the flash window closes, which is why the write-dedupe key

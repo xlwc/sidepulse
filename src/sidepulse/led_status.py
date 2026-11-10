@@ -342,11 +342,11 @@ def apply_brightness(program: str, brightness: int | float = 255) -> str:
 # at all; anything lower scales every band together.
 SLOT_BRIGHTNESS = 255
 SLOT_FLASH_TROUGH = "#000000"
-SLOT_FLASH_PULSE_MS = 1800
-# Measured against resources/sdled.wasm, not derived from the pulse duration: an
-# `1800ms pulse` blink completes every 1817ms. Sampling `repeat 1|2|3` put the
-# settle after the last pulse at 1817ms, 3634ms and 5451ms.
-SLOT_FLASH_CYCLE_MS = 1817
+SLOT_FLASH_PULSE_MS = 1980
+# Measured against resources/sdled.wasm, not derived from the pulse duration: a
+# `1980ms pulse` blink completes every 1997ms. Sampling `repeat 1|2|3` put the
+# settle after the last pulse at 1997ms, 3994ms and 5991ms.
+SLOT_FLASH_CYCLE_MS = 1997
 # `repeat 0` is rejected with bad-repeat and `repeat 65536` overflows, so the
 # count is clamped rather than merely computed.
 SLOT_MIN_REPEAT = 1
