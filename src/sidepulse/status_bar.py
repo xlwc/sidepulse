@@ -138,6 +138,7 @@ from .led_status import (
     program_for_display_state,
     program_for_slots,
     program_for_agent_mode,
+    slot_render_key,
     write_mode_to_leds,
 )
 from .links import IOSLink, load_ios_links, remove_ios_link, send_ios_program
@@ -631,6 +632,7 @@ class StatusBarController(NSObject):
         # needs its own allocator. Slot positions can therefore differ between
         # the Screen Bar and a physical Pro showing the same sessions.
         self.virtual_slot_allocator = SlotAllocator(slot_count=8)
+        self.virtual_slot_program: tuple[tuple[object, ...], str] | None = None
         self.remote_led_program_by_device = {}
         self.last_led_display_kind_by_device = {}
         self.device_errors = {}
@@ -3117,6 +3119,8 @@ class StatusBarController(NSObject):
         if device is None:
             return
         display = self.active_led_display_kind_for_device(device, battery_snapshot)
+        if display != LED_DISPLAY_MULTIAGENT:
+            self.virtual_slot_program = None
         if display == LED_DISPLAY_CUSTOM:
             self.virtual_status_device.hide()
             return
@@ -3132,9 +3136,16 @@ class StatusBarController(NSObject):
             slots = self.virtual_slot_allocator.update(
                 slot_statuses, datetime.now(timezone.utc)
             )
-            self.virtual_status_device.set_program(
-                program_for_slots(slots, brightness=device.brightness)
-            )
+            # The repeat count falls on every refresh, and setProgram_ restarts
+            # the animation for any new text. Resending the same text while the
+            # slots hold keeps a running flash in phase.
+            key = slot_render_key(slots, device.brightness)
+            if self.virtual_slot_program is None or self.virtual_slot_program[0] != key:
+                self.virtual_slot_program = (
+                    key,
+                    program_for_slots(slots, brightness=device.brightness),
+                )
+            self.virtual_status_device.set_program(self.virtual_slot_program[1])
         else:
             animation = self.settings.agent_animation(mode)
             try:

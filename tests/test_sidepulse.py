@@ -2198,6 +2198,7 @@ class AgentMonitorTests(unittest.TestCase):
             status_bar_devices=lambda remember=True: [device],
             active_led_display_kind_for_device=lambda _d, _s: LED_DISPLAY_MULTIAGENT,
             virtual_slot_allocator=SlotAllocator(slot_count=8, rng=random.Random(1234)),
+            virtual_slot_program=None,
         )
         statuses = (
             AgentStatus(
@@ -2217,6 +2218,84 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(len(programs), 1)
         self.assertEqual(programs[0].splitlines()[0], "brightness 64")
         self.assertIn(BAND_ALERT.steady, programs[0])
+
+    def test_status_bar_virtual_multiagent_keeps_a_running_flash(self) -> None:
+        """A refresh with unchanged slots resends the same text, so the flash runs on.
+
+        The repeat count falls every cycle, and `VirtualStatusView.setProgram_`
+        restarts the animation for any text that differs.
+        """
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+        clock = [base]
+
+        class FakeDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock[0]
+
+        device = status_bar.StatusBarDevice(
+            device_id=status_bar.VIRTUAL_DEVICE_ID,
+            name="SidePulse Notch",
+            root=Path(status_bar.VIRTUAL_DEVICE_ID),
+            target=Path(status_bar.VIRTUAL_DEVICE_ID),
+            connected=True,
+            display=LED_DISPLAY_MULTIAGENT,
+        )
+        display = [LED_DISPLAY_MULTIAGENT]
+        programs: list[str] = []
+        target = SimpleNamespace(
+            settings=SimpleNamespace(
+                virtual_status_device_enabled=True,
+                agent_animation=lambda _mode: SimpleNamespace(
+                    style="default", custom_program=""
+                ),
+            ),
+            virtual_status_device=SimpleNamespace(
+                set_program=programs.append,
+                hide=lambda: programs.append("<hidden>"),
+            ),
+            status_bar_devices=lambda remember=True: [device],
+            active_led_display_kind_for_device=lambda _d, _s: display[0],
+            virtual_slot_allocator=SlotAllocator(slot_count=8, rng=random.Random(1234)),
+            virtual_slot_program=None,
+        )
+        statuses = (
+            AgentStatus(
+                provider="claude",
+                agent_id="claude:session:a",
+                display_name="a",
+                mode=AgentMode.WAITING_FOR_INPUT,
+                updated_at=base,
+                event_name="Stop",
+            ),
+        )
+
+        def sync() -> None:
+            status_bar.StatusBarController.sync_virtual_status_device(
+                target, AgentMode.WAITING_FOR_INPUT, None, slot_statuses=statuses
+            )
+
+        with patch.object(status_bar, "datetime", FakeDatetime):
+            sync()
+            clock[0] = base + timedelta(seconds=15)
+            sync()
+            display[0] = "agent"
+            sync()
+            display[0] = LED_DISPLAY_MULTIAGENT
+            clock[0] = base + timedelta(seconds=30)
+            sync()
+
+        flash, unchanged, aggregate, back = programs
+        self.assertIn("repeat", flash)
+        self.assertEqual(unchanged, flash)
+        self.assertNotEqual(aggregate, flash)
+        self.assertIn("repeat", back)
+        self.assertNotEqual(back, flash)
 
     def test_status_bar_observe_connected_device_resets_on_new_mount(self) -> None:
         try:
