@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import os
 import secrets
 import socket
@@ -33,6 +34,10 @@ RELAY_CHANNEL_BYTES = 16
 SHORT_SOCKET_BASE = Path("/tmp")
 RELAY_RETRY_INITIAL_SECONDS = 1.0
 RELAY_RETRY_MAX_SECONDS = 30.0
+# A plain hash of a command lets any reader of the bridge confirm a guess. The key
+# never leaves this process, and the receiver needs digests to match only between
+# a prompt and its answer, so a service restart between the two costs one pairing.
+COMMAND_DIGEST_KEY = secrets.token_bytes(32)
 
 
 @dataclass(frozen=True)
@@ -217,8 +222,9 @@ def relay_event_line(provider: str, line: dict) -> tuple[str, dict] | None:
     The bridge operator, and anyone holding the channel, can read what is posted.
     The status comes from this side's own ``mode_for_event`` and travels as the
     explicit ``sidepulse_status`` the receiver already honours, because the prompt,
-    tool and assistant text that decide it never leave. Commands go as a digest:
-    the receiver only compares them to pair a permission prompt with its answer.
+    tool and assistant text that decide it never leave. Commands go as a keyed
+    digest: the receiver only compares them to pair a permission prompt with its
+    answer, and without the key a reader cannot test a guessed command.
     """
     record = parse_log_line(provider, json.dumps(line, ensure_ascii=False))
     if record is None:
@@ -243,8 +249,10 @@ def relay_event_line(provider: str, line: dict) -> tuple[str, dict] | None:
     tool_input = record.raw.get("tool_input")
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if isinstance(command, str) and command:
-        digest = hashlib.sha256(command.encode("utf-8")).hexdigest()
-        reduced["tool_input"] = {"command": f"sha256:{digest}"}
+        digest = hmac.new(
+            COMMAND_DIGEST_KEY, command.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        reduced["tool_input"] = {"command": f"hmac-sha256:{digest}"}
     return record.provider, reduced
 
 

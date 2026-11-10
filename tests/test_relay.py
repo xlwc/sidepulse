@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import http.client
 import io
 import json
@@ -271,6 +272,19 @@ class RelayTransportTests(unittest.TestCase):
             request_signature,
             permission_signature(self._received_record("claude", other)),
         )
+
+    def test_a_relayed_command_cannot_be_confirmed_by_hashing_a_guess(self) -> None:
+        body = self._published_body(
+            "claude",
+            {
+                "hook_event_name": "PermissionRequest",
+                "session_id": "s",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"},
+            },
+        )
+
+        self.assertNotIn(hashlib.sha256(b"git status").hexdigest(), body)
 
     def test_line_without_an_event_name_is_not_published(self) -> None:
         config = RelayConfig(server="https://bridge.sidepulse.io", outbound_channel="a" * 22)
