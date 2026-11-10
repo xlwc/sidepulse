@@ -2906,6 +2906,7 @@ class AgentMonitorTests(unittest.TestCase):
 
         before = allocator.update(statuses, base)
         status_bar.StatusBarController.reset_led_controllers_for_display_change(fake)
+        self.assertIs(fake.virtual_slot_allocator, allocator)
         after = allocator.update(statuses, base + timedelta(seconds=15))
 
         self.assertEqual(
