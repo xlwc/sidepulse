@@ -452,6 +452,7 @@ class MultiAgentLedController:
         self._rng = rng
         self.allocator: SlotAllocator | None = None
         self.last_key: tuple[object, ...] | None = None
+        self.last_program: str | None = None
         self.last_error: str | None = None
         self.last_target: Path | None = None
         self.last_attempt_monotonic = 0.0
@@ -469,10 +470,21 @@ class MultiAgentLedController:
         missing from the incoming set, so it cleans itself.
         """
         self.last_key = None
+        self.last_program = None
         self.last_error = None
         self.last_target = None
         self.last_attempt_monotonic = 0.0
         self.last_error_was_lookup = False
+
+    def _last_program_is_current(self) -> bool:
+        if self.dry_run:
+            return True
+        if self.last_target is None or self.last_program is None:
+            return False
+        try:
+            return self.last_target.read_text(encoding="utf-8") == self.last_program
+        except (OSError, UnicodeError):
+            return False
 
     def sync_statuses(
         self,
@@ -524,7 +536,11 @@ class MultiAgentLedController:
         slots = self.allocator.update(statuses, moment)
         key = slot_render_key(slots, self.brightness)
 
-        if key == self.last_key and self.last_error is None:
+        if (
+            key == self.last_key
+            and self.last_error is None
+            and self._last_program_is_current()
+        ):
             return MultiAgentLedWrite(
                 target=self.last_target,
                 program="",
@@ -565,6 +581,7 @@ class MultiAgentLedController:
             )
 
         self.last_key = key
+        self.last_program = program
         self.last_error = None
         self.last_target = written_target
         return MultiAgentLedWrite(

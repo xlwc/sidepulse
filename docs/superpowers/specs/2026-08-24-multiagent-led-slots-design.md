@@ -226,7 +226,10 @@ Consequences specific to this design:
   loses power *without* the mount signature changing, the cache still believes
   the strip is correct, `sync` returns early, and the strip sits on `INIT.LED`
   until some agent genuinely changes state. Aggregate mode has this same gap
-  today; multiagent inherits it unchanged and does not make it worse.
+  today; multiagent inherits it unchanged and does not make it worse. Both
+  controllers now read `LEDS.LED` back before they skip a write
+  (`_last_program_is_current`). That repairs a file another writer changed, not
+  a power loss, because the file still holds the last program after one.
 - **Slot assignments survive sleep, flash clocks expire during it.** Allocator
   state lives in the app's memory and the app is not killed by sleep, so slots
   keep their positions. Flash clocks are wall-clock, so a session that was

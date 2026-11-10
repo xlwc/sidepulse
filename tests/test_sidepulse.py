@@ -6200,6 +6200,36 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertFalse(third.changed)
             self.assertIn(f"7:{BAND_ALERT.steady}", (device / "LEDS.LED").read_text())
 
+    def test_multiagent_controller_repairs_externally_changed_program(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "SidePulsePro"
+            device.mkdir()
+            controller = MultiAgentLedController(
+                device_path=device, rng=random.Random(1234)
+            )
+            base = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+            statuses = (
+                AgentStatus(
+                    provider="claude",
+                    agent_id="claude:session:a",
+                    display_name="a",
+                    mode=AgentMode.WORKING,
+                    updated_at=base,
+                    event_name="PreToolUse",
+                ),
+            )
+
+            first = controller.sync_statuses(statuses, now=base)
+            target = device / "LEDS.LED"
+            target.write_text("0:#FF00FF")
+
+            repaired = controller.sync_statuses(
+                statuses, now=base + timedelta(seconds=15)
+            )
+
+            self.assertTrue(repaired.changed)
+            self.assertEqual(target.read_text(), first.program)
+
     def test_multiagent_controller_writes_once_when_the_brightness_moves(self) -> None:
         """A slider move reaches the written program, and costs exactly one write.
 
