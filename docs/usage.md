@@ -17,10 +17,10 @@ This file is the operational half: how to turn it on, and what will surprise you
 |---|---|---|---|---|
 | Red | `#B00000` | `#FF1000` | that session wants something from you | `BLOCKED_ERROR`, `WAITING_FOR_INPUT` |
 | Blue | `#0000E6` | — never flashes | working | `TOOL_RUNNING`, `WORKING`, `LONG_TASK_PROGRESS` |
-| Chartreuse | `#58B000` | `#80FF00` | finished, output unread | `COMPLETED`, `IDLE_READY` |
+| Green | `#00B000` | `#00FF00` | finished, output unread | `COMPLETED`, `IDLE_READY` |
 | Off | `#000000` | — | empty slot | — |
 
-Red and chartreuse **blink for the first five minutes** after a session enters the
+Red and green **blink for the first five minutes** after a session enters the
 band, pulsing from off up to the peak and back to off about once every 2 s,
 then hold settled. Settled is
 not "stale" — it is "this has been true for a while".
@@ -37,7 +37,7 @@ cache-warmth story: it is running, and it will still be running in six minutes.
 The cost is that a session working for an hour looks identical to one that started
 two seconds ago. Working is the boring state.
 
-Red and chartreuse both peak at full, and after five minutes both settle
+Red and green both peak at full, and after five minutes both settle
 *below* a working slot's steady 90% — so once things are quiet, hue is what
 tells them apart, not brightness.
 
@@ -48,8 +48,7 @@ slider on top, as a master gain over all three bands.
 The hex values were chosen by eye on a mounted device, one band at a time, which
 is why the tiers are uneven and the secondary channels look arbitrary. Numeric
 intensity is not perceived intensity: blue carries no green at all and is turned
-up to 90% to hold its own beside red, and the finished band is chartreuse rather
-than green. The code has them in one place, the
+up to 90% to hold its own beside red. The code has them in one place, the
 `BAND_ALERT` / `BAND_WORKING` / `BAND_DONE` table in `led_slots.py`; this file
 restates them in the table above, in the worked example further down and in two
 effective-intensity figures, so a retune moves those too.
@@ -164,7 +163,7 @@ your `PATH`.
 ### Turning the slider down can hide the settled colours
 
 Per-device brightness works in this mode: the slider emits `brightness N`, which
-scales all three bands together. Red and chartreuse settle at 69% and blue
+scales all three bands together. Red and green settle at 69% and blue
 holds 90%, so at a low slider setting the settled colours get faint — at 25%,
 `#B00000` is an effective red of about 44/255.
 
@@ -329,7 +328,7 @@ nothing else is running, because one LED answering for the whole machine demotes
 every finished session as soon as anything is active.
 
 The cost is a real one: exit a window the moment an agent finishes and you lose
-the chartreuse LED that says its output is unread. `collector.multiagent_statuses`
+the green LED that says its output is unread. `collector.multiagent_statuses`
 takes that trade because you closed the window, so there is nothing left to go
 back and read.
 

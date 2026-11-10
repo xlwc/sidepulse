@@ -84,10 +84,11 @@ class SlotBand:
 # one step warm of pure red, chosen over pure red on the strip. Working is pure
 # blue with no green at all, so it cannot be confused with either other band, and
 # is turned up to compensate for blue contributing least to perceived brightness.
-# Done is chartreuse rather than green, and carries red deliberately.
+# Done is pure green: it was chartreuse until 2026-11-09, when the red in it read
+# as too yellow on the strip.
 BAND_ALERT = SlotBand(steady="#B00000", flash_peak="#FF1000")  # low 69% / high 100%
 BAND_WORKING = SlotBand(steady="#0000E6", flash_peak=None)  # 90%
-BAND_DONE = SlotBand(steady="#58B000", flash_peak="#80FF00")  # low 69% / high 100%
+BAND_DONE = SlotBand(steady="#00B000", flash_peak="#00FF00")  # low 69% / high 100%
 
 
 # Rank 1 is most important. Eviction runs off this: a newcomer takes the slot of
